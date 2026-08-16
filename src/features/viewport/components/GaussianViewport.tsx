@@ -1,5 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
-import { locateFourCgsFrame } from '../../gaussian/formats/fourcgs/FourCgsContainer';
+import {
+  fourCgsSceneTransformToInput,
+  locateFourCgsFrame,
+} from '../../gaussian/formats/fourcgs/FourCgsContainer';
 import { FourCgsDecoderClient } from '../../gaussian/formats/fourcgs/FourCgsDecoderClient';
 import type { FourCgsDescriptor } from '../../gaussian/formats/fourcgs/FourCgsTypes';
 import { locateRaw4DSequenceFrame } from '../../gaussian/formats/raw4d/Raw4DSequence';
@@ -9,6 +12,7 @@ import type { GaussianRenderMode } from '../../gaussian/runtime/GaussianRenderMo
 import type { Gaussian4DMemoryPolicy } from '../../gaussian/memory/Gaussian4DMemoryPolicy';
 import type { RelightingState } from '../../../plugins/relighting/RelightingTypes';
 import type { ViewportPerformanceSnapshot } from '../runtime/ViewportPerformanceMonitor';
+import type { GaussianCylinderSelectionRegion } from '../runtime/selection/GaussianCylinderSelection';
 import {
   ViewportRuntime,
   type ViewportEditorTool,
@@ -19,7 +23,6 @@ import {
   type ViewportSelectionScope,
   type ViewportStatus,
   type ViewportTransform,
-  type ViewportTransformSpace,
 } from '../runtime/ViewportRuntime';
 
 interface GaussianViewportProps {
@@ -42,9 +45,9 @@ interface GaussianViewportProps {
   showGrid: boolean;
   showGuides: boolean;
   sourceFiles: readonly File[];
+  selectionCylinder: GaussianCylinderSelectionRegion;
   selectionScope: ViewportSelectionScope;
   transform: ViewportTransform;
-  transformSpace: ViewportTransformSpace;
   uniformScale: boolean;
   viewportLabel: string;
 }
@@ -103,9 +106,9 @@ export function GaussianViewport({
   showGrid,
   showGuides,
   sourceFiles,
+  selectionCylinder,
   selectionScope,
   transform,
-  transformSpace,
   uniformScale,
   viewportLabel,
 }: GaussianViewportProps) {
@@ -307,47 +310,47 @@ export function GaussianViewport({
 
   useEffect(() => {
     runtimeRef.current?.setEditorTool(activeTool);
-  }, [activeTool]);
+  }, [activeTool, runtimeReady]);
 
   useEffect(() => {
     runtimeRef.current?.setGaussianSelectionScope(selectionScope);
-  }, [selectionScope]);
+  }, [runtimeReady, selectionScope]);
 
   useEffect(() => {
     runtimeRef.current?.setGaussianSelectionBrushRadius(brushRadius);
-  }, [brushRadius]);
+  }, [brushRadius, runtimeReady]);
+
+  useEffect(() => {
+    runtimeRef.current?.setGaussianSelectionCylinder(selectionCylinder);
+  }, [runtimeReady, selectionCylinder]);
 
   useEffect(() => {
     runtimeRef.current?.setSceneTransform(transform);
-  }, [transform]);
-
-  useEffect(() => {
-    runtimeRef.current?.setTransformSpace(transformSpace);
-  }, [transformSpace]);
+  }, [runtimeReady, transform]);
 
   useEffect(() => {
     runtimeRef.current?.setUniformScale(uniformScale);
-  }, [uniformScale]);
+  }, [runtimeReady, uniformScale]);
 
   useEffect(() => {
     runtimeRef.current?.setRenderMode(renderMode);
-  }, [renderMode]);
+  }, [renderMode, runtimeReady]);
 
   useEffect(() => {
     runtimeRef.current?.setShLevel(shLevel);
-  }, [shLevel]);
+  }, [runtimeReady, shLevel]);
 
   useEffect(() => {
     runtimeRef.current?.setGridVisible(showGrid);
-  }, [showGrid]);
+  }, [runtimeReady, showGrid]);
 
   useEffect(() => {
     runtimeRef.current?.setAxesVisible(showAxes);
-  }, [showAxes]);
+  }, [runtimeReady, showAxes]);
 
   useEffect(() => {
     runtimeRef.current?.setMemoryPolicy(memoryPolicy);
-  }, [memoryPolicy]);
+  }, [memoryPolicy, runtimeReady]);
 
   useEffect(() => {
     if (fourCgsSessionRef.current) {
@@ -460,6 +463,7 @@ export function GaussianViewport({
     }
     if (sourceFile.name.toLowerCase().endsWith('.4cgs')) {
       const decoder = new FourCgsDecoderClient();
+      const openStartedAt = performance.now();
       let residentSegments: readonly ViewportResidentRaw4DSegment[] = [];
       onStatusChange({
         phase: 'loading', renderer: '4CGS V2.4', splatCount: 0, progress: 0,
@@ -477,17 +481,27 @@ export function GaussianViewport({
         if (!active) return;
         // #WDD-gpt 2026-08-16 - 保留实际 bitstream 解码阶段计时，便于评估多线程是否真正缩短等待。
         console.info(`4CGS decode timings ${JSON.stringify(descriptor.decodeTimings)}`);
-        const decodedSegments: File[] = [];
-        for (let segmentIndex = 0; segmentIndex < descriptor.segments.length; segmentIndex += 1) {
-          decodedSegments.push(await decoder.getSegment(segmentIndex));
-          if (!active) return;
+        if (descriptor.sceneTransform) {
+          // #WDD-gpt 2026-08-16 - 通过运行时原子恢复 4CGS TRS，保证首帧实体与检查器使用同一份元数据。
+          runtime.restoreSceneTransform(fourCgsSceneTransformToInput(descriptor.sceneTransform));
+        }
+        const extractionStartedAt = performance.now();
+        let extractedCount = 0;
+        // #WDD-gpt 2026-08-16 - 一次提交全部片段请求，减少六次主线程往返并让后续 Loader 池尽早接手。
+        const decodedSegments = await Promise.all(descriptor.segments.map(async (_segment, segmentIndex) => {
+          const decoded = await decoder.getSegment(segmentIndex);
+          if (!active) throw new DOMException('4CGS 片段提取已取消。', 'AbortError');
+          extractedCount += 1;
           onStatusChange({
             phase: 'loading', renderer: '4CGS 系统内存预读', splatCount: 0,
-            progress: 0.55 + 0.1 * (segmentIndex + 1) / descriptor.segments.length,
-            message: `正在提取 4CGS 片段 ${segmentIndex + 1}/${descriptor.segments.length}`,
+            progress: 0.55 + 0.1 * extractedCount / descriptor.segments.length,
+            message: `正在并行提取 4CGS 片段 ${extractedCount}/${descriptor.segments.length}`,
             sourceName: sourceFile.name, objectName: sourceFile.name.replace(/\.4cgs$/i, ''), format: '4CGS',
           });
-        }
+          return decoded;
+        }));
+        const extractionMs = performance.now() - extractionStartedAt;
+        const residencyStartedAt = performance.now();
         residentSegments = await runtime.preloadRaw4DSequence(decodedSegments, ({ message, ratio }) => {
           if (!active) return;
           onStatusChange({
@@ -496,6 +510,7 @@ export function GaussianViewport({
             sourceName: sourceFile.name, objectName: sourceFile.name.replace(/\.4cgs$/i, ''), format: '4CGS',
           });
         });
+        const residencyMs = performance.now() - residencyStartedAt;
         if (!active) {
           runtime.releaseRaw4DSequence(residentSegments);
           residentSegments = [];
@@ -507,7 +522,16 @@ export function GaussianViewport({
           decoder, descriptor, residentSegments, sourceFile, segmentIndex: -1,
         };
         decoder.close();
+        const activationStartedAt = performance.now();
         await activateFourCgsFrameRef.current(pendingFrameRef.current);
+        // #WDD-gpt 2026-08-16 - 单独记录提取、CPU 驻留和首段 GPU 激活，避免只优化 Codec 却遗漏后续等待。
+        console.info(`4CGS open timings ${JSON.stringify({
+          decodeMs: descriptor.decodeTimings.totalMs,
+          extractionMs,
+          residencyMs,
+          activationMs: performance.now() - activationStartedAt,
+          totalMs: performance.now() - openStartedAt,
+        })}`);
       }).catch((error: unknown) => {
         if (!active || (error instanceof DOMException && error.name === 'AbortError')) return;
         onStatusChange({

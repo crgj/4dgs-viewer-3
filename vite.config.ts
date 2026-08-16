@@ -1,6 +1,14 @@
 import { fileURLToPath, URL } from 'node:url';
+import { readFileSync } from 'node:fs';
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
+
+// #WDD-gpt 2026-08-16 - 以根目录 VERSION 作为唯一页面版本来源，避免品牌栏与发布文件各自硬编码。
+const appVersion = readFileSync(fileURLToPath(new URL('./VERSION', import.meta.url)), 'utf8').trim();
+
+if (!/^\d+\.\d+\.\d+$/.test(appVersion)) {
+  throw new Error(`Invalid VERSION value: ${JSON.stringify(appVersion)}`);
+}
 
 // #WDD-gpt 2026-08-15 - 开启跨源隔离以允许 Codec Worker 使用 SharedArrayBuffer 零拷贝共享。
 const isolationHeaders = {
@@ -12,6 +20,9 @@ const isolationHeaders = {
 export default defineConfig({
   base: './',
   plugins: [react()],
+  define: {
+    __APP_VERSION__: JSON.stringify(appVersion),
+  },
   // #WDD-gpt 2026-08-16 - 复用离线 V2.4 纯 JS 解码器时，只把 Node 内建模块映射到浏览器安全实现；编码端系统调用在前端会明确报错。
   resolve: {
     alias: {

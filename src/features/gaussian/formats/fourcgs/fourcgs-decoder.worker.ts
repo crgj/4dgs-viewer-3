@@ -25,6 +25,24 @@ let activeManifest: FourCgsManifest | null = null;
 let activeSourceName = '';
 let decodedRows: Uint16Array[] = [];
 let decodedNames: string[][] = [];
+let lastDecodeWorkerCount = 1;
+let lastAttributeTasksMs: Readonly<Record<string, number>> = {};
+
+interface AttributeTaskTiming {
+  readonly task: string;
+  readonly elapsedMs: number;
+  readonly workerCount: number;
+}
+
+const ATTRIBUTE_TASK_LABELS: Readonly<Record<string, string>> = {
+  position: '位置',
+  rotation: '旋转',
+  scale: '缩放',
+  dc: 'DC',
+  opacity: '透明度',
+  lifetime: '生命周期',
+  sh: 'SH',
+};
 
 function progress(ratio: number, message: string): void {
   self.postMessage({ type: 'progress', ratio, message });
@@ -61,13 +79,20 @@ function unshuffle16(shuffled: Uint8Array): Uint8Array {
 }
 
 async function readStreams(file: File, manifest: FourCgsManifest, manifestBytes: number): Promise<Map<string, Buffer>> {
-  const streams = new Map<string, Buffer>();
   const brotli = await brotliPromise;
   let offset = FOUR_CGS_HEADER_BYTES + manifestBytes;
-  for (let index = 0; index < manifest.streams.length; index += 1) {
-    const entry = manifest.streams[index];
-    const stored = new Uint8Array(await file.slice(offset, offset + entry.storedBytes).arrayBuffer());
-    if (stored.length !== entry.storedBytes || await sha256(stored) !== entry.storedSha256) {
+  const ranges = manifest.streams.map((entry) => {
+    const range = { entry, offset };
+    offset += entry.storedBytes;
+    return range;
+  });
+  if (offset !== file.size) throw new Error(`4CGS 末尾存在 ${file.size - offset} 个未登记字节。`);
+  let completed = 0;
+  // #WDD-gpt 2026-08-16 - 独立流并行读取/哈希；raw 流 stored/raw 相同，只计算一次 SHA-256。
+  const decoded = await Promise.all(ranges.map(async ({ entry, offset: streamOffset }) => {
+    const stored = new Uint8Array(await file.slice(streamOffset, streamOffset + entry.storedBytes).arrayBuffer());
+    const storedDigest = await sha256(stored);
+    if (stored.length !== entry.storedBytes || storedDigest !== entry.storedSha256) {
       throw new Error(`4CGS 存储流校验失败：${entry.name}。`);
     }
     let raw: Uint8Array;
@@ -75,15 +100,15 @@ async function readStreams(file: File, manifest: FourCgsManifest, manifestBytes:
     else if (entry.compression === 'brotli-shuffle16') raw = unshuffle16(brotli.decompress(stored));
     else if (entry.compression === 'deflate') raw = unzlibSync(stored);
     else raw = stored;
-    if (raw.length !== entry.rawBytes || await sha256(raw) !== entry.rawSha256) {
+    const rawDigest = raw === stored ? storedDigest : await sha256(raw);
+    if (raw.length !== entry.rawBytes || rawDigest !== entry.rawSha256) {
       throw new Error(`4CGS 原始流校验失败：${entry.name}。`);
     }
-    streams.set(entry.name, Buffer.from(raw.buffer, raw.byteOffset, raw.byteLength));
-    offset += entry.storedBytes;
-    progress(0.04 + 0.24 * (index + 1) / manifest.streams.length, `正在校验 4CGS 流 ${index + 1}/${manifest.streams.length}`);
-  }
-  if (offset !== file.size) throw new Error(`4CGS 末尾存在 ${file.size - offset} 个未登记字节。`);
-  return streams;
+    completed += 1;
+    progress(0.04 + 0.24 * completed / manifest.streams.length, `正在并行校验 4CGS 流 ${completed}/${manifest.streams.length}`);
+    return [entry.name, Buffer.from(raw.buffer, raw.byteOffset, raw.byteLength)] as const;
+  }));
+  return new Map(decoded);
 }
 
 function createActiveSlots(manifest: FourCgsManifest, rawMask: Uint8Array, shared: boolean): Int32Array[] {
@@ -146,6 +171,7 @@ function mixRqTrack(
   decodeMixRqWindows: (encoded: Buffer) => any[],
   decodeScalarRq: (encoded: Buffer) => any,
   decodeTemporalRq: (encoded: Buffer, activeSlots: readonly Int32Array[]) => any,
+  decodeOpacityHybrid: (encoded: Buffer) => any,
 ): void {
   const magic = raw.subarray(0, 8).toString('ascii');
   let bits: Uint16Array;
@@ -162,9 +188,12 @@ function mixRqTrack(
       offset += window.bits.length;
     }
   } else {
-    const decoded = magic === 'MIXSC001'
-      ? decodeScalarRq(raw)
-      : (magic === 'TMRQ0001' ? decodeTemporalRq(raw, activeSlots) : decodeMixRq(raw));
+    // #WDD-gpt 2026-08-16 - V2.5 Opacity 的后三个时间 bank 逐位无损，首 bank 仍走有界 Scalar RQ。
+    const decoded = magic === 'OPHYB001'
+      ? decodeOpacityHybrid(raw)
+      : (magic === 'MIXSC001'
+          ? decodeScalarRq(raw)
+          : (magic === 'TMRQ0001' ? decodeTemporalRq(raw, activeSlots) : decodeMixRq(raw)));
     ({ bits } = decoded);
     ({ dimensions, observationCount } = decoded.metrics);
   }
@@ -214,23 +243,54 @@ function decodeSharedSh(
   const updates = unzlibSync(raw.subarray(baseOffset + baseBytes + maskBytes, baseOffset + baseBytes + maskBytes + labelBytes));
   const state = new Uint8Array(slotCount * 5);
   const initialized = new Uint8Array(slotCount);
+  const decodedSh = new Uint16Array(slotCount * 45);
+  const restOffsets = indices.map((properties, segmentIndex) => {
+    const first = properties.get('f_rest_0');
+    if (first === undefined) throw new Error(`4CGS 第 ${segmentIndex + 1} 段缺少 SH 属性。`);
+    for (let dimension = 1; dimension < 45; dimension += 1) {
+      if (properties.get(`f_rest_${dimension}`) !== first + dimension) throw new Error(`4CGS 第 ${segmentIndex + 1} 段 SH 属性不连续。`);
+    }
+    return first;
+  });
   let instance = 0;
   let updateOffset = 0;
+  // #WDD-gpt 2026-08-16 - CoReSH-5R 只在 Track 码字更新时重建 45D FP16，跨段未更新实例直接复用逐 Track 缓存。
   for (let segmentIndex = 0; segmentIndex < manifest.segments.length; segmentIndex += 1) {
     const stride = indices[segmentIndex].size;
+    const rowValues = rows[segmentIndex];
+    const restOffset = restOffsets[segmentIndex];
     for (let row = 0; row < activeSlots[segmentIndex].length; row += 1) {
       const slot = activeSlots[segmentIndex][row];
       const stateOffset = slot * 5;
-      if ((updateMask[instance >>> 3] & (1 << (instance & 7))) !== 0) {
+      const shOffset = slot * 45;
+      const rowOffset = row * stride + restOffset;
+      const updated = (updateMask[instance >>> 3] & (1 << (instance & 7))) !== 0;
+      if (updated) {
         state.set(updates.subarray(updateOffset, updateOffset + 5), stateOffset);
         initialized[slot] = 1;
         updateOffset += 5;
       }
       if (!initialized[slot]) throw new Error(`4CGS Track ${slot} 缺少 SH 初始化。`);
-      for (let dimension = 0; dimension < 45; dimension += 1) {
-        let value = mean[dimension];
-        for (let level = 0; level < 5; level += 1) value += codebooks[(level * 256 + state[stateOffset + level]) * 45 + dimension];
-        rows[segmentIndex][row * stride + indices[segmentIndex].get(`f_rest_${dimension}`)!] = floatToHalf(value);
+      if (updated) {
+        const code0 = state[stateOffset] * 45;
+        const code1 = (256 + state[stateOffset + 1]) * 45;
+        const code2 = (512 + state[stateOffset + 2]) * 45;
+        const code3 = (768 + state[stateOffset + 3]) * 45;
+        const code4 = (1024 + state[stateOffset + 4]) * 45;
+        for (let dimension = 0; dimension < 45; dimension += 1) {
+          const bits = floatToHalf(mean[dimension]
+            + codebooks[code0 + dimension]
+            + codebooks[code1 + dimension]
+            + codebooks[code2 + dimension]
+            + codebooks[code3 + dimension]
+            + codebooks[code4 + dimension]);
+          decodedSh[shOffset + dimension] = bits;
+          rowValues[rowOffset + dimension] = bits;
+        }
+      } else {
+        for (let dimension = 0; dimension < 45; dimension += 1) {
+          rowValues[rowOffset + dimension] = decodedSh[shOffset + dimension];
+        }
       }
       instance += 1;
     }
@@ -250,14 +310,15 @@ function runAttributeWorker(
   manifest: FourCgsManifest,
   activeSlots: readonly Int32Array[],
   rows: readonly Uint16Array[],
-): Promise<void> {
+  parallelism = 1,
+): Promise<AttributeTaskTiming> {
   return new Promise((resolve, reject) => {
     const worker = new Worker(new URL('./fourcgs-attribute.worker.ts', import.meta.url), { type: 'module' });
     const finish = () => worker.terminate();
-    worker.addEventListener('message', (event: MessageEvent<{ type: string; message?: string }>) => {
+    worker.addEventListener('message', (event: MessageEvent<{ type: string; task: string; elapsedMs?: number; workerCount?: number; message?: string }>) => {
       finish();
       if (event.data.type === 'error') reject(new Error(event.data.message ?? `4CGS ${task} Worker 失败。`));
-      else resolve();
+      else resolve({ task: event.data.task, elapsedMs: event.data.elapsedMs ?? 0, workerCount: event.data.workerCount ?? 1 });
     }, { once: true });
     worker.addEventListener('error', (event) => {
       finish();
@@ -270,7 +331,45 @@ function runAttributeWorker(
       activeSlotBuffers: activeSlots.map((slots) => slots.buffer),
       rowBuffers: rows.map((row) => row.buffer),
       stream: streamBuffer,
+      parallelism,
     }, [streamBuffer]);
+  });
+}
+
+function runAuxiliaryWorker(
+  task: 'opacity' | 'lifetime' | 'sh',
+  streamNames: readonly string[],
+  streams: Map<string, Buffer>,
+  manifest: FourCgsManifest,
+  activeSlots: readonly Int32Array[],
+  rows: readonly Uint16Array[],
+): Promise<AttributeTaskTiming> {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(new URL('./fourcgs-auxiliary.worker.ts', import.meta.url), { type: 'module' });
+    const finish = () => worker.terminate();
+    worker.addEventListener('message', (event: MessageEvent<{ type: string; task: string; elapsedMs?: number; message?: string }>) => {
+      finish();
+      if (event.data.type === 'error') reject(new Error(event.data.message ?? `4CGS ${task} Worker 失败。`));
+      else resolve({ task: event.data.task, elapsedMs: event.data.elapsedMs ?? 0, workerCount: 1 });
+    }, { once: true });
+    worker.addEventListener('error', (event) => {
+      finish();
+      reject(new Error(event.message || `4CGS ${task} Worker 崩溃。`));
+    }, { once: true });
+    const streamBuffers: Record<string, ArrayBuffer> = {};
+    const transfer: ArrayBuffer[] = [];
+    for (const streamName of streamNames) {
+      const buffer = transferableCopy(streams.get(streamName)!);
+      streamBuffers[streamName] = buffer;
+      transfer.push(buffer);
+    }
+    worker.postMessage({
+      task,
+      manifest,
+      activeSlotBuffers: activeSlots.map((slots) => slots.buffer),
+      rowBuffers: rows.map((row) => row.buffer),
+      streams: streamBuffers,
+    }, transfer);
   });
 }
 
@@ -285,31 +384,90 @@ async function decodeAttributes(manifest: FourCgsManifest, streams: Map<string, 
     const buffer: RowBuffer = shared ? new SharedArrayBuffer(bytes) : new ArrayBuffer(bytes);
     return new Uint16Array(buffer);
   });
-  const prs = await import('../../../../../scripts/fourcgs-prs-codec.mjs');
-  const [mix, scalarRq, temporalRq] = await Promise.all([
-    import('../../../../../scripts/fourcgs-mixrq-codec.mjs'),
-    import('../../../../../scripts/fourcgs-scalar-rq-codec.mjs'),
-    import('../../../../../scripts/fourcgs-temporal-rq-codec.mjs'),
-  ]);
-  progress(0.32, shared ? '正在并行解码 Position / Rotation / Scale / DC' : '正在兼容模式解码 4CGS 属性');
+  const hardwareConcurrency = navigator.hardwareConcurrency || 4;
+  const useAuxiliaryWorkers = shared && hardwareConcurrency >= 8;
+  const rotationParallelism = useAuxiliaryWorkers && hardwareConcurrency >= 16
+    ? Math.min(4, Math.max(2, Math.floor((hardwareConcurrency - 8) / 4)))
+    : 1;
+  lastDecodeWorkerCount = useAuxiliaryWorkers
+    ? 8 + (rotationParallelism > 1 ? rotationParallelism : 0)
+    : shared ? 5 : 1;
+  progress(0.32, useAuxiliaryWorkers
+    ? `正在使用 ${lastDecodeWorkerCount - 1} 个子 Worker 并行解码全部属性`
+    : shared ? '正在并行解码 Position / Rotation / Scale / DC' : '正在兼容模式解码 4CGS 属性');
 
   if (shared) {
     const workers = [
       runAttributeWorker('position', streams.get('prs_position')!, manifest, activeSlots, decodedRows),
-      runAttributeWorker('rotation', streams.get('so3_rotation')!, manifest, activeSlots, decodedRows),
+      runAttributeWorker('rotation', streams.get('so3_rotation')!, manifest, activeSlots, decodedRows, rotationParallelism),
       runAttributeWorker('scale', streams.get('tattr_scale')!, manifest, activeSlots, decodedRows),
       runAttributeWorker('dc', streams.get('tattr_dc')!, manifest, activeSlots, decodedRows),
     ];
-    mixRqTrack(
-      streams.get('mixsc_opacity')!, manifest, activeSlots, decodedRows, indices,
-      mix.decodeMixRq, mix.decodeMixRqWindows, scalarRq.decodeScalarRq, temporalRq.decodeTemporalRq,
-    );
-    temporalDecode(streams.get('lifetime_mu')!, manifest, activeSlots, manifest.segments.map(() => ['lifetime_mu']), decodedRows, indices, manifest.losslessEntropy?.temporalModes?.lifetime_mu ?? 'xor');
-    temporalDecode(streams.get('lifetime_w')!, manifest, activeSlots, manifest.segments.map(() => ['lifetime_w']), decodedRows, indices, manifest.losslessEntropy?.temporalModes?.lifetime_w ?? 'xor');
-    decodeSharedSh(streams.get('coresh5r_shared')!, manifest, activeSlots, decodedRows, indices, prs.halfToFloat, prs.floatToHalf);
-    await Promise.all(workers);
+    if (useAuxiliaryWorkers) {
+      workers.push(
+        runAuxiliaryWorker('opacity', ['mixsc_opacity'], streams, manifest, activeSlots, decodedRows),
+        runAuxiliaryWorker('lifetime', ['lifetime_mu', 'lifetime_w'], streams, manifest, activeSlots, decodedRows),
+        runAuxiliaryWorker('sh', ['coresh5r_shared'], streams, manifest, activeSlots, decodedRows),
+      );
+    } else {
+      const [prs, mix, scalarRq, temporalRq, opacityHybrid] = await Promise.all([
+        import('../../../../../scripts/fourcgs-prs-codec.mjs'),
+        import('../../../../../scripts/fourcgs-mixrq-codec.mjs'),
+        import('../../../../../scripts/fourcgs-scalar-rq-codec.mjs'),
+        import('../../../../../scripts/fourcgs-temporal-rq-codec.mjs'),
+        import('../../../../../scripts/fourcgs-opacity-hybrid-codec.mjs'),
+      ]);
+      mixRqTrack(
+        streams.get('mixsc_opacity')!, manifest, activeSlots, decodedRows, indices,
+        mix.decodeMixRq, mix.decodeMixRqWindows, scalarRq.decodeScalarRq, temporalRq.decodeTemporalRq, opacityHybrid.decodeOpacityHybrid,
+      );
+      temporalDecode(streams.get('lifetime_mu')!, manifest, activeSlots, manifest.segments.map(() => ['lifetime_mu']), decodedRows, indices, manifest.losslessEntropy?.temporalModes?.lifetime_mu ?? 'xor');
+      temporalDecode(streams.get('lifetime_w')!, manifest, activeSlots, manifest.segments.map(() => ['lifetime_w']), decodedRows, indices, manifest.losslessEntropy?.temporalModes?.lifetime_w ?? 'xor');
+      decodeSharedSh(streams.get('coresh5r_shared')!, manifest, activeSlots, decodedRows, indices, prs.halfToFloat, prs.floatToHalf);
+    }
+    const taskOrder = useAuxiliaryWorkers
+      ? ['position', 'rotation', 'scale', 'dc', 'opacity', 'lifetime', 'sh']
+      : ['position', 'rotation', 'scale', 'dc'];
+    const completed = new Set<string>();
+    const workerStartedAt = performance.now();
+    let trackingActive = true;
+    const reportWorkerProgress = () => {
+      if (!trackingActive) return;
+      const remaining = taskOrder.filter((task) => !completed.has(task));
+      const visibleTasks = remaining.slice(0, 3).map((task) => ATTRIBUTE_TASK_LABELS[task] ?? task).join('、');
+      const remainingLabel = remaining.length > 3 ? `${visibleTasks}等 ${remaining.length} 项` : visibleTasks || '收尾';
+      const elapsedSeconds = ((performance.now() - workerStartedAt) / 1000).toFixed(1);
+      progress(
+        0.32 + 0.56 * completed.size / taskOrder.length,
+        `${lastDecodeWorkerCount - 1} 个子 Worker · ${completed.size}/${taskOrder.length} 项完成 · 正在处理 ${remainingLabel} · ${elapsedSeconds} 秒`,
+      );
+    };
+    // #WDD-gpt 2026-08-16 - 子 Worker 解码期间持续回报完成数、剩余属性和耗时，避免 3~4 秒无更新被误判为界面卡死。
+    const trackedWorkers = workers.map((worker) => worker.then((timing) => {
+      completed.add(timing.task);
+      reportWorkerProgress();
+      return timing;
+    }));
+    reportWorkerProgress();
+    const heartbeat = globalThis.setInterval(reportWorkerProgress, 400);
+    let timings: AttributeTaskTiming[];
+    try {
+      timings = await Promise.all(trackedWorkers);
+    } finally {
+      trackingActive = false;
+      globalThis.clearInterval(heartbeat);
+    }
+    lastDecodeWorkerCount = 1 + taskOrder.length
+      + timings.reduce((sum, timing) => sum + Math.max(0, timing.workerCount - 1), 0);
+    lastAttributeTasksMs = Object.fromEntries(timings.map((timing) => [timing.task, timing.elapsedMs]));
   } else {
-    const [rotationCodec, attributeCodec, structuredCodec] = await Promise.all([
+    lastAttributeTasksMs = {};
+    const [prs, mix, scalarRq, temporalRq, opacityHybrid, rotationCodec, attributeCodec, structuredCodec] = await Promise.all([
+      import('../../../../../scripts/fourcgs-prs-codec.mjs'),
+      import('../../../../../scripts/fourcgs-mixrq-codec.mjs'),
+      import('../../../../../scripts/fourcgs-scalar-rq-codec.mjs'),
+      import('../../../../../scripts/fourcgs-temporal-rq-codec.mjs'),
+      import('../../../../../scripts/fourcgs-opacity-hybrid-codec.mjs'),
       import('../../../../../scripts/fourcgs-so3-temporal-codec.mjs'),
       import('../../../../../scripts/fourcgs-temporal-attribute-codec.mjs'),
       import('../../../../../scripts/fourcgs-v21-lossless-codec.mjs'),
@@ -324,7 +482,7 @@ async function decodeAttributes(manifest: FourCgsManifest, streams: Map<string, 
     attributeCodec.decodeTemporalAttributeStreams(dc.metadata, dc.streams, manifest, activeSlots, decodedRows, indices);
     mixRqTrack(
       streams.get('mixsc_opacity')!, manifest, activeSlots, decodedRows, indices,
-      mix.decodeMixRq, mix.decodeMixRqWindows, scalarRq.decodeScalarRq, temporalRq.decodeTemporalRq,
+      mix.decodeMixRq, mix.decodeMixRqWindows, scalarRq.decodeScalarRq, temporalRq.decodeTemporalRq, opacityHybrid.decodeOpacityHybrid,
     );
     temporalDecode(streams.get('lifetime_mu')!, manifest, activeSlots, manifest.segments.map(() => ['lifetime_mu']), decodedRows, indices, manifest.losslessEntropy?.temporalModes?.lifetime_mu ?? 'xor');
     temporalDecode(streams.get('lifetime_w')!, manifest, activeSlots, manifest.segments.map(() => ['lifetime_w']), decodedRows, indices, manifest.losslessEntropy?.temporalModes?.lifetime_w ?? 'xor');
@@ -374,12 +532,15 @@ async function open(file: File): Promise<FourCgsDescriptor> {
     totalFrames: manifest.uniqueFrameCount,
     slotCount: manifest.slotCount,
     segments: manifest.segments,
+    sceneTransform: manifest.metadata?.sceneTransform,
     crossOriginIsolated: globalThis.crossOriginIsolated,
     decodeTimings: {
       streamReadMs,
       attributeDecodeMs,
       totalMs: performance.now() - totalStartedAt,
-      workerCount: globalThis.crossOriginIsolated ? 5 : 1,
+      workerCount: lastDecodeWorkerCount,
+      hardwareConcurrency: navigator.hardwareConcurrency || 4,
+      attributeTasksMs: lastAttributeTasksMs,
     },
   };
 }

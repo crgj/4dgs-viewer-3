@@ -21,6 +21,7 @@ import {
 import { decodeMixRq, decodeMixRqWindows } from './fourcgs-mixrq-codec.mjs';
 import { decodeScalarRq } from './fourcgs-scalar-rq-codec.mjs';
 import { decodeTemporalRq } from './fourcgs-temporal-rq-codec.mjs';
+import { decodeOpacityHybrid } from './fourcgs-opacity-hybrid-codec.mjs';
 import { decodeTemporalAttribute, decodeTemporalAttributeStreams } from './fourcgs-temporal-attribute-codec.mjs';
 import { decodeSo3Rotations, decodeSo3RotationStreams } from './fourcgs-so3-temporal-codec.mjs';
 import { decodeV21StructuredStream, decodeV22StructuredParts, isV21StructuredStream } from './fourcgs-v21-lossless-codec.mjs';
@@ -169,9 +170,12 @@ function decodeMixRqTrack(raw, manifest, activeSlots, prefix, components, bankKe
       },
     };
   } else {
-    decoded = magic === 'TMRQ0001'
-      ? decodeTemporalRq(raw, activeSlots)
-      : (magic === 'MIXSC001' ? decodeScalarRq(raw) : decodeMixRq(raw));
+    // #WDD-gpt 2026-08-16 - 离线验收与 Web Worker 共用 V2.5 Opacity 混合流语义，保证解码位流一致。
+    decoded = magic === 'OPHYB001'
+      ? decodeOpacityHybrid(raw)
+      : (magic === 'TMRQ0001'
+          ? decodeTemporalRq(raw, activeSlots)
+          : (magic === 'MIXSC001' ? decodeScalarRq(raw) : decodeMixRq(raw)));
   }
   const dimensions = manifest.segments[0].bankCounts[bankKey] * components.length;
   const observationCount = activeSlots.reduce((sum, slots) => sum + slots.length, 0);
@@ -295,6 +299,8 @@ function validateDecoded(sources, sourceLayout, manifest, activeSlots, rows, ind
   let opacitySquare = 0;
   let opacityCount = 0;
   let opacityMaximum = 0;
+  let opacityBitExactTemporalValues = 0;
+  let opacityBitExactValues = 0;
   let checkedBitExactValues = 0;
   for (let segmentIndex = 0; segmentIndex < sources.length; segmentIndex += 1) {
     const source = sources[segmentIndex];
@@ -346,8 +352,19 @@ function validateDecoded(sources, sourceLayout, manifest, activeSlots, rows, ind
       }
       for (let bank = 0; bank < manifest.segments[segmentIndex].bankCounts.opacity; bank += 1) {
         const name = `opacity_bank_${bank}`;
-        const sourceLogit = halfToFloat(source.rows[sourceBase + source.propertyIndex.get(name)]);
-        const decodedLogit = halfToFloat(decoded[decodedBase + indices[segmentIndex].get(name)]);
+        const sourceBits = source.rows[sourceBase + source.propertyIndex.get(name)];
+        const decodedBits = decoded[decodedBase + indices[segmentIndex].get(name)];
+        const exactOpacityBank = bank === 0
+          ? manifest.compressionV25?.opacityPolicy?.baseBank?.bitExactFp16
+          : manifest.compressionV25?.opacityPolicy?.temporalBanks?.bitExactFp16;
+        if (exactOpacityBank) {
+          if (decodedBits !== sourceBits) throw new Error(`V2.5 Opacity temporal bank mismatch at segment ${segmentIndex}, Track ID ${slot}, ${name}.`);
+          opacityBitExactValues += 1;
+          if (bank > 0) opacityBitExactTemporalValues += 1;
+        }
+        // #WDD-gpt 2026-08-16 - V2.5 验收显式统计三个逐位无损 Opacity 时间 bank，不再只报告四 bank 合并 RMSE。
+        const sourceLogit = halfToFloat(sourceBits);
+        const decodedLogit = halfToFloat(decodedBits);
         const sourceAlpha = sourceLogit >= 0 ? 1 / (1 + Math.exp(-sourceLogit)) : Math.exp(sourceLogit) / (1 + Math.exp(sourceLogit));
         const decodedAlpha = decodedLogit >= 0 ? 1 / (1 + Math.exp(-decodedLogit)) : Math.exp(decodedLogit) / (1 + Math.exp(decodedLogit));
         const error = Math.abs(sourceAlpha - decodedAlpha);
@@ -391,7 +408,13 @@ function validateDecoded(sources, sourceLayout, manifest, activeSlots, rows, ind
     rotation: { observationCount: rotationCount, angularRmseDegrees: Math.sqrt(rotationSquare / rotationCount), maximumAngleDegrees: rotationMaximum },
     scale: { valueCount: scaleCount, rmse: Math.sqrt(scaleSquare / scaleCount), maximumLogError: scaleMaximum },
     colorDc: { valueCount: colorDcCount, rmse: Math.sqrt(colorDcSquare / colorDcCount), maximumError: colorDcMaximum },
-    opacityAlpha: { valueCount: opacityCount, rmse: Math.sqrt(opacitySquare / opacityCount), maximumError: opacityMaximum },
+    opacityAlpha: {
+      valueCount: opacityCount,
+      rmse: Math.sqrt(opacitySquare / opacityCount),
+      maximumError: opacityMaximum,
+      bitExactValues: opacityBitExactValues,
+      bitExactTemporalValues: opacityBitExactTemporalValues,
+    },
   };
 }
 

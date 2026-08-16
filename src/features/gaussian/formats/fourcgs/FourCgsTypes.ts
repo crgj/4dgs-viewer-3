@@ -26,6 +26,20 @@ export interface FourCgsStreamEntry {
   readonly v21DecodedSha256?: string;
 }
 
+export interface FourCgsSceneTransform {
+  readonly schemaVersion: 1;
+  readonly coordinateSystem: 'playcanvas-y-up';
+  readonly units: 'meter';
+  readonly position: readonly [number, number, number];
+  readonly rotationEulerDegrees: readonly [number, number, number];
+  readonly scale: readonly [number, number, number];
+}
+
+export interface FourCgsMetadata {
+  readonly sceneTransform?: FourCgsSceneTransform;
+  readonly [key: string]: unknown;
+}
+
 export interface FourCgsManifest {
   readonly format: '4CGS';
   readonly version: number;
@@ -47,6 +61,7 @@ export interface FourCgsManifest {
   readonly mintMixRq?: Record<string, unknown>;
   readonly mesongsTemporal?: Record<string, unknown>;
   readonly temporalAttributes?: Record<string, unknown>;
+  readonly metadata?: FourCgsMetadata;
   readonly [key: string]: unknown;
 }
 
@@ -59,6 +74,7 @@ export interface FourCgsDescriptor {
   readonly totalFrames: number;
   readonly slotCount: number;
   readonly segments: readonly FourCgsSegment[];
+  readonly sceneTransform?: FourCgsSceneTransform;
   readonly crossOriginIsolated: boolean;
   readonly decodeTimings: FourCgsDecodeTimings;
 }
@@ -68,6 +84,8 @@ export interface FourCgsDecodeTimings {
   readonly attributeDecodeMs: number;
   readonly totalMs: number;
   readonly workerCount: number;
+  readonly hardwareConcurrency: number;
+  readonly attributeTasksMs: Readonly<Record<string, number>>;
 }
 
 export interface FourCgsProgress {

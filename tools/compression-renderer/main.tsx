@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { detectAutomaticGaussian4DMemoryPolicy } from '../../src/features/gaussian/memory/Gaussian4DMemoryPolicy';
 import { GaussianViewport } from '../../src/features/viewport/components/GaussianViewport';
@@ -48,6 +48,10 @@ const ignoreTransform = (_transform: ViewportTransform) => undefined;
 const ignoreSelection = (_selection: ViewportSelectionState) => undefined;
 // #WDD-gpt 2026-08-15 - 独立压缩评测不启用重光照，但仍显式接收 Viewport 新增的状态回调以保持构建隔离。
 const ignoreRelighting = () => undefined;
+// #WDD-gpt 2026-08-16 - 隔离评测固定隐藏编辑辅助项，只接收正式视口新增的性能、历史和圆柱选择受控接口。
+const disabledSelectionCylinder = {
+  centerX: 0, centerZ: 0, radius: 1, height: 2, groundPadding: 0.08,
+};
 
 const nextPaint = () => new Promise<void>((resolve) => {
   window.requestAnimationFrame(() => window.requestAnimationFrame(() => resolve()));
@@ -68,7 +72,10 @@ function captureCanvas(canvas: HTMLCanvasElement): Promise<Blob> {
 }
 
 async function captureRenderableCanvas(canvas: HTMLCanvasElement, settleMilliseconds: number): Promise<Blob> {
-  for (let attempt = 0; attempt < 5; attempt += 1) {
+  let previousPixels: ImageData | null = null;
+  let consecutiveStableFrames = 0;
+  const stabilityDeadline = performance.now() + Math.max(320, settleMilliseconds * 2);
+  for (let attempt = 0; attempt < 10; attempt += 1) {
     const blob = await captureCanvas(canvas);
     const pixels = await readBlobPixels(blob);
     let visiblePixels = 0;
@@ -76,11 +83,25 @@ async function captureRenderableCanvas(canvas: HTMLCanvasElement, settleMillisec
       const offset = pixel * 4;
       if (pixels.data[offset] + pixels.data[offset + 1] + pixels.data[offset + 2] > 48) visiblePixels += 1;
     }
-    if (visiblePixels >= 64) return blob;
-    await wait(Math.max(500, settleMilliseconds));
+    let identicalToPrevious = previousPixels !== null
+      && previousPixels.width === pixels.width
+      && previousPixels.height === pixels.height;
+    if (identicalToPrevious && previousPixels) {
+      for (let index = 0; index < pixels.data.length; index += 1) {
+        if (pixels.data[index] !== previousPixels.data[index]) {
+          identicalToPrevious = false;
+          break;
+        }
+      }
+    }
+    consecutiveStableFrames = visiblePixels >= 64 && identicalToPrevious ? consecutiveStableFrames + 1 : 0;
+    // #WDD-gpt 2026-08-16 - WebGL2 Worker Sort 完成时间不固定；连续像素一致且经过最短稳定窗后才采样，杜绝未排序帧污染 PSNR。
+    if (visiblePixels >= 64 && consecutiveStableFrames >= 1 && performance.now() >= stabilityDeadline) return blob;
+    previousPixels = pixels;
+    await wait(Math.max(100, settleMilliseconds));
     await nextPaint();
   }
-  throw new Error('Renderer remained blank after five readiness retries');
+  throw new Error('Renderer did not reach two consecutive stable visible frames');
 }
 
 async function readBlobPixels(blob: Blob): Promise<ImageData> {
@@ -155,6 +176,8 @@ function CompressionRenderer() {
   const [result, setResult] = useState('');
   const [worstSource, setWorstSource] = useState('');
   const [worstDecoded, setWorstDecoded] = useState('');
+  // #WDD-gpt 2026-08-16 - 保持 sourceFiles 引用稳定，避免状态回调触发视口重复导入形成 React 更新环。
+  const activeFiles = useMemo(() => activeFile ? [activeFile] : [], [activeFile]);
 
   useEffect(() => {
     const query = new URLSearchParams(window.location.search);
@@ -176,10 +199,15 @@ function CompressionRenderer() {
         all.findIndex((candidate) => candidate.img_name === camera.img_name) === index
       ));
       const requestedCameraLimit = Math.max(1, Number.parseInt(query.get('cameraLimit') || `${uniqueCameras.length}`, 10));
+      const requestedCameraNames = new Set((query.get('cameraNames') || '').split(',').filter(Boolean));
       // #WDD-gpt 2026-08-15 - 抽查模式按完整相机序列等距取样，避免只测相邻视角造成虚高 PSNR。
-      const sampledCameras = requestedCameraLimit < uniqueCameras.length
-        ? Array.from({ length: requestedCameraLimit }, (_, index) => uniqueCameras[Math.floor(index * uniqueCameras.length / requestedCameraLimit)])
-        : uniqueCameras;
+      // #WDD-gpt 2026-08-16 - 最差样本消融可按已验收相机名精确复测，避免为单属性诊断重复渲染无关视角。
+      const sampledCameras = requestedCameraNames.size > 0
+        ? uniqueCameras.filter((camera) => requestedCameraNames.has(camera.img_name))
+        : requestedCameraLimit < uniqueCameras.length
+          ? Array.from({ length: requestedCameraLimit }, (_, index) => uniqueCameras[Math.floor(index * uniqueCameras.length / requestedCameraLimit)])
+          : uniqueCameras;
+      if (sampledCameras.length === 0) throw new Error('No camera matched cameraNames.');
       const nextSourceFile = new File([sourceBuffer], assetName(sourcePath), { type: 'application/octet-stream' });
       const nextDecodedFile = new File([decodedBuffer], assetName(decodedPath), { type: 'application/octet-stream' });
       setSourceFile(nextSourceFile);
@@ -211,8 +239,22 @@ function CompressionRenderer() {
         readonly blob: Blob;
       }> = [];
       // #WDD-gpt 2026-08-16 - 大 RAW4D 报告 ready 后仍给相机控制器一个稳定周期，避免首个评测姿态早于相机初始化。
-      await wait(settleMilliseconds);
+      await wait(Math.max(5000, settleMilliseconds * 12));
       await nextPaint();
+      for (const warmupCamera of [cameras[0], cameras[cameras.length - 1]]) {
+        const warmupPose: EvaluationCameraPose = {
+          position: warmupCamera.position,
+          rotation: warmupCamera.rotation,
+          fx: warmupCamera.fx,
+          sourceWidth: warmupCamera.width,
+        };
+        runtime.setEvaluationCamera(warmupPose);
+        runtime.setFrame(frames[0]);
+        await nextPaint();
+        await wait(Math.max(2500, settleMilliseconds * 10));
+        // #WDD-gpt 2026-08-16 - Source/Decoded 都先完成两个不同姿态的冷启动排序，清空跨资产迟到的 Worker 结果。
+        await captureRenderableCanvas(canvas, settleMilliseconds);
+      }
       for (let cameraIndex = 0; cameraIndex < cameras.length; cameraIndex += 1) {
         const camera = cameras[cameraIndex];
         const pose: EvaluationCameraPose = {
@@ -225,6 +267,10 @@ function CompressionRenderer() {
           runtime.setEvaluationCamera(pose);
           runtime.setFrame(frame);
           await nextPaint();
+          if (cameraIndex === 0 && frame === frames[0]) {
+            // #WDD-gpt 2026-08-16 - 首个目标姿态必须等前一轮预热排序退出；否则迟到的 Worker 结果会覆盖正确相机的深度序。
+            await wait(Math.max(2000, settleMilliseconds * 8));
+          }
           await wait(settleMilliseconds);
           captures.push({
             cameraIndex,
@@ -353,12 +399,15 @@ function CompressionRenderer() {
   return (
     <main className="compression-renderer">
       <section className="compression-renderer-panel" ref={sourcePanelRef}>
+        {/* #WDD-gpt 2026-08-16 - 跟随正式视口的多文件入口，只向隔离评测器传入当前单个对比资产。 */}
         <GaussianViewport
           activeTool="select"
           brushRadius={24}
           currentFrame={0}
           memoryPolicy={memoryPolicy}
+          onHistoryChange={ignoreRelighting}
           onMemoryChange={ignoreMemory}
+          onPerformanceChange={ignoreRelighting}
           onRelightingChange={ignoreRelighting}
           onRuntimeChange={setRuntime}
           onSelectionChange={ignoreSelection}
@@ -366,11 +415,14 @@ function CompressionRenderer() {
           onTransformChange={ignoreTransform}
           preserveDrawingBuffer
           renderMode="gaussian"
+          selectionCylinder={disabledSelectionCylinder}
           showGuides={false}
-          sourceFile={activeFile}
+          showAxes={false}
+          showGrid={false}
+          shLevel={3}
+          sourceFiles={activeFiles}
           selectionScope="visible"
           transform={identityTransform}
-          transformSpace="world"
           uniformScale
           viewportLabel="Source compression renderer"
         />

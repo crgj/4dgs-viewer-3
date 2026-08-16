@@ -207,38 +207,42 @@ export function decodeTemporalAttributeReaders(metadata, readers, manifest, acti
   ]));
   const endState = new Int32Array(manifest.slotCount * dimensions);
   const initialized = new Uint8Array(manifest.slotCount);
+  const propertyOffsets = manifest.segments.map((_, segmentIndex) => Array.from(
+    { length: metadata.bankCounts[segmentIndex] },
+    (_, bank) => metadata.components.map((component) => {
+      const property = indices[segmentIndex].get(propertyName(metadata.prefix, bank, component));
+      if (property === undefined) throw new Error(`Temporal attribute property missing: ${propertyName(metadata.prefix, bank, component)}.`);
+      return property;
+    }),
+  ));
   let decodedValues = 0;
+  // #WDD-gpt 2026-08-16 - Scale/DC 解码按行直接写最终 FP16，消除整段 banks 暂存、二次遍历和热循环属性 Map 查询。
   for (let segmentIndex = 0; segmentIndex < manifest.segments.length; segmentIndex += 1) {
     const active = activeSlots[segmentIndex];
     const endpoint = metadata.bankCounts[segmentIndex] - 1;
-    const banks = Array.from({ length: endpoint + 1 }, () => new Int32Array(active.length * dimensions));
-    for (let row = 0; row < active.length; row += 1) {
-      const slot = active[row];
-      for (let component = 0; component < dimensions; component += 1) {
-        const offset = row * dimensions + component;
-        const stateOffset = slot * dimensions + component;
-        const start = initialized[slot] ? endState[stateOffset] + contextReaders.boundary[component].sint() : birth[stateOffset];
-        banks[0][offset] = start;
-        banks[endpoint][offset] = start + contextReaders.endpoint[component].sint();
-        for (let bank = 1; bank < endpoint; bank += 1) {
-          const predicted = Math.round(((endpoint - bank) * start + bank * banks[endpoint][offset]) / endpoint);
-          banks[bank][offset] = predicted + contextReaders.internal[component].sint();
-        }
-        endState[stateOffset] = banks[endpoint][offset];
-      }
-      initialized[slot] = 1;
-    }
     const rowValues = rows[segmentIndex];
     const stride = indices[segmentIndex].size;
-    for (let bank = 0; bank <= endpoint; bank += 1) {
-      for (let row = 0; row < active.length; row += 1) {
-        for (let component = 0; component < dimensions; component += 1) {
-          const code = banks[bank][row * dimensions + component];
-          rowValues[row * stride + indices[segmentIndex].get(propertyName(metadata.prefix, bank, metadata.components[component]))]
-            = metadata.exactHalf ? unorderedHalf(code) : floatToHalf(code * metadata.step);
-          decodedValues += 1;
+    const offsets = propertyOffsets[segmentIndex];
+    for (let row = 0; row < active.length; row += 1) {
+      const slot = active[row];
+      const hasState = initialized[slot] !== 0;
+      const rowOffset = row * stride;
+      for (let component = 0; component < dimensions; component += 1) {
+        const stateOffset = slot * dimensions + component;
+        const start = hasState ? endState[stateOffset] + contextReaders.boundary[component].sint() : birth[stateOffset];
+        const end = start + contextReaders.endpoint[component].sint();
+        const first = endpoint === 0 ? end : start;
+        rowValues[rowOffset + offsets[0][component]] = metadata.exactHalf ? unorderedHalf(first) : floatToHalf(first * metadata.step);
+        for (let bank = 1; bank < endpoint; bank += 1) {
+          const predicted = Math.round(((endpoint - bank) * start + bank * end) / endpoint);
+          const code = predicted + contextReaders.internal[component].sint();
+          rowValues[rowOffset + offsets[bank][component]] = metadata.exactHalf ? unorderedHalf(code) : floatToHalf(code * metadata.step);
         }
+        if (endpoint > 0) rowValues[rowOffset + offsets[endpoint][component]] = metadata.exactHalf ? unorderedHalf(end) : floatToHalf(end * metadata.step);
+        endState[stateOffset] = end;
+        decodedValues += endpoint + 1;
       }
+      initialized[slot] = 1;
     }
   }
   for (const readers of Object.values(contextReaders)) for (const reader of readers) reader.done();

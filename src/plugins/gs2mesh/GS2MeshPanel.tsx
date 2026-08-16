@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { ValidatedNumberInput } from '../../app/components/ValidatedNumberInput';
 import type { UiLanguage } from '../../app/i18n';
 import type { GS2MeshOptions, GS2MeshState } from './GS2MeshTypes';
 import './GS2MeshPanel.css';
@@ -134,13 +135,13 @@ export function GS2MeshPanel({
       </div>
       <p>{copy.description}</p>
       <div className="gs2mesh-config-grid">
-        <label><span>{copy.resolution}</span><select onChange={(event) => setFieldResolution(Number(event.target.value))} value={fieldResolution}><option value="64">64³ · Fast</option><option value="96">96³ · Balanced</option><option value="128">128³ · Fine</option><option value="160">160³ · Dense Ultra</option><option value="256">256³ · Sparse</option><option value="512">512³ · Sparse Fine</option><option value="1024">1024³ · Sparse Max</option></select></label>
-        <label><span>{copy.unitScale}</span><input max="1000000" min="0.001" onChange={(event) => setSceneUnitMillimeters(Number(event.target.value))} step="1" type="number" value={sceneUnitMillimeters} /></label>
-        <label><span>{copy.targetVoxel}</span><select onChange={(event) => setTargetVoxelMillimeters(Number(event.target.value))} value={targetVoxelMillimeters}><option value="0.25">0.25 mm · Extreme</option><option value="0.5">0.5 mm · Ultra</option><option value="1">1.0 mm · Fine</option><option value="2">2.0 mm · Recommended</option></select></label>
-        <label><span>{copy.smoothing}</span><select onChange={(event) => setSmoothingIterations(Number(event.target.value))} value={smoothingIterations}><option value="0">Off</option><option value="2">2× · Light</option><option value="3">3× · Recommended</option><option value="5">5× · Smooth</option></select></label>
-        <label><span>{copy.isoLevel}</span><input max="0.7" min="0.08" onChange={(event) => setIsoLevel(Number(event.target.value))} step="0.01" type="number" value={isoLevel} /></label>
-        <label><span>{copy.maxGaussians}</span><select onChange={(event) => setMaxGaussians(Number(event.target.value))} value={maxGaussians}><option value="40000">40K</option><option value="80000">80K</option><option value="120000">120K</option><option value="160000">160K</option></select></label>
-        <label><span>{copy.views}</span><input max="16" min="4" onChange={(event) => setViewCount(Number(event.target.value))} step="1" type="number" value={viewCount} /></label>
+        <label><span>{copy.resolution}</span><select className="ui-select" onChange={(event) => setFieldResolution(Number(event.target.value))} value={fieldResolution}><option value="64">64³ · Fast</option><option value="96">96³ · Balanced</option><option value="128">128³ · Fine</option><option value="160">160³ · Dense Ultra</option><option value="256">256³ · Sparse</option><option value="512">512³ · Sparse Fine</option><option value="1024">1024³ · Sparse Max</option></select></label>
+        <label><span>{copy.unitScale}</span><ValidatedNumberInput aria-label={copy.unitScale} max={1_000_000} min={0.001} onCommit={setSceneUnitMillimeters} precision={3} step={1} value={sceneUnitMillimeters} /></label>
+        <label><span>{copy.targetVoxel}</span><select className="ui-select" onChange={(event) => setTargetVoxelMillimeters(Number(event.target.value))} value={targetVoxelMillimeters}><option value="0.25">0.25 mm · Extreme</option><option value="0.5">0.5 mm · Ultra</option><option value="1">1.0 mm · Fine</option><option value="2">2.0 mm · Recommended</option></select></label>
+        <label><span>{copy.smoothing}</span><select className="ui-select" onChange={(event) => setSmoothingIterations(Number(event.target.value))} value={smoothingIterations}><option value="0">Off</option><option value="2">2× · Light</option><option value="3">3× · Recommended</option><option value="5">5× · Smooth</option></select></label>
+        <label><span>{copy.isoLevel}</span><ValidatedNumberInput aria-label={copy.isoLevel} max={0.7} min={0.08} onCommit={setIsoLevel} precision={2} step={0.01} value={isoLevel} /></label>
+        <label><span>{copy.maxGaussians}</span><select className="ui-select" onChange={(event) => setMaxGaussians(Number(event.target.value))} value={maxGaussians}><option value="40000">40K</option><option value="80000">80K</option><option value="120000">120K</option><option value="160000">160K</option></select></label>
+        <label><span>{copy.views}</span><ValidatedNumberInput aria-label={copy.views} integer max={16} min={4} onCommit={setViewCount} precision={0} step={1} value={viewCount} /></label>
       </div>
       <div aria-live="polite" className="gs2mesh-status" role="status">
         <span>{message}</span>

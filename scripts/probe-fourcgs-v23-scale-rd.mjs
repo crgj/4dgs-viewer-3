@@ -27,7 +27,11 @@ async function main() {
     .split(',').map(Number).filter((value) => Number.isFinite(value) && value > 0);
   const started = performance.now();
   const segments = await readSegments(sourceDirectory);
-  const manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
+  const manifestSource = await readFile(manifestPath);
+  // #WDD-gpt 2026-08-16 - 允许码率探针直接读取正式 4CGS 容器目录，避免依赖已清理的旁路 manifest 文件。
+  const manifest = manifestSource.subarray(0, 8).toString('ascii') === '4CGSPRS2'
+    ? JSON.parse(manifestSource.subarray(12, 12 + manifestSource.readUInt32LE(8)).toString('utf8'))
+    : JSON.parse(manifestSource.toString('utf8'));
   const permanent = buildExactBoundaryPermanentTrackMaps(segments);
   const layout = buildCroppedMortonLayout(segments, permanent, manifest.crop.center, manifest.crop.halfExtent);
   const bankCounts = segments.map((segment) => bankCount(segment, 'scale_bank'));

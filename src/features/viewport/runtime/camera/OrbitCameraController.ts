@@ -21,6 +21,19 @@ export interface OrbitCameraState {
   readonly yaw: number;
 }
 
+export type OrbitCameraPreset = 'back' | 'bottom' | 'front' | 'left' | 'right' | 'top';
+
+export function orbitCameraPresetAngles(preset: OrbitCameraPreset): { pitch: number; yaw: number } {
+  switch (preset) {
+    case 'back': return { pitch: 0, yaw: 180 };
+    case 'bottom': return { pitch: -90, yaw: 0 };
+    case 'left': return { pitch: 0, yaw: -90 };
+    case 'right': return { pitch: 0, yaw: 90 };
+    case 'top': return { pitch: 90, yaw: 0 };
+    default: return { pitch: 0, yaw: 0 };
+  }
+}
+
 interface PointerPoint {
   x: number;
   y: number;
@@ -98,6 +111,25 @@ export class OrbitCameraController {
     };
   }
 
+  // #WDD-gpt 2026-08-16 - ViewCube 只吸附观察方向，保留当前轨道中心和距离，便于在编辑构图间快速往返。
+  setPreset(preset: OrbitCameraPreset): void {
+    const angles = orbitCameraPresetAngles(preset);
+    this.clearInput();
+    this.pitch = angles.pitch;
+    this.yaw = angles.yaw;
+    this.updateCamera();
+    this.canvas.dataset.cameraView = preset;
+  }
+
+  // #WDD-gpt 2026-08-16 - 导航立方体拖拽直接复用轨道相机角度，形成与 Blender 导航 Gizmo 一致的环绕反馈。
+  orbitBy(deltaYaw: number, deltaPitch: number): void {
+    this.clearInput();
+    this.yaw += deltaYaw;
+    this.pitch = Math.max(-89.8, Math.min(89.8, this.pitch + deltaPitch));
+    this.canvas.dataset.cameraView = 'custom';
+    this.updateCamera();
+  }
+
   private readonly onPointerDown = (event: PointerEvent) => {
     if (!this.inputEnabled || blocksCameraInput(event.target)) return;
     this.canvas.setPointerCapture(event.pointerId);
@@ -130,6 +162,7 @@ export class OrbitCameraController {
     } else {
       this.yaw -= dx * 0.22;
       this.pitch = Math.max(-82, Math.min(82, this.pitch + dy * 0.18));
+      this.canvas.dataset.cameraView = 'custom';
     }
 
     this.updateCamera();
@@ -220,7 +253,9 @@ export class OrbitCameraController {
       this.target.y + Math.sin(pitch) * this.distance,
       this.target.z + Math.cos(yaw) * horizontal,
     );
-    this.camera.lookAt(this.target);
+    // #WDD-gpt 2026-08-16 - 正上方视角改用 -Z 作为屏幕上方，避免默认 Y-up 与视线平行时退化翻转。
+    const up = Math.abs(Math.cos(pitch)) < 1e-5 ? new Vec3(0, 0, -1) : Vec3.UP;
+    this.camera.lookAt(this.target, up);
     // #WDD-gpt 2026-08-15 - 将只读相机位置写入 canvas dataset，便于无侵入浏览器回归验证输入隔离。
     const position = this.camera.getPosition();
     this.canvas.dataset.cameraPosition = [position.x, position.y, position.z]

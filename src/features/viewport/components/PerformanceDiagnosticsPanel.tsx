@@ -24,7 +24,7 @@ export function PerformanceDiagnosticsPanel({ snapshot }: { readonly snapshot: V
       </svg>
       <dl className="property-list performance-device">
         <div><dt>后端</dt><dd>{snapshot.device.backend}</dd></div>
-        <div><dt>设备</dt><dd title={snapshot.device.renderer}>{snapshot.device.renderer}</dd></div>
+        <div><dt>设备</dt><dd className="has-tip" data-tip={snapshot.device.renderer}>{snapshot.device.renderer}</dd></div>
         <div><dt>CPU</dt><dd>{snapshot.device.logicalCores ? `${snapshot.device.logicalCores} threads` : '--'}</dd></div>
         <div><dt>设备内存</dt><dd>{snapshot.device.deviceMemoryGiB ? `${snapshot.device.deviceMemoryGiB} GiB` : '--'}</dd></div>
       </dl>

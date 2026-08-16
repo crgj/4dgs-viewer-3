@@ -226,50 +226,183 @@ export function decodeSo3Rotations(encoded, manifest, activeSlots, rows, indices
   return decodeSo3RotationStreams(metadata, streams, manifest, activeSlots, rows, indices);
 }
 
-// #WDD-gpt 2026-08-16 - V2.4 直接消费结构化外层恢复出的原始子流，跳过昂贵的 rANS 重编码再解码。
-export function decodeSo3RotationStreams(metadata, streams, manifest, activeSlots, rows, indices) {
+function int32Storage(length, shared) {
+  const buffer = shared && typeof SharedArrayBuffer !== 'undefined'
+    ? new SharedArrayBuffer(length * Int32Array.BYTES_PER_ELEMENT)
+    : new ArrayBuffer(length * Int32Array.BYTES_PER_ELEMENT);
+  return new Int32Array(buffer);
+}
+
+function uint16Storage(length, shared) {
+  const buffer = shared && typeof SharedArrayBuffer !== 'undefined'
+    ? new SharedArrayBuffer(length * Uint16Array.BYTES_PER_ELEMENT)
+    : new ArrayBuffer(length * Uint16Array.BYTES_PER_ELEMENT);
+  return new Uint16Array(buffer);
+}
+
+function uint8Storage(length, shared) {
+  const buffer = shared && typeof SharedArrayBuffer !== 'undefined'
+    ? new SharedArrayBuffer(length)
+    : new ArrayBuffer(length);
+  return new Uint8Array(buffer);
+}
+
+// #WDD-gpt 2026-08-16 - Rotation 先顺序展开位流为共享整数平面，随后可按永久 Track 分区并行执行独立 SO(3) 重建。
+export function prepareSo3RotationStreams(metadata, streams, manifest, activeSlots, shared = false) {
   if (metadata.slotCount !== manifest.slotCount) throw new Error('SO(3) slot mismatch.');
   const birthReader = new BitReader(streams.get('birth'));
-  const birth = Array.from({ length: manifest.slotCount }, () => ({ largest: birthReader.read(2), codes: [birthReader.read(metadata.bits), birthReader.read(metadata.bits), birthReader.read(metadata.bits)] }));
+  const birthLargest = uint8Storage(manifest.slotCount, shared);
+  const birthCodes = uint16Storage(manifest.slotCount * 3, shared);
+  for (let slot = 0; slot < manifest.slotCount; slot += 1) {
+    birthLargest[slot] = birthReader.read(2);
+    const offset = slot * 3;
+    birthCodes[offset] = birthReader.read(metadata.bits);
+    birthCodes[offset + 1] = birthReader.read(metadata.bits);
+    birthCodes[offset + 2] = birthReader.read(metadata.bits);
+  }
   const context = Object.fromEntries(['boundary', 'endpoint'].map((name) => [name, Array.from({ length: 3 }, (_, axis) => new ByteReader(streams.get(`${name}:${axis}`)))]));
   const exceptionReader = new ByteReader(streams.get('exceptions'));
-  const exceptions = new Map();
   const exceptionCount = exceptionReader.uint();
+  const exceptionOrdinals = int32Storage(exceptionCount, shared);
+  const exceptionBits = uint16Storage(exceptionCount * 4, shared);
   let exceptionOrdinal = -1;
   for (let index = 0; index < exceptionCount; index += 1) {
     exceptionOrdinal += exceptionReader.uint() + 1;
-    exceptions.set(exceptionOrdinal, [exceptionReader.ushort(), exceptionReader.ushort(), exceptionReader.ushort(), exceptionReader.ushort()]);
+    exceptionOrdinals[index] = exceptionOrdinal;
+    const offset = index * 4;
+    exceptionBits[offset] = exceptionReader.ushort();
+    exceptionBits[offset + 1] = exceptionReader.ushort();
+    exceptionBits[offset + 2] = exceptionReader.ushort();
+    exceptionBits[offset + 3] = exceptionReader.ushort();
   }
   exceptionReader.done();
-  const step = metadata.stepDegrees * Math.PI / 180;
+
+  const seen = new Uint8Array(manifest.slotCount);
+  let instanceCount = 0;
+  let boundaryCount = 0;
+  for (const active of activeSlots) {
+    for (let row = 0; row < active.length; row += 1) {
+      const slot = active[row];
+      if (seen[slot]) boundaryCount += 1;
+      else seen[slot] = 1;
+      instanceCount += 1;
+    }
+  }
+  const boundary = Array.from({ length: 3 }, (_, axis) => {
+    const values = int32Storage(boundaryCount, shared);
+    for (let index = 0; index < values.length; index += 1) values[index] = context.boundary[axis].sint();
+    context.boundary[axis].done();
+    return values;
+  });
+  const endpoint = Array.from({ length: 3 }, (_, axis) => {
+    const values = int32Storage(instanceCount, shared);
+    for (let index = 0; index < values.length; index += 1) values[index] = context.endpoint[axis].sint();
+    context.endpoint[axis].done();
+    return values;
+  });
+  const expectedObservations = metadata.bankCounts.reduce(
+    (sum, count, segmentIndex) => sum + count * activeSlots[segmentIndex].length, 0,
+  );
+  if (expectedObservations !== instanceCount * 2) throw new Error('SO(3) codec expects two Rotation banks per segment.');
+  return {
+    bits: metadata.bits,
+    stepDegrees: metadata.stepDegrees,
+    slotCount: manifest.slotCount,
+    instanceCount,
+    boundaryCount,
+    exceptionCount,
+    birthLargest,
+    birthCodes,
+    boundary,
+    endpoint,
+    exceptionOrdinals,
+    exceptionBits,
+  };
+}
+
+export function decodeSo3RotationPartition(prepared, manifest, activeSlots, rows, indices, partitionIndex = 0, partitionCount = 1) {
+  if (!Number.isInteger(partitionIndex) || !Number.isInteger(partitionCount)
+    || partitionCount < 1 || partitionIndex < 0 || partitionIndex >= partitionCount) {
+    throw new Error('SO(3) partition is invalid.');
+  }
+  const exceptions = new Map();
+  for (let index = 0; index < prepared.exceptionCount; index += 1) {
+    const offset = index * 4;
+    exceptions.set(prepared.exceptionOrdinals[index], [
+      prepared.exceptionBits[offset], prepared.exceptionBits[offset + 1],
+      prepared.exceptionBits[offset + 2], prepared.exceptionBits[offset + 3],
+    ]);
+  }
+  const step = prepared.stepDegrees * Math.PI / 180;
   const state = new Float32Array(manifest.slotCount * 4);
-  const initialized = new Uint8Array(manifest.slotCount);
-  let ordinal = 0;
+  const seen = new Uint8Array(manifest.slotCount);
+  const propertyOffsets = manifest.segments.map((_, segmentIndex) => [0, 1].map((bank) => ['w', 'x', 'y', 'z'].map((component) => {
+    const property = indices[segmentIndex].get(`rot_bank_${bank}_${component}`);
+    if (property === undefined) throw new Error(`SO(3) property layout missing for segment ${segmentIndex}, bank ${bank}, ${component}.`);
+    return property;
+  })));
+  let instance = 0;
+  let boundaryIndex = 0;
+  let processedInstances = 0;
   for (let segmentIndex = 0; segmentIndex < manifest.segments.length; segmentIndex += 1) {
     const rowValues = rows[segmentIndex];
     const stride = indices[segmentIndex].size;
+    const offsets = propertyOffsets[segmentIndex];
     for (let row = 0; row < activeSlots[segmentIndex].length; row += 1) {
       const slot = activeSlots[segmentIndex][row];
+      const continuing = seen[slot] !== 0;
+      if (!continuing) seen[slot] = 1;
+      const currentBoundary = boundaryIndex;
+      if (continuing) boundaryIndex += 1;
+      const currentInstance = instance;
+      instance += 1;
+      if (slot % partitionCount !== partitionIndex) continue;
+      processedInstances += 1;
       let start;
-      if (!initialized[slot]) start = halfQuaternion(decodeSmallestThree(birth[slot].largest, birth[slot].codes, metadata.bits));
+      if (!continuing) {
+        const birthOffset = slot * 3;
+        start = halfQuaternion(decodeSmallestThree(prepared.birthLargest[slot], [
+          prepared.birthCodes[birthOffset], prepared.birthCodes[birthOffset + 1], prepared.birthCodes[birthOffset + 2],
+        ], prepared.bits));
+      }
       else {
         const previous = Array.from(state.subarray(slot * 4, slot * 4 + 4));
-        start = halfQuaternion(applyTangent(previous, context.boundary.map((reader) => reader.sint() * step)));
+        start = halfQuaternion(applyTangent(previous, [
+          prepared.boundary[0][currentBoundary] * step,
+          prepared.boundary[1][currentBoundary] * step,
+          prepared.boundary[2][currentBoundary] * step,
+        ]));
       }
-      const startException = exceptions.get(ordinal++);
+      const startOrdinal = currentInstance * 2;
+      const startException = exceptions.get(startOrdinal);
       const startBits = startException ?? start.map(floatToHalf);
       if (startException) start = normalized(startBits.map(halfToFloat));
-      for (let axis = 0; axis < 4; axis += 1) rowValues[row * stride + indices[segmentIndex].get(`rot_bank_0_${['w', 'x', 'y', 'z'][axis]}`)] = startBits[axis];
-      let end = halfQuaternion(applyTangent(start, context.endpoint.map((reader) => reader.sint() * step)));
-      const endException = exceptions.get(ordinal++);
+      const rowOffset = row * stride;
+      for (let axis = 0; axis < 4; axis += 1) rowValues[rowOffset + offsets[0][axis]] = startBits[axis];
+      let end = halfQuaternion(applyTangent(start, [
+        prepared.endpoint[0][currentInstance] * step,
+        prepared.endpoint[1][currentInstance] * step,
+        prepared.endpoint[2][currentInstance] * step,
+      ]));
+      const endException = exceptions.get(startOrdinal + 1);
       const endBits = endException ?? end.map(floatToHalf);
       if (endException) end = normalized(endBits.map(halfToFloat));
-      for (let axis = 0; axis < 4; axis += 1) rowValues[row * stride + indices[segmentIndex].get(`rot_bank_1_${['w', 'x', 'y', 'z'][axis]}`)] = endBits[axis];
+      for (let axis = 0; axis < 4; axis += 1) rowValues[rowOffset + offsets[1][axis]] = endBits[axis];
       state.set(end, slot * 4);
-      initialized[slot] = 1;
     }
   }
-  for (const readers of Object.values(context)) for (const reader of readers) reader.done();
-  if (ordinal !== metadata.bankCounts.reduce((sum, count, segmentIndex) => sum + count * activeSlots[segmentIndex].length, 0)) throw new Error('SO(3) observation mismatch.');
-  return { observationCount: ordinal, appliedExceptions: exceptionCount, stepDegrees: metadata.stepDegrees };
+  if (instance !== prepared.instanceCount || boundaryIndex !== prepared.boundaryCount) throw new Error('SO(3) partition traversal mismatch.');
+  return {
+    observationCount: processedInstances * 2,
+    appliedExceptions: prepared.exceptionCount,
+    stepDegrees: prepared.stepDegrees,
+  };
+}
+
+// #WDD-gpt 2026-08-16 - V2.4 直接消费结构化外层恢复出的原始子流，跳过昂贵的 rANS 重编码再解码。
+export function decodeSo3RotationStreams(metadata, streams, manifest, activeSlots, rows, indices) {
+  const prepared = prepareSo3RotationStreams(metadata, streams, manifest, activeSlots, false);
+  const result = decodeSo3RotationPartition(prepared, manifest, activeSlots, rows, indices);
+  if (result.observationCount !== prepared.instanceCount * 2) throw new Error('SO(3) observation mismatch.');
+  return result;
 }

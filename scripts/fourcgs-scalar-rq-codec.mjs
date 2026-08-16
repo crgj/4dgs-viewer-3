@@ -1,4 +1,4 @@
-import { deflateSync, inflateSync } from 'node:zlib';
+import { unzlibSync, zlibSync } from 'fflate';
 import { floatToHalf, halfToFloat } from './fourcgs-prs-codec.mjs';
 
 const MAGIC = 'MIXSC001';
@@ -197,9 +197,10 @@ export function encodeScalarRq(sourceBits, observationCount, dimensions, options
     });
   }
   const rawLabels = labelWriter.finish();
-  const storedLabels = deflateSync(rawLabels, { level: 9 });
-  const storedMask = deflateSync(exceptionMask, { level: 9 });
-  const storedExceptions = deflateSync(Buffer.from(exceptionValues), { level: 9 });
+  // #WDD-gpt 2026-08-16 - Scalar RQ 改用浏览器原生可打包的 fflate，避免 Worker 运行时依赖被 Vite 外置的 node:zlib。
+  const storedLabels = zlibSync(rawLabels, { level: 9 });
+  const storedMask = zlibSync(exceptionMask, { level: 9 });
+  const storedExceptions = zlibSync(Buffer.from(exceptionValues), { level: 9 });
   const modelBytes = Buffer.concat(modelParts);
   const header = Buffer.alloc(HEADER_BYTES);
   header.write(MAGIC, 0, 'ascii');
@@ -272,11 +273,11 @@ export function decodeScalarRq(encoded) {
     models.push({ bits, predictor, centroids });
   }
   if (offset !== modelEnd || models.length !== dimensions) throw new Error('Invalid scalar RQ model bytes.');
-  const labels = inflateSync(encoded.subarray(offset, offset + labelBytes));
+  const labels = unzlibSync(encoded.subarray(offset, offset + labelBytes));
   offset += labelBytes;
-  const mask = inflateSync(encoded.subarray(offset, offset + maskBytes));
+  const mask = unzlibSync(encoded.subarray(offset, offset + maskBytes));
   offset += maskBytes;
-  const exceptions = inflateSync(encoded.subarray(offset, offset + exceptionBytes));
+  const exceptions = unzlibSync(encoded.subarray(offset, offset + exceptionBytes));
   offset += exceptionBytes;
   if (offset !== encoded.length || labels.length !== rawLabelBytes || mask.length !== Math.ceil(observationCount * dimensions / 8)) {
     throw new Error('Invalid scalar RQ payload bytes.');

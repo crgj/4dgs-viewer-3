@@ -615,17 +615,29 @@ export function decodePositionContextStreams(contexts, manifest, activeSlots, ro
   const { center, halfExtent, step, cellSize } = manifest.prs.position;
   const origin = center.map((value) => value - halfExtent);
   const cellQuant = Math.max(1, Math.round(cellSize / step));
-  const state = [new Int32Array(manifest.slotCount), new Int32Array(manifest.slotCount), new Int32Array(manifest.slotCount)];
+  const stateX = new Int32Array(manifest.slotCount);
+  const stateY = new Int32Array(manifest.slotCount);
+  const stateZ = new Int32Array(manifest.slotCount);
   const initialized = new Uint8Array(manifest.slotCount);
   const layerCount = metadata.uint();
+  const hasExceptions = exceptionMap.size > 0;
   let decodedLayers = 0;
   let ordinal = 0;
+  // #WDD-gpt 2026-08-16 - Position 热循环消除逐点 Array/map、模板字符串和属性 Map 查询，保持相同整数状态与 FP16 写出顺序。
   for (let segmentIndex = 0; segmentIndex < manifest.segments.length; segmentIndex += 1) {
     const active = activeSlots[segmentIndex];
     const rowValues = rows[segmentIndex];
     const stride = indices[segmentIndex].size;
     for (let bank = 0; bank < manifest.segments[segmentIndex].bankCounts.position; bank += 1) {
-      const global = [metadata.sint(), metadata.sint(), metadata.sint()];
+      const propertyX = indices[segmentIndex].get(`xyz_bank_${bank}_x`);
+      const propertyY = indices[segmentIndex].get(`xyz_bank_${bank}_y`);
+      const propertyZ = indices[segmentIndex].get(`xyz_bank_${bank}_z`);
+      if (propertyX === undefined || propertyY === undefined || propertyZ === undefined) {
+        throw new Error(`Position property layout missing for segment ${segmentIndex}, bank ${bank}.`);
+      }
+      const globalX = metadata.sint();
+      const globalY = metadata.sint();
+      const globalZ = metadata.sint();
       const cellCount = metadata.uint();
       const cells = new Map();
       let key = 0;
@@ -633,31 +645,54 @@ export function decodePositionContextStreams(contexts, manifest, activeSlots, ro
         key += metadata.uint();
         cells.set(key, readTriple(metadata));
       }
-      let birth = [0, 0, 0];
+      let birthX = 0;
+      let birthY = 0;
+      let birthZ = 0;
       let hasBirth = false;
       for (let row = 0; row < active.length; row += 1) {
         const slot = active[row];
         const code = dictionaryCodes.uint();
-        const residual = code === 0 ? escape.map((reader) => reader.sint()) : tripleDictionary.entries[code - 1];
-        let quantized;
-        if (initialized[slot]) {
-          const cellKey = Math.floor(state[0][slot] / cellQuant)
-            + Math.floor(state[1][slot] / cellQuant) * 32
-            + Math.floor(state[2][slot] / cellQuant) * 1024;
-          const cell = cells.get(cellKey) ?? [0, 0, 0];
-          quantized = residual.map((value, axis) => state[axis][slot] + global[axis] + cell[axis] + value);
+        let residualX;
+        let residualY;
+        let residualZ;
+        if (code === 0) {
+          residualX = escape[0].sint();
+          residualY = escape[1].sint();
+          residualZ = escape[2].sint();
         } else {
-          quantized = residual.map((value, axis) => (hasBirth ? birth[axis] : 0) + value);
-          birth = quantized;
+          const residual = tripleDictionary.entries[code - 1];
+          residualX = residual[0];
+          residualY = residual[1];
+          residualZ = residual[2];
+        }
+        let quantizedX;
+        let quantizedY;
+        let quantizedZ;
+        if (initialized[slot]) {
+          const cellKey = Math.floor(stateX[slot] / cellQuant)
+            + Math.floor(stateY[slot] / cellQuant) * 32
+            + Math.floor(stateZ[slot] / cellQuant) * 1024;
+          const cell = cells.get(cellKey);
+          quantizedX = stateX[slot] + globalX + (cell?.[0] ?? 0) + residualX;
+          quantizedY = stateY[slot] + globalY + (cell?.[1] ?? 0) + residualY;
+          quantizedZ = stateZ[slot] + globalZ + (cell?.[2] ?? 0) + residualZ;
+        } else {
+          quantizedX = (hasBirth ? birthX : 0) + residualX;
+          quantizedY = (hasBirth ? birthY : 0) + residualY;
+          quantizedZ = (hasBirth ? birthZ : 0) + residualZ;
+          birthX = quantizedX;
+          birthY = quantizedY;
+          birthZ = quantizedZ;
           hasBirth = true;
         }
-        const exception = exceptionMap.get(ordinal);
-        for (let axis = 0; axis < 3; axis += 1) {
-          state[axis][slot] = quantized[axis];
-          const name = `xyz_bank_${bank}_${['x', 'y', 'z'][axis]}`;
-          rowValues[row * stride + indices[segmentIndex].get(name)] = exception?.[axis]
-            ?? floatToHalf(origin[axis] + quantized[axis] * step);
-        }
+        const exception = hasExceptions ? exceptionMap.get(ordinal) : undefined;
+        stateX[slot] = quantizedX;
+        stateY[slot] = quantizedY;
+        stateZ[slot] = quantizedZ;
+        const output = row * stride;
+        rowValues[output + propertyX] = exception?.[0] ?? floatToHalf(origin[0] + quantizedX * step);
+        rowValues[output + propertyY] = exception?.[1] ?? floatToHalf(origin[1] + quantizedY * step);
+        rowValues[output + propertyZ] = exception?.[2] ?? floatToHalf(origin[2] + quantizedZ * step);
         initialized[slot] = 1;
         ordinal += 1;
       }
@@ -1015,37 +1050,66 @@ export function decodeScales(encoded, manifest, activeSlots, rows, indices) {
   const reader = new ByteReader(mainBytes);
   const exceptionMap = exceptionRecords(exceptionBytes);
   const step = manifest.prs.scale.step;
-  const state = [new Int32Array(manifest.slotCount), new Int32Array(manifest.slotCount), new Int32Array(manifest.slotCount)];
+  const stateX = new Int32Array(manifest.slotCount);
+  const stateY = new Int32Array(manifest.slotCount);
+  const stateZ = new Int32Array(manifest.slotCount);
   const initialized = new Uint8Array(manifest.slotCount);
   const layerCount = reader.uint();
   const dictionaryCount = reader.uint();
   const dictionary = Array.from({ length: dictionaryCount }, () => [reader.sint(), reader.sint(), reader.sint()]);
+  const hasExceptions = exceptionMap.size > 0;
   let decodedLayers = 0;
   let ordinal = 0;
+  // #WDD-gpt 2026-08-16 - Scale 热循环改为标量整数状态并缓存属性偏移，避免逐点 Array/map、模板字符串和 Map 查询。
   for (let segmentIndex = 0; segmentIndex < manifest.segments.length; segmentIndex += 1) {
     const active = activeSlots[segmentIndex];
     const rowValues = rows[segmentIndex];
     const stride = indices[segmentIndex].size;
     for (let bank = 0; bank < manifest.segments[segmentIndex].bankCounts.scale; bank += 1) {
-      let birth = [0, 0, 0];
+      const propertyX = indices[segmentIndex].get(`scale_bank_${bank}_0`);
+      const propertyY = indices[segmentIndex].get(`scale_bank_${bank}_1`);
+      const propertyZ = indices[segmentIndex].get(`scale_bank_${bank}_2`);
+      if (propertyX === undefined || propertyY === undefined || propertyZ === undefined) {
+        throw new Error(`Scale property layout missing for segment ${segmentIndex}, bank ${bank}.`);
+      }
+      let birthX = 0;
+      let birthY = 0;
+      let birthZ = 0;
       let hasBirth = false;
       for (let row = 0; row < active.length; row += 1) {
         const slot = active[row];
         const dictionaryIndex = reader.byte();
-        const residual = dictionaryIndex === 0
-          ? [reader.sint(), reader.sint(), reader.sint()]
-          : dictionary[dictionaryIndex - 1];
-        const quantized = residual.map((value, axis) => value + (initialized[slot] ? state[axis][slot] : hasBirth ? birth[axis] : 0));
+        let residualX;
+        let residualY;
+        let residualZ;
+        if (dictionaryIndex === 0) {
+          residualX = reader.sint();
+          residualY = reader.sint();
+          residualZ = reader.sint();
+        } else {
+          const residual = dictionary[dictionaryIndex - 1];
+          residualX = residual[0];
+          residualY = residual[1];
+          residualZ = residual[2];
+        }
+        const hasState = initialized[slot] !== 0;
+        const quantizedX = residualX + (hasState ? stateX[slot] : hasBirth ? birthX : 0);
+        const quantizedY = residualY + (hasState ? stateY[slot] : hasBirth ? birthY : 0);
+        const quantizedZ = residualZ + (hasState ? stateZ[slot] : hasBirth ? birthZ : 0);
         if (!initialized[slot]) {
-          birth = quantized;
+          birthX = quantizedX;
+          birthY = quantizedY;
+          birthZ = quantizedZ;
           hasBirth = true;
         }
-        const exception = exceptionMap.get(ordinal);
-        for (let axis = 0; axis < 3; axis += 1) {
-          const name = `scale_bank_${bank}_${axis}`;
-          rowValues[row * stride + indices[segmentIndex].get(name)] = exception?.[axis] ?? floatToHalf(quantized[axis] * step);
-          state[axis][slot] = quantized[axis];
-        }
+        const exception = hasExceptions ? exceptionMap.get(ordinal) : undefined;
+        const output = row * stride;
+        rowValues[output + propertyX] = exception?.[0] ?? floatToHalf(quantizedX * step);
+        rowValues[output + propertyY] = exception?.[1] ?? floatToHalf(quantizedY * step);
+        rowValues[output + propertyZ] = exception?.[2] ?? floatToHalf(quantizedZ * step);
+        stateX[slot] = quantizedX;
+        stateY[slot] = quantizedY;
+        stateZ[slot] = quantizedZ;
         initialized[slot] = 1;
         ordinal += 1;
       }

@@ -77,6 +77,7 @@ input:focus-visible {
 .studio-shell input,
 .studio-shell textarea,
 .studio-shell [contenteditable="true"] {
+  -webkit-user-drag: none;
   user-select: text;
 }
 
@@ -267,6 +268,7 @@ input:focus-visible {
 .brand {
   display: flex;
   align-items: center;
+  gap: 7px;
   min-width: 126px;
   padding-left: 3px;
   padding-right: 16px;
@@ -278,6 +280,24 @@ input:focus-visible {
   font-size: 12px;
   font-weight: 680;
   letter-spacing: 0.005em;
+}
+
+/* #WDD-gpt 2026-08-16 - 使用紧凑低对比徽标显示版本，保持左上品牌区单行且不抢占菜单空间。 */
+.app-version-badge {
+  display: inline-flex;
+  align-items: center;
+  height: 17px;
+  padding: 0 6px;
+  border: 1px solid rgba(73, 222, 178, 0.19);
+  border-radius: 5px;
+  color: #8edbc5;
+  background: rgba(36, 201, 151, 0.08);
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 8px;
+  font-weight: 700;
+  letter-spacing: 0.035em;
+  line-height: 1;
+  white-space: nowrap;
 }
 
 .brand small {
@@ -962,6 +982,71 @@ input:focus-visible {
   display: none;
 }
 
+/* #WDD-gpt 2026-08-16 - 真实投影的导航立方体保持轻量透明容器，并固定在视口右上角。 */
+.viewcube-toolbar {
+  position: absolute;
+  top: 10px;
+  right: 12px;
+  z-index: 8;
+  width: 66px;
+  height: 66px;
+  border-radius: 14px;
+  background: radial-gradient(circle at 50% 46%, rgba(35, 43, 47, 0.32), rgba(7, 10, 12, 0) 68%);
+  filter: drop-shadow(0 7px 10px rgba(0, 0, 0, 0.42));
+  transition: right 160ms ease;
+}
+
+.viewcube-toolbar.inspector-open {
+  right: 342px;
+}
+
+@media (max-width: 1080px) {
+  .viewcube-toolbar.inspector-open { right: 314px; }
+}
+
+@media (max-width: 860px) {
+  .viewcube-toolbar.inspector-open { right: 298px; }
+}
+
+@media (max-width: 620px) {
+  .viewcube-toolbar.inspector-open { right: 14px; }
+}
+
+.viewcube-canvas {
+  display: block;
+  width: 66px;
+  height: 66px;
+  border: 0;
+  border-radius: inherit;
+  outline: 0;
+  background: transparent;
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+}
+
+.viewcube-canvas:hover {
+  background: radial-gradient(circle at 50% 48%, rgba(36, 201, 151, 0.07), transparent 66%);
+}
+
+.viewcube-canvas.dragging {
+  cursor: grabbing;
+}
+
+.viewcube-canvas:focus-visible {
+  outline: 1px solid rgba(52, 211, 153, 0.78);
+  outline-offset: -5px;
+}
+
+.viewcube-accessible-actions {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  pointer-events: none;
+}
+
 /* #WDD-gpt 2026-08-15 - 常驻显示镜头快捷键，降低首次使用 WASD+QE 漫游的发现成本。 */
 .camera-help {
   position: absolute;
@@ -1175,6 +1260,7 @@ input:focus-visible {
 }
 
 .loading-progress {
+  position: relative;
   height: 3px;
   margin-top: 13px;
   overflow: hidden;
@@ -1189,6 +1275,27 @@ input:focus-visible {
   background: linear-gradient(90deg, #25bd90, #56dfba);
   box-shadow: 0 0 12px rgba(65, 215, 170, 0.38);
   transition: width 120ms ease;
+}
+
+/* #WDD-gpt 2026-08-16 - 解码进度尚未跨过下一个属性节点时仍显示合成层流光，明确区分“繁忙”与“卡死”。 */
+.loading-progress::after {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -38%;
+  width: 38%;
+  background: linear-gradient(90deg, transparent, rgba(225, 255, 246, 0.72), transparent);
+  content: "";
+  animation: loading-progress-sweep 1.05s ease-in-out infinite;
+  will-change: transform;
+}
+
+@keyframes loading-progress-sweep {
+  to { transform: translateX(365%); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .loading-progress::after { animation: none; }
 }
 
 .viewport-loading small {
@@ -1361,6 +1468,67 @@ input:focus-visible {
   font-variant-numeric: tabular-nums;
 }
 
+.selection-cylinder-controls {
+  display: grid;
+  gap: 7px;
+  margin-top: 8px;
+}
+
+.selection-cylinder-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 5px;
+}
+
+.selection-cylinder-grid label {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+  color: #737d86;
+  font-size: 8px;
+}
+
+.selection-cylinder-grid label:last-child {
+  grid-column: 1 / -1;
+}
+
+.selection-cylinder-grid input {
+  width: 100%;
+  min-width: 0;
+  height: 26px;
+  padding: 0 7px;
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 6px;
+  color: #c9d3d0;
+  outline: 0;
+  background: rgba(5, 9, 10, 0.7);
+  font: 9px "SFMono-Regular", Consolas, monospace;
+}
+
+.selection-cylinder-actions {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 4px;
+}
+
+.selection-cylinder-actions button {
+  min-width: 0;
+  min-height: 27px;
+  padding: 3px 5px;
+  border: 1px solid rgba(39, 208, 159, 0.18);
+  border-radius: 6px;
+  color: #bfeedd;
+  background: rgba(36, 201, 151, 0.08);
+  font-size: 8px;
+  line-height: 1.2;
+  cursor: pointer;
+}
+
+.selection-cylinder-actions button:disabled {
+  cursor: default;
+  opacity: 0.35;
+}
+
 .selection-tool-hint {
   min-height: 26px;
   margin: 7px 0 8px;
@@ -1475,50 +1643,152 @@ input:focus-visible {
   font-weight: 720;
 }
 
-/* #WDD-gpt  2026-08-16 - 采用 viewer-2 的 data-tip 浮层，替代延迟且样式不可控的浏览器 title。 */
+/* #WDD-gpt 2026-08-16 - data-tip 的定位改由全局 Portal 负责，元素本身只保留语义标记。 */
 .has-tip {
   position: relative;
 }
 
-.has-tip::before {
-  position: absolute;
-  top: 50%;
-  left: calc(100% + 8px);
-  z-index: 50;
+.global-tooltip {
+  position: fixed;
+  z-index: 1100;
+  width: max-content;
   max-width: 230px;
   padding: 6px 8px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  border-radius: 6px;
+  border: 1px solid rgba(64, 220, 174, 0.2);
+  border-radius: 8px;
+  visibility: hidden;
   opacity: 0;
-  color: #dce2df;
-  background: rgba(18, 22, 24, 0.97);
-  box-shadow: 0 8px 26px rgba(0, 0, 0, 0.38);
-  content: attr(data-tip);
-  font-size: 9px;
+  color: #e1f2ec;
+  background: rgba(15, 20, 21, 0.98);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.46), inset 0 1px rgba(255, 255, 255, 0.04);
+  font-family: Inter, "PingFang SC", system-ui, sans-serif;
+  font-size: 10px;
+  font-weight: 560;
   line-height: 1.35;
   pointer-events: none;
-  transform: translate(-3px, -50%);
-  transition: opacity 100ms ease, transform 100ms ease;
+  transition: opacity 100ms ease;
+  white-space: normal;
+}
+
+.global-tooltip.ready {
+  visibility: visible;
+  opacity: 1;
+}
+
+/* #WDD-gpt 2026-08-16 - 原生下拉保留统一闭合样式；自绘下拉进一步统一不可控的系统弹出层。 */
+select.ui-select {
+  min-width: 0;
+  border: 1px solid rgba(255, 255, 255, 0.1) !important;
+  border-radius: 7px !important;
+  color: #d3d9dc !important;
+  outline: 0;
+  background-color: rgba(20, 24, 28, 0.98) !important;
+  background-image:
+    linear-gradient(45deg, transparent 50%, #7e8b8d 50%),
+    linear-gradient(135deg, #7e8b8d 50%, transparent 50%) !important;
+  background-position:
+    calc(100% - 11px) 50%,
+    calc(100% - 7px) 50% !important;
+  background-repeat: no-repeat !important;
+  background-size: 4px 4px, 4px 4px !important;
+  color-scheme: dark;
+  cursor: pointer;
+  appearance: none;
+  padding-right: 22px !important;
+}
+
+select.ui-select:hover,
+select.ui-select:focus-visible {
+  border-color: rgba(43, 213, 161, 0.34) !important;
+  color: #edfff9 !important;
+  background-color: rgba(24, 34, 34, 0.99) !important;
+}
+
+select.ui-select option,
+select.ui-select optgroup {
+  color: #e5ebe9;
+  background: #171c1e;
+  font: 500 11px Inter, "PingFang SC", system-ui, sans-serif;
+}
+
+.ui-select:not(select) {
+  position: relative;
+  min-width: 0;
+}
+
+.ui-select-trigger {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  padding: 0 8px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 7px;
+  color: #d3d9dc;
+  outline: 0;
+  background: rgba(20, 24, 28, 0.98);
+  cursor: pointer;
+  font: inherit;
   white-space: nowrap;
 }
 
-.has-tip:hover::before,
-.has-tip:focus-visible::before {
-  opacity: 1;
-  transform: translate(0, -50%);
+.ui-select-trigger:hover,
+.ui-select-trigger:focus-visible,
+.ui-select-trigger[aria-expanded="true"] {
+  border-color: rgba(43, 213, 161, 0.34);
+  color: #edfff9;
+  background: rgba(24, 34, 34, 0.99);
 }
 
-.selection-detail-panel .has-tip::before {
-  top: calc(100% + 7px);
-  left: 50%;
-  white-space: normal;
-  width: max-content;
-  transform: translate(-50%, -3px);
+.ui-select-trigger i {
+  width: 6px;
+  height: 6px;
+  margin-left: 8px;
+  border-right: 1px solid currentColor;
+  border-bottom: 1px solid currentColor;
+  opacity: 0.7;
+  transform: translateY(-2px) rotate(45deg);
 }
 
-.selection-detail-panel .has-tip:hover::before,
-.selection-detail-panel .has-tip:focus-visible::before {
-  transform: translate(-50%, 0);
+.ui-select-popover {
+  position: fixed;
+  /* #WDD-gpt 2026-08-16 - Portal 弹层使用全局顶层层级，不再被时间轴、检查器或插件窗口压住。 */
+  z-index: 1000;
+  display: grid;
+  min-width: 0;
+  overflow: hidden;
+  padding: 4px;
+  border: 1px solid rgba(64, 220, 174, 0.18);
+  border-radius: 9px;
+  background: rgba(15, 20, 21, 0.99);
+  box-shadow: 0 14px 34px rgba(0, 0, 0, 0.52), inset 0 1px rgba(255, 255, 255, 0.04);
+}
+
+.ui-select-option {
+  min-height: 25px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 6px;
+  color: #aeb8b7;
+  outline: 0;
+  background: transparent;
+  cursor: pointer;
+  font: 600 9px Inter, "PingFang SC", system-ui, sans-serif;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.ui-select-option:hover,
+.ui-select-option:focus-visible {
+  color: #eafff8;
+  background: rgba(43, 213, 161, 0.1);
+}
+
+.ui-select-option[aria-selected="true"] {
+  color: #62e4bd;
+  background: rgba(43, 213, 161, 0.14);
 }
 
 .panel {
@@ -1760,19 +2030,8 @@ input:focus-visible {
   transform: rotate(90deg);
 }
 
-/* #WDD-gpt 2026-08-15 - 将变换页重排为目标状态、模式、坐标空间和分组数值卡片，支持清晰的实时编辑。 */
-.transform-panel-heading {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: 9px;
-}
+/* #WDD-gpt 2026-08-16 - 变换页固定世界空间，只保留数值字段、分组重置和等比缩放。 */
 
-.transform-panel-heading h3 {
-  margin: 0;
-}
-
-.transform-reset-button,
 .transform-vector-heading button {
   padding: 3px 6px;
   border: 1px solid rgba(255, 255, 255, 0.08);
@@ -1783,111 +2042,21 @@ input:focus-visible {
   cursor: pointer;
 }
 
-.transform-reset-button:hover:not(:disabled),
 .transform-vector-heading button:hover:not(:disabled) {
   color: #c6eede;
   border-color: rgba(36, 201, 151, 0.24);
   background: rgba(36, 201, 151, 0.07);
 }
 
-.transform-reset-button:disabled,
 .transform-vector-heading button:disabled,
-.transform-mode-switch button:disabled,
 .vector-row input:disabled {
   cursor: not-allowed;
   opacity: 0.42;
 }
 
-.transform-target {
-  display: flex;
-  min-height: 34px;
-  align-items: center;
-  gap: 8px;
-  padding: 7px 9px;
-  border: 1px solid rgba(36, 201, 151, 0.13);
-  border-radius: 8px;
-  color: #9fb2ab;
-  background: rgba(36, 201, 151, 0.05);
-  font-size: 10px;
-  line-height: 1.35;
-}
-
-.transform-target i {
-  width: 6px;
-  height: 6px;
-  flex: 0 0 auto;
-  border-radius: 50%;
-  background: var(--accent-bright);
-  box-shadow: 0 0 8px rgba(57, 221, 176, 0.42);
-}
-
-.transform-target.empty {
-  color: #777e89;
-  border-color: rgba(255, 255, 255, 0.07);
-  background: rgba(255, 255, 255, 0.025);
-}
-
-.transform-target.empty i {
-  background: #646b76;
-  box-shadow: none;
-}
-
-.transform-control-bar {
-  display: grid;
-  gap: 6px;
-  margin: 8px 0;
-}
-
-.transform-mode-switch,
-.transform-space-switch {
-  display: grid;
-  gap: 3px;
-  padding: 3px;
-  border: 1px solid rgba(255, 255, 255, 0.065);
-  border-radius: 8px;
-  background: rgba(7, 9, 12, 0.28);
-}
-
-.transform-mode-switch {
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-}
-
-.transform-space-switch {
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-}
-
-.transform-mode-switch button,
-.transform-space-switch button {
-  display: flex;
-  height: 27px;
-  align-items: center;
-  justify-content: center;
-  gap: 5px;
-  padding: 0 5px;
-  border: 1px solid transparent;
-  border-radius: 6px;
-  color: #777e8a;
-  background: transparent;
-  font-size: 10px;
-  cursor: pointer;
-}
-
-.transform-mode-switch button:hover:not(:disabled),
-.transform-space-switch button:hover {
-  color: #d6dae0;
-  background: rgba(255, 255, 255, 0.045);
-}
-
-.transform-mode-switch button[aria-pressed="true"],
-.transform-space-switch button[aria-pressed="true"] {
-  color: #b9f2df;
-  border-color: rgba(36, 201, 151, 0.17);
-  background: rgba(36, 201, 151, 0.095);
-}
-
 .transform-vector-card {
-  margin-top: 7px;
-  padding: 8px;
+  margin-top: 6px;
+  padding: 7px;
   border: 1px solid rgba(255, 255, 255, 0.06);
   border-radius: 8px;
   background: rgba(255, 255, 255, 0.022);
@@ -1907,7 +2076,7 @@ input:focus-visible {
 }
 
 .scale-link-row {
-  margin: 9px 2px -2px;
+  margin: 7px 2px -1px;
   color: #777e89;
   font-size: 10px;
 }
@@ -1927,13 +2096,6 @@ input:focus-visible {
   color: var(--accent-bright);
   border-color: rgba(36, 201, 151, 0.22);
   background: rgba(36, 201, 151, 0.1);
-}
-
-.transform-hint {
-  margin: 9px 2px 2px;
-  color: #656d78;
-  font-size: 10px;
-  line-height: 1.5;
 }
 
 .vector-row {
@@ -1959,15 +2121,29 @@ input:focus-visible {
   z-index: 1;
   font-size: 6px;
   font-weight: 760;
+  pointer-events: none;
   transform: translateY(-50%);
 }
 
-.vector-row .scrub-handle {
-  padding: 5px 4px;
-  margin: -5px -4px;
+/* #WDD-gpt 2026-08-16 - 变换数值框本体采用 view2 的水平拖拽光标，拖拽不触发页面滚动。 */
+.validated-number-input.scrubbable {
   cursor: ew-resize;
-  user-select: none;
   touch-action: none;
+}
+
+.validated-number-input.scrubbable:focus {
+  cursor: text;
+  touch-action: manipulation;
+  user-select: text;
+}
+
+/* #WDD-gpt 2026-08-16 - 提交时被限值或判无效后给出短期可见反馈，下一次编辑自动清除。 */
+.validated-number-input[data-validation="corrected"] {
+  border-color: rgba(238, 175, 80, 0.48) !important;
+}
+
+.validated-number-input[aria-invalid="true"] {
+  border-color: rgba(246, 101, 112, 0.58) !important;
 }
 
 .vector-row input {
@@ -2410,7 +2586,7 @@ input:focus-visible {
 
 .timeline-panel {
   display: grid;
-  grid-template-columns: 142px minmax(180px, 1fr) 112px;
+  grid-template-columns: 142px minmax(180px, 1fr) 124px;
   align-items: center;
   gap: 8px;
   min-width: 0;
@@ -2535,9 +2711,42 @@ input:focus-visible {
   font-variant-numeric: tabular-nums;
 }
 
+.timeline-readout {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  justify-content: flex-end;
+  gap: 8px;
+  white-space: nowrap;
+}
+
+.timeline-frame-counter {
+  color: #8b959e !important;
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 8px !important;
+  font-weight: 650 !important;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0 !important;
+}
+
 .timeline-track {
   position: relative;
   height: 22px;
+}
+
+/* #WDD-gpt 2026-08-16 - 用背景分格标出每个整数帧，避免为长序列创建成千上万个 DOM 节点。 */
+.timeline-frame-ticks {
+  position: absolute;
+  top: 5px;
+  right: 0;
+  left: 0;
+  z-index: 1;
+  height: 6px;
+  border-right: 1px solid rgba(255, 255, 255, 0.12);
+  background-image: linear-gradient(90deg, rgba(255, 255, 255, 0.12) 0 1px, transparent 1px);
+  background-position: left top;
+  background-size: calc(100% / var(--timeline-frame-intervals)) 100%;
+  pointer-events: none;
 }
 
 .timeline-track input {
@@ -2657,18 +2866,21 @@ input:focus-visible {
   background: rgba(36, 201, 151, 0.07);
 }
 
-.fps-badge {
-  display: grid;
+.fps-select {
   height: 23px;
-  padding: 0 8px;
-  place-items: center;
-  border: 1px solid var(--stroke);
-  border-radius: 7px;
-  color: #8d939e;
-  background: rgba(255, 255, 255, 0.025);
+  min-width: 58px;
   font-size: 7px;
   font-weight: 650;
   white-space: nowrap;
+}
+
+.fps-select .ui-select-trigger:hover,
+.fps-select .ui-select-trigger:focus-visible,
+.fps-select .ui-select-trigger[aria-expanded="true"] {
+  color: #dffbf2;
+  border-color: rgba(36, 201, 151, 0.28);
+  outline: none;
+  background: rgba(36, 201, 151, 0.07);
 }
 
 .statusbar {
@@ -2768,7 +2980,11 @@ input:focus-visible {
   }
 
   .timeline-panel {
-    grid-template-columns: 154px minmax(160px, 1fr) 82px;
+    grid-template-columns: 154px minmax(160px, 1fr) 88px;
+  }
+
+  .timeline-readout > strong {
+    display: none;
   }
 
   .loop-button span {
@@ -2831,7 +3047,7 @@ input:focus-visible {
   }
 
   .timeline-panel {
-    grid-template-columns: 145px minmax(120px, 1fr);
+    grid-template-columns: 145px minmax(80px, 1fr) 58px;
     gap: 9px;
     margin-right: 8px;
     margin-left: 8px;
@@ -2839,6 +3055,10 @@ input:focus-visible {
   }
 
   .timeline-options {
+    gap: 0;
+  }
+
+  .timeline-options .loop-button {
     display: none;
   }
 
@@ -2904,7 +3124,7 @@ input:focus-visible {
 .timeline-header span,
 .timeline-marks,
 .loop-button,
-.fps-badge,
+.fps-select,
 .statusbar,
 .memory-usage b,
 .memory-usage em,

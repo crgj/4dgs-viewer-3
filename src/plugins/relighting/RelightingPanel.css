@@ -41,7 +41,7 @@
 .relighting-position-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 5px; }
 .relighting-position-grid label { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 4px; align-items: center; }
 .relighting-position-grid b { font: 700 9px ui-monospace, monospace; }
-.relighting-position-grid input, .relighting-light-properties input[type="number"] { min-width: 0; height: 27px; padding: 0 6px; border: 1px solid rgba(183, 147, 99, 0.2); border-radius: 5px; color: #eadac2; background: rgba(10, 8, 6, 0.75); font: 9px ui-monospace, monospace; }
+.relighting-position-grid input, .relighting-light-properties .validated-number-input { min-width: 0; height: 27px; padding: 0 6px; border: 1px solid rgba(183, 147, 99, 0.2); border-radius: 5px; color: #eadac2; background: rgba(10, 8, 6, 0.75); font: 9px ui-monospace, monospace; }
 .relighting-light-properties { display: grid; grid-template-columns: .65fr 1fr 1fr; gap: 6px; }
 .relighting-light-properties label { display: grid; gap: 4px; color: #88765f; font-size: 8px; }
 .relighting-light-properties input { width: 100%; }

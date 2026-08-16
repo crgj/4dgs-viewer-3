@@ -18,10 +18,12 @@ import { GaussianViewport } from '../features/viewport/components/GaussianViewpo
 import { MemoryTelemetryPanel } from '../features/viewport/components/MemoryTelemetryPanel';
 import { PerformanceDiagnosticsPanel } from '../features/viewport/components/PerformanceDiagnosticsPanel';
 import type { ViewportPerformanceSnapshot } from '../features/viewport/runtime/ViewportPerformanceMonitor';
+import type { GaussianCylinderSelectionRegion } from '../features/viewport/runtime/selection/GaussianCylinderSelection';
 import {
   INITIAL_EDITOR_HISTORY_STATE,
   INITIAL_VIEWPORT_SELECTION_STATE,
   ViewportRuntime,
+  type ViewportCameraView,
   type ViewportEditorTool,
   type ViewportHistoryState,
   type ViewportMemoryUsage,
@@ -31,7 +33,6 @@ import {
   type ViewportStatus,
   type ViewportTransform,
   type ViewportTransformTool,
-  type ViewportTransformSpace,
 } from '../features/viewport/runtime/ViewportRuntime';
 import { SmartAlignmentPanel } from '../plugins/smart-alignment/SmartAlignmentPanel';
 import { SmartAlignmentPlugin } from '../plugins/smart-alignment/SmartAlignmentPlugin';
@@ -61,6 +62,10 @@ import {
   type UiCopy,
   type UiLanguage,
 } from './i18n';
+import { ValidatedNumberInput } from './components/ValidatedNumberInput';
+import { UiSelect } from './components/UiSelect';
+import { GlobalTooltipLayer } from './components/GlobalTooltipLayer';
+import { ViewCube3D } from './components/ViewCube3D';
 
 type IconName =
   | 'cursor'
@@ -69,6 +74,7 @@ type IconName =
   | 'brush'
   | 'rect'
   | 'poly'
+  | 'cylinder'
   | 'move'
   | 'rotate'
   | 'scale'
@@ -90,6 +96,7 @@ const iconPaths: Record<IconName, string> = {
   brush: 'M20.7 5.6l-2.3-2.3a1 1 0 0 0-1.4 0l-6.5 6.5 3.7 3.7 6.5-6.5a1 1 0 0 0 0-1.4zM12.8 14.9L9.1 11.2 3 18.8V21h2.2zM3 21c1.8 0 3-1 3-2.6',
   rect: 'M4 6h16v12H4z',
   poly: 'M12 3l8 6-3 11H7L4 9zM12 3v0M20 9v0M17 20v0M7 20v0M4 9v0',
+  cylinder: 'M5 6c0-2 3.1-3.5 7-3.5S19 4 19 6v12c0 2-3.1 3.5-7 3.5S5 20 5 18V6zm0 0c0 2 3.1 3.5 7 3.5S19 8 19 6M5 18c0 2 3.1 3.5 7 3.5S19 20 19 18',
   move: 'M12 2l3 3h-2v5h5V8l3 3-3 3v-2h-5v5h2l-3 3-3-3h2v-5H6v2l-3-3 3-3v2h5V5H9z',
   rotate: 'M5 7a8 8 0 0 1 13.5 1M19 3v5h-5M19 17a8 8 0 0 1-13.5-1M5 21v-5h5',
   scale: 'M5 19l5-5m-5 5v-4m0 4h4M19 5l-5 5m5-5v4m0-4h-4',
@@ -133,6 +140,7 @@ const selectionTools: ReadonlyArray<EditorToolDescriptor & { readonly id: Viewpo
   { id: 'select-brush', labelKey: 'toolSelectBrush', tipKey: 'toolSelectBrushTip', icon: 'brush', shortcut: '1' },
   { id: 'select-rect', labelKey: 'toolSelectRect', tipKey: 'toolSelectRectTip', icon: 'rect', shortcut: '2' },
   { id: 'select-poly', labelKey: 'toolSelectPoly', tipKey: 'toolSelectPolyTip', icon: 'poly', shortcut: '3' },
+  { id: 'select-cylinder', labelKey: 'toolSelectCylinder', tipKey: 'toolSelectCylinderTip', icon: 'cylinder', shortcut: 'C' },
 ];
 
 const operationTools: ReadonlyArray<EditorToolDescriptor> = [
@@ -149,7 +157,7 @@ function isViewportTransformTool(tool: ViewportEditorTool): tool is ViewportTran
 }
 
 function isGaussianSelectionTool(tool: ViewportEditorTool): tool is ViewportSelectionTool {
-  return tool === 'select-brush' || tool === 'select-rect' || tool === 'select-poly';
+  return tool === 'select-brush' || tool === 'select-rect' || tool === 'select-poly' || tool === 'select-cylinder';
 }
 
 const createInitialTransform = (): ViewportTransform => ({
@@ -158,7 +166,28 @@ const createInitialTransform = (): ViewportTransform => ({
   scale: [1, 1, 1],
 });
 
+const createInitialSelectionCylinder = (): GaussianCylinderSelectionRegion => ({
+  centerX: 0,
+  centerZ: 0,
+  radius: 1,
+  height: 2,
+  groundPadding: 0.08,
+});
+
 const transformAxes = ['x', 'y', 'z'] as const;
+const playbackFpsOptions = [1, 2, 4, 10, 15, 30, 60] as const;
+const cameraViews: ReadonlyArray<{
+  readonly id: ViewportCameraView;
+  readonly labelKey: keyof UiCopy;
+  readonly shortKey: keyof UiCopy;
+}> = [
+  { id: 'front', labelKey: 'cameraViewFront', shortKey: 'cameraViewFrontShort' },
+  { id: 'back', labelKey: 'cameraViewBack', shortKey: 'cameraViewBackShort' },
+  { id: 'left', labelKey: 'cameraViewLeft', shortKey: 'cameraViewLeftShort' },
+  { id: 'right', labelKey: 'cameraViewRight', shortKey: 'cameraViewRightShort' },
+  { id: 'top', labelKey: 'cameraViewTop', shortKey: 'cameraViewTopShort' },
+  { id: 'bottom', labelKey: 'cameraViewBottom', shortKey: 'cameraViewBottomShort' },
+];
 
 function isTextEntryTarget(target: EventTarget | null): boolean {
   return target instanceof Element
@@ -169,96 +198,40 @@ function TransformNumberField({
   axis,
   disabled,
   label,
+  max,
+  min,
   onChange,
+  precision,
+  scrubStep,
   step,
   value,
 }: {
   axis: typeof transformAxes[number];
   disabled: boolean;
   label: string;
+  max: number;
+  min: number;
   onChange: (value: number) => void;
+  precision: number;
+  scrubStep: number;
   step: number;
   value: number;
 }) {
-  const formattedValue = String(Math.round(value * 1000) / 1000);
-  const [draft, setDraft] = useState(formattedValue);
-  const focused = useRef(false);
-  // #WDD-gpt 2026-08-16 - 轴标签作为水平 Scrub 抓手，输入框仍保留精确键入能力。
-  const scrub = useRef<{ pointerId: number; startX: number; startValue: number } | null>(null);
-
-  useEffect(() => {
-    if (!focused.current) setDraft(formattedValue);
-  }, [formattedValue]);
-
   return (
     <label>
-      <b
-        aria-disabled={disabled}
-        aria-label={`${label} ${axis.toUpperCase()} scrub`}
-        aria-valuenow={value}
-        className={`axis-${axis} scrub-handle`}
-        onPointerCancel={(event) => {
-          scrub.current = null;
-          event.currentTarget.releasePointerCapture(event.pointerId);
-        }}
-        onPointerDown={(event) => {
-          if (disabled || event.button !== 0) return;
-          event.preventDefault();
-          event.stopPropagation();
-          scrub.current = { pointerId: event.pointerId, startX: event.clientX, startValue: value };
-          event.currentTarget.setPointerCapture(event.pointerId);
-        }}
-        onPointerMove={(event) => {
-          const active = scrub.current;
-          if (!active || active.pointerId !== event.pointerId) return;
-          const sensitivity = event.altKey ? 0.02 : event.shiftKey ? 0.1 : 0.25;
-          const next = Math.round((active.startValue + (event.clientX - active.startX) * step * sensitivity) * 10000) / 10000;
-          setDraft(String(next));
-          onChange(next);
-        }}
-        onKeyDown={(event) => {
-          if (disabled || (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight')) return;
-          event.preventDefault();
-          const direction = event.key === 'ArrowRight' ? 1 : -1;
-          const sensitivity = event.altKey ? 0.1 : event.shiftKey ? 10 : 1;
-          const next = Math.round((value + direction * step * sensitivity) * 10000) / 10000;
-          setDraft(String(next));
-          onChange(next);
-        }}
-        onPointerUp={(event) => {
-          if (scrub.current?.pointerId !== event.pointerId) return;
-          scrub.current = null;
-          event.currentTarget.releasePointerCapture(event.pointerId);
-        }}
-        role="slider"
-        tabIndex={disabled ? -1 : 0}
-      >{axis.toUpperCase()}</b>
-      <input
+      <b aria-hidden="true" className={`axis-${axis}`}>{axis.toUpperCase()}</b>
+      {/* #WDD-gpt 2026-08-16 - 对齐 view2：数值框本体可水平拖拽，单击后仍可完整键入并在提交时限值。 */}
+      <ValidatedNumberInput
         aria-label={`${label} ${axis.toUpperCase()}`}
         disabled={disabled}
-        inputMode="decimal"
-        onBlur={() => {
-          focused.current = false;
-          const next = Number(draft);
-          if (draft.trim() === '' || !Number.isFinite(next)) setDraft(formattedValue);
-        }}
-        onChange={(event) => {
-          const nextDraft = event.target.value;
-          setDraft(nextDraft);
-          const next = Number(nextDraft);
-          if (nextDraft.trim() !== '' && Number.isFinite(next)) onChange(next);
-        }}
-        onFocus={(event) => {
-          focused.current = true;
-          event.currentTarget.select();
-        }}
-        onKeyDown={(event) => {
-          if (event.key === 'Enter') event.currentTarget.blur();
-        }}
-        onWheel={(event) => event.currentTarget.blur()}
+        max={max}
+        min={min}
+        onCommit={onChange}
+        precision={precision}
+        scrub
+        scrubStep={scrubStep}
         step={step}
-        type="number"
-        value={draft}
+        value={value}
       />
     </label>
   );
@@ -267,17 +240,25 @@ function TransformNumberField({
 function TransformVectorEditor({
   disabled,
   label,
+  max,
+  min,
   onChange,
   onReset,
+  precision,
   resetLabel,
+  scrubStep,
   step,
   values,
 }: {
   disabled: boolean;
   label: string;
+  max: number;
+  min: number;
   onChange: (axis: number, value: number) => void;
   onReset: () => void;
+  precision: number;
   resetLabel: string;
+  scrubStep: number;
   step: number;
   values: [number, number, number];
 }) {
@@ -289,7 +270,7 @@ function TransformVectorEditor({
       </div>
       <div className="vector-row">
         {transformAxes.map((axis, index) => (
-          <TransformNumberField axis={axis} disabled={disabled} key={axis} label={label} onChange={(value) => onChange(index, value)} step={step} value={values[index]} />
+          <TransformNumberField axis={axis} disabled={disabled} key={axis} label={label} max={max} min={min} onChange={(value) => onChange(index, value)} precision={precision} scrubStep={scrubStep} step={step} value={values[index]} />
         ))}
       </div>
     </div>
@@ -386,6 +367,7 @@ export function App() {
   const [selectionState, setSelectionState] = useState<ViewportSelectionState>(INITIAL_VIEWPORT_SELECTION_STATE);
   const [selectionScope, setSelectionScope] = useState<ViewportSelectionScope>('visible');
   const [selectionBrushRadius, setSelectionBrushRadius] = useState(48);
+  const [selectionCylinder, setSelectionCylinder] = useState<GaussianCylinderSelectionRegion>(createInitialSelectionCylinder);
   const [historyState, setHistoryState] = useState<ViewportHistoryState>(INITIAL_EDITOR_HISTORY_STATE);
   const [status, setStatus] = useState<ViewportStatus>(initialStatus);
   const [memoryUsage, setMemoryUsage] = useState<ViewportMemoryUsage>(initialMemoryUsage);
@@ -404,12 +386,13 @@ export function App() {
   const [currentFrame, setCurrentFrame] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
   const [isLooping, setIsLooping] = useState(true);
+  // #WDD-gpt 2026-08-16 - 播放速率独立于文件元数据并默认 30 FPS，允许用户按检查需求降速或加速。
+  const [playbackFps, setPlaybackFps] = useState(30);
   const [renderMode, setRenderMode] = useState<GaussianRenderMode>('gaussian');
   const [shLevel, setShLevel] = useState(3);
   const [showGrid, setShowGrid] = useState(true);
   const [showAxes, setShowAxes] = useState(true);
   const [sceneTransform, setSceneTransform] = useState<ViewportTransform>(createInitialTransform);
-  const [transformSpace, setTransformSpace] = useState<ViewportTransformSpace>('world');
   const [uniformScale, setUniformScale] = useState(true);
   const [exportProgress, setExportProgress] = useState<number | null>(null);
   const [viewportRuntime, setViewportRuntime] = useState<ViewportRuntime | null>(null);
@@ -442,8 +425,14 @@ export function App() {
     [customCpuGiB, customGpuGiB, memoryMode],
   );
   const timelineEndFrame = Math.max(0, (status.totalFrames ?? 121) - 1);
-  const timelineFps = status.fps ?? 30;
   const copy = UI_COPY[language];
+  const cameraViewLabels = useMemo(
+    () => Object.fromEntries(cameraViews.map((view) => [view.id, {
+      long: UI_COPY[language][view.labelKey],
+      short: UI_COPY[language][view.shortKey],
+    }])) as Record<ViewportCameraView, { long: string; short: string }>,
+    [language],
+  );
   const activeSelectionDescriptor = isGaussianSelectionTool(activeTool)
     ? selectionTools.find((tool) => tool.id === activeTool) ?? null
     : null;
@@ -536,7 +525,7 @@ export function App() {
     let animationFrame = 0;
     // #WDD-gpt 2026-08-14 - 使用真实时间驱动播放，避免定时器积压导致 RAW4D 越播越卡。
     const updatePlayback = (now: number) => {
-      const elapsedFrames = Math.floor((now - startTime) * timelineFps / 1000);
+      const elapsedFrames = Math.floor((now - startTime) * playbackFps / 1000);
       const absoluteFrame = startFrame + elapsedFrames;
       if (!isLooping && absoluteFrame >= timelineEndFrame) {
         setCurrentFrame(timelineEndFrame);
@@ -549,7 +538,7 @@ export function App() {
     };
     animationFrame = window.requestAnimationFrame(updatePlayback);
     return () => window.cancelAnimationFrame(animationFrame);
-  }, [isLooping, isPlaying, timelineEndFrame, timelineFps]);
+  }, [isLooping, isPlaying, playbackFps, timelineEndFrame]);
 
   useEffect(() => {
     setCurrentFrame((frame) => Math.min(frame, timelineEndFrame));
@@ -586,8 +575,6 @@ export function App() {
     const initial = createInitialTransform();
     setSceneTransform((current) => ({ ...current, [key]: initial[key] }));
   };
-
-  const resetTransform = () => setSceneTransform(createInitialTransform());
 
   const runSmartAlignment = () => {
     if (!viewportRuntime || transformDisabled) return;
@@ -706,16 +693,6 @@ export function App() {
     window.setTimeout(() => URL.revokeObjectURL(url), 0);
   };
 
-  const downloadUrl = (url: string, filename: string) => {
-    const anchor = document.createElement('a');
-    anchor.href = url;
-    anchor.download = filename;
-    anchor.hidden = true;
-    document.body.append(anchor);
-    anchor.click();
-    anchor.remove();
-  };
-
   // #WDD-gpt  2026-08-16 - RAW4D 保存时根据软删除位集输出压实文件；编辑中的源数据保持稳定 ID。
   const exportWorkspace = async () => {
     setOpenMenu(null);
@@ -724,9 +701,13 @@ export function App() {
       setExportProgress(0);
       try {
         const result = await exportRaw4DSequenceAsFourCgs(sourceFiles, ({ ratio }) => setExportProgress(ratio));
+        setExportProgress(0.97);
+        // #WDD-gpt 2026-08-16 - 已验收 V2.4 仅重写清单元数据，压缩流保持原字节并写入当前完整变换。
+        const response = await fetch(result.url);
+        if (!response.ok) throw new Error(`4CGS V2.4 资源读取失败：HTTP ${response.status}。`);
+        const blob = await writeFourCgsFile(await response.blob(), sceneTransform);
         setExportProgress(1);
-        // #WDD-gpt 2026-08-16 - 已验收 V2.4 直接走构建内容哈希 URL，避免 59.6M Blob 二次复制并兼容浏览器下载事件。
-        downloadUrl(result.url, result.filename);
+        downloadBlob(blob, result.filename);
       } catch (error) {
         window.alert(error instanceof Error ? error.message : String(error));
       } finally {
@@ -742,7 +723,7 @@ export function App() {
       }
       setExportProgress(0.05);
       try {
-        const blob = await writeFourCgsFile(sourceFile);
+        const blob = await writeFourCgsFile(sourceFile, sceneTransform);
         setExportProgress(1);
         const stem = (sceneName ?? status.objectName ?? 'dong-editor-3').replace(/\.4cgs$/i, '');
         downloadBlob(blob, `${stem}.4cgs`);
@@ -890,10 +871,13 @@ export function App() {
   };
 
   const frameTimecode = useMemo(() => {
-    const seconds = Math.floor(currentFrame / timelineFps);
-    const frame = currentFrame % timelineFps;
+    const seconds = Math.floor(currentFrame / playbackFps);
+    const frame = currentFrame % playbackFps;
     return `00:00:${seconds.toString().padStart(2, '0')}:${frame.toString().padStart(2, '0')}`;
-  }, [currentFrame, timelineFps]);
+  }, [currentFrame, playbackFps]);
+
+  const frameDigits = Math.max(4, String(timelineEndFrame + 1).length);
+  const frameCounter = `${copy.frameShort} [${String(currentFrame).padStart(frameDigits, '0')}] / ${copy.totalFramesShort} [${String(timelineEndFrame + 1).padStart(frameDigits, '0')}]`;
 
   const timelineMarks = useMemo(
     () => [...new Set(Array.from({ length: 5 }, (_, index) => Math.round(timelineEndFrame * index / 4)))],
@@ -916,11 +900,16 @@ export function App() {
       data-raw4d-sh-updates={status.raw4dSequence?.sharedShUpdateStateCount ?? 0}
       lang={language === 'zh' ? 'zh-CN' : 'en'}
       onClick={() => setOpenMenu(null)}
+      onDragStart={(event) => {
+        // #WDD-gpt 2026-08-16 - 文本编辑保留选字，但阻止浏览器把选中文字或输入框作为系统拖拽对象。
+        if (isTextEntryTarget(event.target)) event.preventDefault();
+      }}
       onDragEnter={handleFileDragEnter}
       onDragLeave={handleFileDragLeave}
       onDragOver={handleFileDragOver}
       onDrop={handleFileDrop}
     >
+      <GlobalTooltipLayer />
       {fileDragActive && (
         <div aria-label={copy.dropFilesToOpen} className="file-drop-overlay" role="status">
           <div>
@@ -942,6 +931,8 @@ export function App() {
       <header className="topbar" data-camera-input-block>
         <div className="brand">
           <strong>Dong Editor 3</strong>
+          {/* #WDD-gpt 2026-08-16 - 页面左上角直接展示由 VERSION 注入的构建版本。 */}
+          <span aria-label={`Version ${__APP_VERSION__}`} className="app-version-badge">v{__APP_VERSION__}</span>
         </div>
 
         <nav aria-label={copy.mainMenu} className="menu-bar" onClick={(event) => event.stopPropagation()}>
@@ -950,6 +941,9 @@ export function App() {
             {openMenu === 'file' && (
               <div className="dropdown-menu">
                 <button onClick={newWorkspace} type="button"><span>{copy.newWorkspace}</span></button>
+                {/* #WDD-gpt 2026-08-16 - 文件菜单补齐与顶部按钮一致的导入、导出入口。 */}
+                <button onClick={() => { setOpenMenu(null); fileInputRef.current?.click(); }} type="button"><span>{copy.import}</span></button>
+                <button disabled={exportProgress !== null} onClick={() => void exportWorkspace()} type="button"><span>{copy.export}</span></button>
               </div>
             )}
           </div>
@@ -1008,24 +1002,26 @@ export function App() {
         <div aria-label={copy.editHistory} className="history-toolbar" onClick={(event) => event.stopPropagation()} role="toolbar">
           <button
             aria-label={copy.undo}
+            className="has-tip"
+            data-tip={`${copy.undo} · Ctrl/⌘ Z`}
             disabled={!historyState.canUndo}
             onClick={() => {
               viewportRuntime?.undo();
               setIsPlaying(false);
             }}
-            title={`${copy.undo} · Ctrl/⌘ Z`}
             type="button"
           >
             <Icon name="undo" size={16} />
           </button>
           <button
             aria-label={copy.redo}
+            className="has-tip"
+            data-tip={`${copy.redo} · Ctrl/⌘ Shift Z`}
             disabled={!historyState.canRedo}
             onClick={() => {
               viewportRuntime?.redo();
               setIsPlaying(false);
             }}
-            title={`${copy.redo} · Ctrl/⌘ Shift Z`}
             type="button"
           >
             <Icon name="redo" size={16} />
@@ -1035,18 +1031,18 @@ export function App() {
         <div className="scene-document">
           <span className="status-dot cyan" />
           <strong>{displaySceneName}</strong>
-          <span className="unsaved-dot" title={copy.unsaved} />
+          <span className="unsaved-dot has-tip" data-tip={copy.unsaved} />
         </div>
 
         <div className="top-actions">
           <div aria-label={copy.language} className="language-switch" role="group">
-            <button aria-pressed={language === 'zh'} onClick={() => setLanguage('zh')} title={copy.chinese} type="button">中</button>
-            <button aria-pressed={language === 'en'} onClick={() => setLanguage('en')} title={copy.english} type="button">EN</button>
+            <button aria-pressed={language === 'zh'} className="has-tip" data-tip={copy.chinese} onClick={() => setLanguage('zh')} type="button">中</button>
+            <button aria-pressed={language === 'en'} className="has-tip" data-tip={copy.english} onClick={() => setLanguage('en')} type="button">EN</button>
           </div>
-          <button className="quiet-button" onClick={() => fileInputRef.current?.click()} title={copy.chooseImportFile} type="button">
+          <button className="quiet-button has-tip" data-tip={copy.chooseImportFile} onClick={() => fileInputRef.current?.click()} type="button">
             <Icon name="folder" />{copy.import}
           </button>
-          <button className="primary-button" disabled={exportProgress !== null} onClick={() => void exportWorkspace()} title={copy.exportWorkspace} type="button">
+          <button className="primary-button has-tip" data-tip={copy.exportTip} disabled={exportProgress !== null} onClick={() => void exportWorkspace()} type="button">
             <Icon name="export" />{exportProgress === null ? copy.export : `${copy.savingRaw4D} ${Math.round(exportProgress * 100)}%`}
           </button>
         </div>
@@ -1069,13 +1065,13 @@ export function App() {
             onTransformChange={setSceneTransform}
             renderMode={renderMode}
             shLevel={shLevel}
+            selectionCylinder={selectionCylinder}
             selectionScope={selectionScope}
             showAxes={showAxes}
             showGrid={showGrid}
             showGuides
             sourceFiles={sourceFiles}
             transform={sceneTransform}
-            transformSpace={transformSpace}
             uniformScale={uniformScale}
             viewportLabel={copy.viewportCanvas}
           />
@@ -1084,10 +1080,10 @@ export function App() {
               {gaussianRenderModes.map((mode) => (
                 <button
                   aria-pressed={renderMode === mode.id}
-                  className={renderMode === mode.id ? 'render-mode-button active' : 'render-mode-button'}
+                  className={renderMode === mode.id ? 'render-mode-button active has-tip' : 'render-mode-button has-tip'}
+                  data-tip={copy[mode.titleKey]}
                   key={mode.id}
                   onClick={() => setRenderMode(mode.id)}
-                  title={copy[mode.titleKey]}
                   type="button"
                 >
                   <i aria-hidden="true" className={`render-mode-glyph ${mode.id}`} />
@@ -1099,11 +1095,11 @@ export function App() {
               {[0, 1, 2, 3].map((level) => (
                 <button
                   aria-pressed={shLevel === level}
-                  className={shLevel === level ? 'active' : ''}
+                  className={shLevel === level ? 'active has-tip' : 'has-tip'}
+                  data-tip={`SH${level}`}
                   disabled={level > (status.shBands ?? 0)}
                   key={level}
                   onClick={() => setShLevel(level)}
-                  title={`SH${level}`}
                   type="button"
                 >SH{level}</button>
               ))}
@@ -1125,6 +1121,13 @@ export function App() {
             )}
           </div>
           <div className="camera-help" data-camera-input-block>{copy.cameraMoveHint}</div>
+          {/* #WDD-gpt 2026-08-16 - 使用实时 3D 投影导航立方体同步相机姿态，并隔离主视口的鼠标输入。 */}
+          <ViewCube3D
+            inspectorOpen={inspectorPanelVisible}
+            labels={cameraViewLabels}
+            runtime={viewportRuntime}
+            title={copy.cameraCubeTip}
+          />
           {status.phase === 'error' && (
             <div className="viewport-error">
               <strong>{copy.viewportFailed}</strong>
@@ -1224,11 +1227,58 @@ export function App() {
                 <b>{selectionBrushRadius}px</b>
               </label>
             )}
+            {activeTool === 'select-cylinder' && (
+              <div className="selection-cylinder-controls">
+                <div className="selection-cylinder-grid">
+                  {([
+                    ['centerX', copy.selectionCylinderCenterX, -100_000, 100_000, 0.05],
+                    ['centerZ', copy.selectionCylinderCenterZ, -100_000, 100_000, 0.05],
+                    ['radius', copy.selectionCylinderRadius, 0.001, 100_000, 0.02],
+                    ['height', copy.selectionCylinderHeight, 0.001, 100_000, 0.02],
+                    ['groundPadding', copy.selectionCylinderGroundPadding, 0, 100_000, 0.01],
+                  ] as const).map(([key, label, min, max, scrubStep]) => (
+                    <label key={key}>
+                      <span>{label}</span>
+                      <ValidatedNumberInput
+                        aria-label={label}
+                        max={max}
+                        min={min}
+                        onCommit={(value) => setSelectionCylinder((current) => ({ ...current, [key]: value }))}
+                        precision={3}
+                        scrub
+                        scrubStep={scrubStep}
+                        step={scrubStep * 5}
+                        value={selectionCylinder[key]}
+                      />
+                    </label>
+                  ))}
+                </div>
+                <div className="selection-cylinder-actions">
+                  <button
+                    disabled={selectionState.phase === 'selecting' || status.splatCount === 0}
+                    onClick={() => void viewportRuntime?.selectGaussiansInCylinder('replace')}
+                    type="button"
+                  >{copy.selectCylinder}</button>
+                  <button
+                    disabled={selectionState.phase === 'selecting' || status.splatCount === 0}
+                    onClick={() => void viewportRuntime?.keepGaussiansInCylinder('inside')}
+                    type="button"
+                  >{copy.keepCylinderInside}</button>
+                  <button
+                    disabled={selectionState.phase === 'selecting' || status.splatCount === 0}
+                    onClick={() => void viewportRuntime?.keepGaussiansInCylinder('outside')}
+                    type="button"
+                  >{copy.keepCylinderOutside}</button>
+                </div>
+              </div>
+            )}
             <p className="selection-tool-hint">
               {selectionState.phase === 'selecting'
                 ? `${copy.selectionAnalyzing} ${Math.round(selectionState.progress * 100)}%`
                 : activeTool === 'select-brush'
                   ? copy.selectionBrushDescription
+                  : activeTool === 'select-cylinder'
+                    ? copy.selectionCylinderDescription
                   : activeTool === 'select-poly'
                     ? copy.selectionPolyDescription
                     : copy.selectionRectDescription}
@@ -1294,35 +1344,14 @@ export function App() {
           <div className="inspector-tab-content">
             {inspectorTab === 'transform' && (
               <section aria-labelledby="inspector-tab-transform" className="inspector-section" id="inspector-panel-transform" role="tabpanel">
-                <div className="transform-panel-heading">
-                  <h3><Icon name="chevron" size={13} />{copy.transform}</h3>
-                  <button className="transform-reset-button" disabled={transformDisabled} onClick={resetTransform} title={copy.resetTransform} type="button">{copy.reset}</button>
-                </div>
-                <div className={transformDisabled ? 'transform-target empty' : 'transform-target'}>
-                  <i aria-hidden="true" />
-                  <span>{transformDisabled ? copy.transformTargetEmpty : copy.transformTargetReady}</span>
-                </div>
-                <div className="transform-control-bar">
-                  <div aria-label={copy.editorTools} className="transform-mode-switch" role="group">
-                    {operationTools.filter((tool) => isViewportTransformTool(tool.id)).map((tool) => (
-                      <button aria-pressed={activeTool === tool.id} disabled={transformDisabled} key={tool.id} onClick={() => chooseTool(tool.id)} type="button">
-                        <Icon name={tool.icon} size={14} />{copy[tool.labelKey]}
-                      </button>
-                    ))}
-                  </div>
-                  <div aria-label={copy.coordinateSpace} className="transform-space-switch" role="group">
-                    <button aria-pressed={transformSpace === 'world'} onClick={() => setTransformSpace('world')} type="button">{copy.worldSpace}</button>
-                    <button aria-pressed={transformSpace === 'local'} onClick={() => setTransformSpace('local')} type="button">{copy.localSpace}</button>
-                  </div>
-                </div>
-                <TransformVectorEditor disabled={transformDisabled} label={copy.position} onChange={(axis, value) => updateTransformVector('position', axis, value)} onReset={() => resetTransformVector('position')} resetLabel={copy.reset} step={0.1} values={sceneTransform.position} />
-                <TransformVectorEditor disabled={transformDisabled} label={copy.rotation} onChange={(axis, value) => updateTransformVector('rotation', axis, value)} onReset={() => resetTransformVector('rotation')} resetLabel={copy.reset} step={1} values={sceneTransform.rotation} />
+                {/* #WDD-gpt 2026-08-16 - 变换统一使用世界空间，移除无实际工作流价值的局部/世界重复开关。 */}
+                <TransformVectorEditor disabled={transformDisabled} label={copy.position} max={100_000} min={-100_000} onChange={(axis, value) => updateTransformVector('position', axis, value)} onReset={() => resetTransformVector('position')} precision={3} resetLabel={copy.reset} scrubStep={0.02} step={0.1} values={sceneTransform.position} />
+                <TransformVectorEditor disabled={transformDisabled} label={copy.rotation} max={360} min={-360} onChange={(axis, value) => updateTransformVector('rotation', axis, value)} onReset={() => resetTransformVector('rotation')} precision={2} resetLabel={copy.reset} scrubStep={0.5} step={1} values={sceneTransform.rotation} />
                 <div className="scale-link-row">
                   <span>{copy.uniformScale}</span>
                   <button aria-pressed={uniformScale} className={uniformScale ? 'scale-link active' : 'scale-link'} onClick={() => setUniformScale((linked) => !linked)} type="button">{uniformScale ? '●' : '○'}</button>
                 </div>
-                <TransformVectorEditor disabled={transformDisabled} label={copy.scale} onChange={(axis, value) => updateTransformVector('scale', axis, value)} onReset={() => resetTransformVector('scale')} resetLabel={copy.reset} step={0.05} values={sceneTransform.scale} />
-                <p className="transform-hint">{copy.transformHint}</p>
+                <TransformVectorEditor disabled={transformDisabled} label={copy.scale} max={1_000} min={0.001} onChange={(axis, value) => updateTransformVector('scale', axis, value)} onReset={() => resetTransformVector('scale')} precision={3} resetLabel={copy.reset} scrubStep={0.01} step={0.05} values={sceneTransform.scale} />
               </section>
             )}
 
@@ -1349,6 +1378,7 @@ export function App() {
                   <span>{copy.budgetMode}</span>
                   <select
                     aria-label={copy.memoryModeLabel}
+                    className="ui-select"
                     onChange={(event) => setMemoryMode(event.target.value as Gaussian4DMemoryMode)}
                     value={memoryMode}
                   >
@@ -1364,8 +1394,8 @@ export function App() {
                 )}
                 {memoryMode === 'custom' && (
                   <div className="memory-custom-grid">
-                    <label><span>{copy.cpuGiB}</span><input max="64" min="1" onChange={(event) => setCustomCpuGiB(Number(event.target.value))} step="1" type="number" value={customCpuGiB} /></label>
-                    <label><span>{copy.gpuGiB}</span><input max="32" min="0.5" onChange={(event) => setCustomGpuGiB(Number(event.target.value))} step="0.5" type="number" value={customGpuGiB} /></label>
+                    <label><span>{copy.cpuGiB}</span><ValidatedNumberInput aria-label={copy.cpuGiB} integer max={64} min={1} onCommit={setCustomCpuGiB} precision={0} step={1} value={customCpuGiB} /></label>
+                    <label><span>{copy.gpuGiB}</span><ValidatedNumberInput aria-label={copy.gpuGiB} max={32} min={0.5} onCommit={setCustomGpuGiB} precision={1} step={0.5} value={customGpuGiB} /></label>
                   </div>
                 )}
                 <MemoryTelemetryPanel language={language} usage={memoryUsage} />
@@ -1373,7 +1403,7 @@ export function App() {
                   <div><dt>{copy.transport}</dt><dd>{memoryUsage.transport === 'shared-array-buffer' ? 'SharedArrayBuffer' : 'Transferable'}</dd></div>
                   <div><dt>{copy.loaderWorker}</dt><dd>{status.decodeBackend === 'wasm' ? 'WASM + TypedArray' : status.decodeBackend === 'fp16-bits' ? 'FP16 Bits + TypedArray' : status.decodeBackend === 'image-codebook' ? 'Image Codebook' : status.decodeBackend ? 'TypedArray' : '--'}</dd></div>
                   <div><dt>{copy.gpuDecode}</dt><dd>{status.gpuBackend === 'storage-buffer' ? 'StorageBuffer · WGSL' : status.gpuBackend === 'texture' ? 'Texture · WGSL' : '--'}</dd></div>
-                  <div><dt>{copy.bufferId}</dt><dd className="buffer-id" title={status.bufferId}>{status.bufferId ?? '--'}</dd></div>
+                  <div><dt>{copy.bufferId}</dt><dd className="buffer-id has-tip" data-tip={status.bufferId ?? '--'}>{status.bufferId ?? '--'}</dd></div>
                   <div><dt>{copy.sourceResident}</dt><dd>{status.sourceToResidentRatio ? `${status.sourceToResidentRatio.toFixed(2)}×` : '--'}</dd></div>
                 </dl>
               </section>
@@ -1409,13 +1439,14 @@ export function App() {
                 <div className="plugin-window-actions">
                   <button
                     aria-label={pluginWindowMinimized ? copy.restorePlugin : copy.minimizePlugin}
+                    className="has-tip"
+                    data-tip={pluginWindowMinimized ? copy.restorePlugin : copy.minimizePlugin}
                     onClick={() => setPluginWindowMinimized((minimized) => !minimized)}
-                    title={pluginWindowMinimized ? copy.restorePlugin : copy.minimizePlugin}
                     type="button"
                   >
                     {pluginWindowMinimized ? '□' : '—'}
                   </button>
-                  <button aria-label={copy.closePlugin} onClick={() => setActivePlugin(null)} title={copy.closePlugin} type="button">×</button>
+                  <button aria-label={copy.closePlugin} className="has-tip" data-tip={copy.closePlugin} onClick={() => setActivePlugin(null)} type="button">×</button>
                 </div>
               </header>
               {!pluginWindowMinimized && <div className="plugin-workspace-content">
@@ -1469,11 +1500,11 @@ export function App() {
 
       <section aria-label={copy.timeline} className="timeline-panel glass-panel" data-camera-input-block>
         <div className="playback-controls">
-          <button aria-label={copy.firstFrame} onClick={() => { setCurrentFrame(0); setIsPlaying(false); }} title={copy.firstFrame} type="button"><Icon name="stepBack" size={15} /></button>
-          <button aria-label={copy.previousFrame} onClick={() => { setCurrentFrame((frame) => Math.max(0, frame - 1)); setIsPlaying(false); }} title={copy.previousFrame} type="button"><span>−1</span></button>
-          <button aria-label={isPlaying ? copy.pause : copy.play} className="play-button" onClick={() => setIsPlaying((playing) => !playing)} title={isPlaying ? copy.pause : copy.play} type="button"><Icon name={isPlaying ? 'pause' : 'play'} size={16} /></button>
-          <button aria-label={copy.nextFrame} onClick={() => { setCurrentFrame((frame) => Math.min(timelineEndFrame, frame + 1)); setIsPlaying(false); }} title={copy.nextFrame} type="button"><span>+1</span></button>
-          <button aria-label={copy.lastFrame} onClick={() => { setCurrentFrame(timelineEndFrame); setIsPlaying(false); }} title={copy.lastFrame} type="button"><Icon name="stepForward" size={15} /></button>
+          <button aria-label={copy.firstFrame} className="has-tip" data-tip={copy.firstFrame} onClick={() => { setCurrentFrame(0); setIsPlaying(false); }} type="button"><Icon name="stepBack" size={15} /></button>
+          <button aria-label={copy.previousFrame} className="has-tip" data-tip={copy.previousFrame} onClick={() => { setCurrentFrame((frame) => Math.max(0, frame - 1)); setIsPlaying(false); }} type="button"><span>−1</span></button>
+          <button aria-label={isPlaying ? copy.pause : copy.play} className="play-button has-tip" data-tip={isPlaying ? copy.pause : copy.play} onClick={() => setIsPlaying((playing) => !playing)} type="button"><Icon name={isPlaying ? 'pause' : 'play'} size={16} /></button>
+          <button aria-label={copy.nextFrame} className="has-tip" data-tip={copy.nextFrame} onClick={() => { setCurrentFrame((frame) => Math.min(timelineEndFrame, frame + 1)); setIsPlaying(false); }} type="button"><span>+1</span></button>
+          <button aria-label={copy.lastFrame} className="has-tip" data-tip={copy.lastFrame} onClick={() => { setCurrentFrame(timelineEndFrame); setIsPlaying(false); }} type="button"><Icon name="stepForward" size={15} /></button>
         </div>
 
         <div className="timeline-main">
@@ -1484,9 +1515,18 @@ export function App() {
                 <small><i className="keyframe-swatch" />{copy.timelineKeyframes}<i className="segment-swatch" />{copy.timelineSegments}</small>
               )}
             </div>
-            <strong>{frameTimecode}</strong>
+            <div className="timeline-readout">
+              <strong>{frameTimecode}</strong>
+              {/* #WDD-gpt 2026-08-16 - 播放时逐帧显示零填充当前帧与总帧数，避免只能从时间码反推帧号。 */}
+              <span aria-label={frameCounter} className="timeline-frame-counter">{frameCounter}</span>
+            </div>
           </div>
           <div className="timeline-track">
+            <div
+              aria-hidden="true"
+              className="timeline-frame-ticks"
+              style={{ '--timeline-frame-intervals': Math.max(1, timelineEndFrame) } as React.CSSProperties}
+            />
             {status.raw4dSequence && (
               <div aria-hidden="true" className="timeline-annotations">
                 {timelineKeyframes.map((frame) => (
@@ -1519,8 +1559,16 @@ export function App() {
         </div>
 
         <div className="timeline-options">
-          <button aria-label={copy.loop} className={isLooping ? 'loop-button active' : 'loop-button'} onClick={() => setIsLooping((looping) => !looping)} title={copy.loop} type="button"><Icon name="loop" size={14} /><span>{copy.loopShort}</span></button>
-          <span className="fps-badge">{timelineFps} FPS</span>
+          <button aria-label={copy.loop} className={isLooping ? 'loop-button active has-tip' : 'loop-button has-tip'} data-tip={copy.loop} onClick={() => setIsLooping((looping) => !looping)} type="button"><Icon name="loop" size={14} /><span>{copy.loopShort}</span></button>
+          {/* #WDD-gpt 2026-08-16 - 固定档位覆盖逐帧检查到 60 FPS 快速预览，避免自由输入产生无效速度。 */}
+          <UiSelect
+            ariaLabel={copy.playbackSpeed}
+            className="fps-select"
+            onChange={setPlaybackFps}
+            options={playbackFpsOptions.map((fps) => ({ label: `${fps} FPS`, value: fps }))}
+            placement="above"
+            value={playbackFps}
+          />
         </div>
       </section>
 
@@ -1529,8 +1577,8 @@ export function App() {
         <span>{status.splatCount.toLocaleString(language === 'zh' ? 'zh-CN' : 'en-US')} {copy.splats}</span>
         <span
           aria-label={`${copy.memoryUsage}: JS ${formatBytes(memoryUsage.jsHeapBytes)}, 4D ${formatBytes(memoryUsage.managedCpuBytes)}, GPU ${formatBytes(memoryUsage.gpuBytes)}`}
-          className="memory-usage"
-          title={`${copy.jsHeapLabel} ${formatBytes(memoryUsage.jsHeapBytes)} / ${formatBytes(memoryUsage.jsHeapLimitBytes)} · ${copy.dataMemoryLabel} ${formatBytes(memoryUsage.managedCpuBytes)} / ${formatBytes(memoryUsage.cpuBudgetBytes)} · ${copy.gpuVramLabel} ${formatBytes(memoryUsage.gpuBytes)} / ${formatBytes(memoryUsage.gpuBudgetBytes)}`}
+          className="memory-usage has-tip"
+          data-tip={`${copy.jsHeapLabel} ${formatBytes(memoryUsage.jsHeapBytes)} / ${formatBytes(memoryUsage.jsHeapLimitBytes)} · ${copy.dataMemoryLabel} ${formatBytes(memoryUsage.managedCpuBytes)} / ${formatBytes(memoryUsage.cpuBudgetBytes)} · ${copy.gpuVramLabel} ${formatBytes(memoryUsage.gpuBytes)} / ${formatBytes(memoryUsage.gpuBudgetBytes)}`}
         >
           <b>MEM</b>
           <em>JS {formatBytes(memoryUsage.jsHeapBytes)}</em>

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { detectGaussianSourceFormat } from './GaussianAssetImporter';
+import { GaussianAssetImporter, detectGaussianSourceFormat } from './GaussianAssetImporter';
 import { decodePlyGaussian } from './PlyGaussianDecoder';
 
 function binaryPlyFile(): File {
@@ -29,6 +29,16 @@ describe('PLY Gaussian decoder', () => {
     expect(detectGaussianSourceFormat('a.sog')).toBe('SOG');
     expect(detectGaussianSourceFormat('a.ply')).toBe('PLY');
     expect(detectGaussianSourceFormat('a.obj')).toBeNull();
+  });
+
+  it('caps the RAW4D loader pool to the measured safe parallelism', () => {
+    // #WDD-gpt 2026-08-16 - 防止后续误把大数组 Loader Worker 无上限扩展到逻辑核心数。
+    const maximum = new GaussianAssetImporter(99);
+    const minimum = new GaussianAssetImporter(0);
+    expect(maximum.raw4DWorkerCount).toBe(3);
+    expect(minimum.raw4DWorkerCount).toBe(1);
+    maximum.destroy();
+    minimum.destroy();
   });
 
   it('decodes static binary PLY into the unified canonical asset', async () => {

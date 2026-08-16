@@ -1,6 +1,8 @@
 import type {
   FourCgsFrameLocation,
   FourCgsManifest,
+  FourCgsMetadata,
+  FourCgsSceneTransform,
   FourCgsSegment,
   FourCgsStreamEntry,
 } from './FourCgsTypes';
@@ -8,6 +10,83 @@ import type {
 export const FOUR_CGS_MAGIC = '4CGSPRS2';
 export const FOUR_CGS_HEADER_BYTES = 12;
 const MAX_MANIFEST_BYTES = 8 * 1024 * 1024;
+
+export interface FourCgsTransformInput {
+  readonly position: readonly [number, number, number];
+  readonly rotation: readonly [number, number, number];
+  readonly scale: readonly [number, number, number];
+}
+
+function finiteVector3(value: unknown, label: string, positive = false): [number, number, number] {
+  if (!Array.isArray(value) || value.length !== 3
+    || value.some((component) => !Number.isFinite(component)
+      || (positive && (component as number) <= 0))) {
+    throw new Error(`4CGS ${label} 必须是三个${positive ? '正' : ''}有限数值。`);
+  }
+  return [Number(value[0]), Number(value[1]), Number(value[2])];
+}
+
+export function createFourCgsSceneTransform(input: FourCgsTransformInput): FourCgsSceneTransform {
+  return {
+    schemaVersion: 1,
+    coordinateSystem: 'playcanvas-y-up',
+    units: 'meter',
+    position: finiteVector3(input.position, 'metadata.sceneTransform.position'),
+    rotationEulerDegrees: finiteVector3(input.rotation, 'metadata.sceneTransform.rotationEulerDegrees'),
+    scale: finiteVector3(input.scale, 'metadata.sceneTransform.scale', true),
+  };
+}
+
+export function fourCgsSceneTransformToInput(transform: FourCgsSceneTransform): {
+  position: [number, number, number];
+  rotation: [number, number, number];
+  scale: [number, number, number];
+} {
+  return {
+    position: [...transform.position],
+    rotation: [...transform.rotationEulerDegrees],
+    scale: [...transform.scale],
+  };
+}
+
+function validateSceneTransform(value: unknown): FourCgsSceneTransform | undefined {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== 'object') throw new Error('4CGS metadata.sceneTransform 无效。');
+  const transform = value as Partial<FourCgsSceneTransform>;
+  if (transform.schemaVersion !== 1 || transform.coordinateSystem !== 'playcanvas-y-up' || transform.units !== 'meter') {
+    throw new Error('4CGS metadata.sceneTransform 坐标约定不受支持。');
+  }
+  return {
+    schemaVersion: 1,
+    coordinateSystem: 'playcanvas-y-up',
+    units: 'meter',
+    position: finiteVector3(transform.position, 'metadata.sceneTransform.position'),
+    rotationEulerDegrees: finiteVector3(transform.rotationEulerDegrees, 'metadata.sceneTransform.rotationEulerDegrees'),
+    scale: finiteVector3(transform.scale, 'metadata.sceneTransform.scale', true),
+  };
+}
+
+function validateMetadata(value: unknown): FourCgsMetadata | undefined {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('4CGS metadata 必须是对象。');
+  }
+  const metadata = value as FourCgsMetadata;
+  const sceneTransform = validateSceneTransform(metadata.sceneTransform);
+  return {
+    ...metadata,
+    ...(sceneTransform ? { sceneTransform } : {}),
+  };
+}
+
+function sceneTransformsEqual(first: FourCgsSceneTransform, second: FourCgsSceneTransform): boolean {
+  return first.schemaVersion === second.schemaVersion
+    && first.coordinateSystem === second.coordinateSystem
+    && first.units === second.units
+    && first.position.every((value, index) => value === second.position[index])
+    && first.rotationEulerDegrees.every((value, index) => value === second.rotationEulerDegrees[index])
+    && first.scale.every((value, index) => value === second.scale[index]);
+}
 
 function positiveInteger(value: unknown, label: string): number {
   if (!Number.isSafeInteger(value) || (value as number) <= 0) {
@@ -56,6 +135,7 @@ export function validateFourCgsManifest(value: unknown, fileBytes?: number): Fou
   positiveInteger(manifest.uniqueFrameCount, 'uniqueFrameCount');
   const segments = manifest.segments.map(validateSegment);
   const streams = manifest.streams.map(validateStream);
+  const metadata = validateMetadata(manifest.metadata);
   if (segments.length === 0 || streams.length === 0) throw new Error('4CGS 清单不得为空。');
   const streamNames = new Set<string>();
   for (const stream of streams) {
@@ -72,7 +152,12 @@ export function validateFourCgsManifest(value: unknown, fileBytes?: number): Fou
       throw new Error('4CGS 文件长度与流目录不一致。');
     }
   }
-  return { ...manifest, segments, streams } as FourCgsManifest;
+  return {
+    ...manifest,
+    segments,
+    streams,
+    ...(metadata ? { metadata } : {}),
+  } as FourCgsManifest;
 }
 
 export async function readFourCgsManifest(source: Blob): Promise<{ manifest: FourCgsManifest; manifestBytes: number }> {
@@ -110,8 +195,33 @@ export function locateFourCgsFrame(segments: readonly FourCgsSegment[], globalFr
   };
 }
 
-// #WDD-gpt 2026-08-16 - Save As 先完整验证容器目录，再返回同字节 Blob，禁止把单段 RAW4D 冒充成 4CGS。
-export async function writeFourCgsFile(source: File): Promise<Blob> {
-  await readFourCgsManifest(source);
-  return source.slice(0, source.size, 'application/x-4cgs');
+// #WDD-gpt 2026-08-16 - 4CGS Save As 只重写清单区并保留全部压缩流原字节，使场景变换可往返而不重新编码 Gaussian。
+export async function writeFourCgsFile(
+  source: Blob,
+  transform?: FourCgsTransformInput,
+): Promise<Blob> {
+  const { manifest, manifestBytes } = await readFourCgsManifest(source);
+  if (!transform) return source.slice(0, source.size, 'application/x-4cgs');
+  const sceneTransform = createFourCgsSceneTransform(transform);
+  const nextManifest: FourCgsManifest = {
+    ...manifest,
+    metadata: {
+      ...manifest.metadata,
+      sceneTransform,
+    },
+  };
+  const nextManifestBytes = new TextEncoder().encode(JSON.stringify(nextManifest));
+  if (nextManifestBytes.byteLength > MAX_MANIFEST_BYTES) throw new Error('4CGS 清单超过 8MB 限制。');
+  const header = new Uint8Array(FOUR_CGS_HEADER_BYTES);
+  header.set(new TextEncoder().encode(FOUR_CGS_MAGIC));
+  new DataView(header.buffer).setUint32(8, nextManifestBytes.byteLength, true);
+  const streams = source.slice(FOUR_CGS_HEADER_BYTES + manifestBytes);
+  const output = new Blob([header, nextManifestBytes, streams], { type: 'application/x-4cgs' });
+  // #WDD-gpt 2026-08-16 - 写完重新解析并逐项比对 TRS，避免清单可读但变换字段被覆盖或精度丢失。
+  const verified = await readFourCgsManifest(output);
+  if (!verified.manifest.metadata?.sceneTransform
+    || !sceneTransformsEqual(verified.manifest.metadata.sceneTransform, sceneTransform)) {
+    throw new Error('4CGS 完整场景变换写后校验失败。');
+  }
+  return output;
 }

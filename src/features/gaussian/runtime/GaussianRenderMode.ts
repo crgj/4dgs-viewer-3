@@ -24,13 +24,19 @@ void modifySplatCenter(inout vec3 center) {
 }
 
 void modifySplatRotationScale(vec3 originalCenter, vec3 modifiedCenter, inout vec4 rotation, inout vec3 scale) {
-    if (dongRenderMode > 0.5 && dongRenderMode < 1.5) {
-        float pointScale = max(max(scale.x, scale.y), scale.z) * 0.035;
-        scale = vec3(max(pointScale, 0.0015));
+    if ((dongRenderMode > 0.5 && dongRenderMode < 1.5) || dongRenderMode > 2.5) {
+        float pointScale = max(max(scale.x, scale.y), scale.z) * 0.0175;
+        scale = vec3(max(pointScale, 0.00075));
     }
 }
 
 void modifySplatColor(vec3 center, inout vec4 color) {
+    if (dongRenderMode > 2.5) {
+        bool finiteCenter = all(equal(center, center)) && all(lessThan(abs(center), vec3(100000.0)));
+        bool finiteColor = all(equal(color, color));
+        bool validPoint = finiteCenter && finiteColor && color.a >= 0.0039215686;
+        color = vec4(validPoint ? vec3(0.12, 1.0, 0.34) : vec3(1.0, 0.12, 0.10), 1.0);
+    }
 }
 `;
 
@@ -38,7 +44,7 @@ const modifyFragmentGLSL = `
 uniform float dongRenderMode;
 
 void modifySplatColor(vec2 gaussianUV, inout vec4 color) {
-    if (dongRenderMode < 0.5 || dongRenderMode > 2.5) {
+    if (dongRenderMode < 0.5) {
         return;
     }
 
@@ -49,12 +55,17 @@ void modifySplatColor(vec2 gaussianUV, inout vec4 color) {
 
     if (dongRenderMode < 1.5) {
         float pointEdge = 1.0 - smoothstep(0.70, 0.96, radialDistance);
-        color.a = sourceOpacity * pointEdge;
-    } else {
+        color.a = pointEdge;
+        float centerDot = 1.0 - smoothstep(0.015, 0.040, radialDistance);
+        color.rgb = mix(color.rgb, vec3(0.08, 0.42, 1.0), centerDot);
+    } else if (dongRenderMode < 2.5) {
         float ellipseInnerEdge = smoothstep(0.64, 0.72, radialDistance);
         float ellipseOuterEdge = 1.0 - smoothstep(0.86, 0.93, radialDistance);
         color.a = sourceOpacity * ellipseInnerEdge * ellipseOuterEdge * 0.95;
         color.rgb = mix(color.rgb, vec3(1.0), 0.08);
+    } else {
+        // #WDD-gpt 2026-08-16 - “全部”是绿色正常点/红色异常点诊断点，不再回退为高斯椭圆。
+        color.a = 1.0 - smoothstep(0.70, 0.96, radialDistance);
     }
 }
 `;
@@ -66,14 +77,22 @@ fn modifySplatCenter(center: ptr<function, vec3f>) {
 }
 
 fn modifySplatRotationScale(originalCenter: vec3f, modifiedCenter: vec3f, rotation: ptr<function, vec4f>, scale: ptr<function, vec3f>) {
-    if (uniform.dongRenderMode > 0.5 && uniform.dongRenderMode < 1.5) {
+    if ((uniform.dongRenderMode > 0.5 && uniform.dongRenderMode < 1.5) || uniform.dongRenderMode > 2.5) {
         let currentScale = *scale;
-        let pointScale = max(max(currentScale.x, currentScale.y), currentScale.z) * 0.035;
-        *scale = vec3f(max(pointScale, 0.0015));
+        let pointScale = max(max(currentScale.x, currentScale.y), currentScale.z) * 0.0175;
+        *scale = vec3f(max(pointScale, 0.00075));
     }
 }
 
 fn modifySplatColor(center: vec3f, color: ptr<function, vec4f>) {
+    if (uniform.dongRenderMode > 2.5) {
+        let finiteCenter = all(center == center) && all(abs(center) < vec3f(100000.0));
+        let currentColor = *color;
+        let finiteColor = all(currentColor == currentColor);
+        let validPoint = finiteCenter && finiteColor && currentColor.a >= 0.0039215686;
+        let diagnosticColor = select(vec3f(1.0, 0.12, 0.10), vec3f(0.12, 1.0, 0.34), validPoint);
+        *color = vec4f(diagnosticColor, 1.0);
+    }
 }
 `;
 
@@ -81,7 +100,7 @@ const modifyFragmentWGSL = `
 uniform dongRenderMode: f32;
 
 fn modifySplatColor(gaussianUV: vec2f, color: ptr<function, vec4f>) {
-    if (uniform.dongRenderMode < 0.5 || uniform.dongRenderMode > 2.5) {
+    if (uniform.dongRenderMode < 0.5) {
         return;
     }
 
@@ -92,12 +111,16 @@ fn modifySplatColor(gaussianUV: vec2f, color: ptr<function, vec4f>) {
 
     if (uniform.dongRenderMode < 1.5) {
         let pointEdge = 1.0 - smoothstep(0.70, 0.96, radialDistance);
-        (*color).a = sourceOpacity * pointEdge;
-    } else {
+        (*color).a = pointEdge;
+        let centerDot = 1.0 - smoothstep(0.015, 0.040, radialDistance);
+        (*color).rgb = mix((*color).rgb, vec3f(0.08, 0.42, 1.0), centerDot);
+    } else if (uniform.dongRenderMode < 2.5) {
         let ellipseInnerEdge = smoothstep(0.64, 0.72, radialDistance);
         let ellipseOuterEdge = 1.0 - smoothstep(0.86, 0.93, radialDistance);
         (*color).a = sourceOpacity * ellipseInnerEdge * ellipseOuterEdge * 0.95;
         (*color).rgb = mix((*color).rgb, vec3f(1.0), 0.08);
+    } else {
+        (*color).a = 1.0 - smoothstep(0.70, 0.96, radialDistance);
     }
 }
 `;
@@ -111,23 +134,26 @@ uniform float uRelightBrightness;
 uniform float uRelightBackground;
 
 void modifySplatColor(vec2 gaussianUV, inout vec4 color) {
-    if (dongRenderMode > 0.5 && dongRenderMode < 2.5) {
-        float radialDistance = dot(gaussianUV, gaussianUV);
+    float radialDistance = dot(gaussianUV, gaussianUV);
+    if (dongRenderMode > 0.5) {
         float exp4 = exp(-4.0);
         float gaussianProfile = (exp(-4.0 * radialDistance) - exp4) / (1.0 - exp4);
         float sourceOpacity = color.a / max(gaussianProfile, 0.0001);
 
         if (dongRenderMode < 1.5) {
             float pointEdge = 1.0 - smoothstep(0.70, 0.96, radialDistance);
-            color.a = sourceOpacity * pointEdge;
-        } else {
+            color.a = pointEdge;
+        } else if (dongRenderMode < 2.5) {
             float ellipseInnerEdge = smoothstep(0.64, 0.72, radialDistance);
             float ellipseOuterEdge = 1.0 - smoothstep(0.86, 0.93, radialDistance);
             color.a = sourceOpacity * ellipseInnerEdge * ellipseOuterEdge * 0.95;
             color.rgb = mix(color.rgb, vec3(1.0), 0.08);
+        } else {
+            color.a = 1.0 - smoothstep(0.70, 0.96, radialDistance);
         }
     }
 
+    if (dongRenderMode > 2.5) return;
     vec4 lit = textureLod(uRelightMap, gl_FragCoord.xy * uScreenSize.zw, 0.0);
     vec3 hdrLighting = max(lit.rgb * uRelightBrightness, vec3(0.0));
     vec3 compressedLighting = 2.0 * hdrLighting / (vec3(1.0) + hdrLighting);
@@ -136,6 +162,10 @@ void modifySplatColor(vec2 gaussianUV, inout vec4 color) {
     vec3 boundedBaseColor = clamp(color.rgb, vec3(0.0), vec3(0.999999));
     vec3 boundedRelitColor = vec3(1.0) - pow(max(vec3(1.0) - boundedBaseColor, vec3(0.000001)), max(factor, vec3(0.0)));
     color.rgb = mix(color.rgb, boundedRelitColor, uRelightBlend);
+    if (dongRenderMode > 0.5 && dongRenderMode < 1.5) {
+        float centerDot = 1.0 - smoothstep(0.015, 0.040, radialDistance);
+        color.rgb = mix(color.rgb, vec3(0.08, 0.42, 1.0), centerDot);
+    }
 }
 `;
 
@@ -149,23 +179,26 @@ uniform uRelightBrightness: f32;
 uniform uRelightBackground: f32;
 
 fn modifySplatColor(gaussianUV: vec2f, color: ptr<function, vec4f>) {
-    if (uniform.dongRenderMode > 0.5 && uniform.dongRenderMode < 2.5) {
-        let radialDistance = dot(gaussianUV, gaussianUV);
+    let radialDistance = dot(gaussianUV, gaussianUV);
+    if (uniform.dongRenderMode > 0.5) {
         let exp4 = exp(-4.0);
         let gaussianProfile = (exp(-4.0 * radialDistance) - exp4) / (1.0 - exp4);
         let sourceOpacity = (*color).a / max(gaussianProfile, 0.0001);
 
         if (uniform.dongRenderMode < 1.5) {
             let pointEdge = 1.0 - smoothstep(0.70, 0.96, radialDistance);
-            (*color).a = sourceOpacity * pointEdge;
-        } else {
+            (*color).a = pointEdge;
+        } else if (uniform.dongRenderMode < 2.5) {
             let ellipseInnerEdge = smoothstep(0.64, 0.72, radialDistance);
             let ellipseOuterEdge = 1.0 - smoothstep(0.86, 0.93, radialDistance);
             (*color).a = sourceOpacity * ellipseInnerEdge * ellipseOuterEdge * 0.95;
             (*color).rgb = mix((*color).rgb, vec3f(1.0), 0.08);
+        } else {
+            (*color).a = 1.0 - smoothstep(0.70, 0.96, radialDistance);
         }
     }
 
+    if (uniform.dongRenderMode > 2.5) { return; }
     let lit = textureSampleLevel(uRelightMap, uRelightMapSampler, pcPosition.xy * uniform.uScreenSize.zw, 0.0);
     let hdrLighting = max(lit.rgb * uniform.uRelightBrightness, vec3f(0.0));
     let compressedLighting = 2.0 * hdrLighting / (vec3f(1.0) + hdrLighting);
@@ -174,6 +207,10 @@ fn modifySplatColor(gaussianUV: vec2f, color: ptr<function, vec4f>) {
     let boundedBaseColor = clamp((*color).rgb, vec3f(0.0), vec3f(0.999999));
     let boundedRelitColor = vec3f(1.0) - pow(max(vec3f(1.0) - boundedBaseColor, vec3f(0.000001)), max(factor, vec3f(0.0)));
     *color = vec4f(mix((*color).rgb, boundedRelitColor, uniform.uRelightBlend), (*color).a);
+    if (uniform.dongRenderMode > 0.5 && uniform.dongRenderMode < 1.5) {
+        let centerDot = 1.0 - smoothstep(0.015, 0.040, radialDistance);
+        (*color).rgb = mix((*color).rgb, vec3f(0.08, 0.42, 1.0), centerDot);
+    }
 }
 `;
 

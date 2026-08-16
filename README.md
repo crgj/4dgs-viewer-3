@@ -43,13 +43,13 @@ WebGPU 模式把位置关键帧和其余动态属性分别分批上传到两个�
 
 顶部“导入”正式接受 `.4cgs`。当前产品格式是 `4CGSPRS2` / manifest version 2：一个容器可组合六个 RAW4D 片段，以永久 Track ID 保留边界对应关系，Position、Rotation、Scale、DC 和 Opacity 使用 V2.4 结构流，共享一份 CoReSH-5R SH 轨迹与生命周期流。六段重合边界在主时间轴只计一次；例如全局第 30 帧会选择第二段 local frame 0，不会重复播放前段末帧。
 
-读取首先校验文件长度、流目录以及 stored/raw SHA-256。外层 Brotli 由 `brotli-wasm` 解码，XZ、rANS、Predictive Rice、Scalar-RQ 和 CoReSH-5R 全部在浏览器 Worker 内执行。启用 COOP/COEP 时，Position/Rotation/Scale/DC 四个子 Worker 直接写共享行缓冲；没有 `SharedArrayBuffer` 时保留同算法的串行兼容路径，并明确显示加载状态。解码完成后，各片段一次性转成规范 RAW4D 并 Pin 在系统内存驻留池；播放与多 RAW4D 共用“当前段 + 未来段”GPU 滑动窗口。命中预取段只切换实体显隐，显存不足时优先淘汰已播放段，当前段始终受保护，不再到段落节点才临时解码和上传。
+读取首先校验文件长度、流目录以及 stored/raw SHA-256；九条容器流并行读取和校验，原样存储流不会重复计算同一份 SHA-256。外层 Brotli 由 `brotli-wasm` 解码，XZ、rANS、Predictive Rice、Scalar-RQ 和 CoReSH-5R 全部在浏览器 Worker 内执行。启用 COOP/COEP、浏览器暴露至少 8 个逻辑核心时，Position、Rotation、Scale、DC、Opacity、Lifetime 与 SH 七个属性 Worker 直接写互不重叠的共享行缓冲；至少 16 核时再按永久 Track 把 Rotation 拆给 2–4 个子 Worker，32 逻辑核心机器达到 11 个子 Worker加 1 个主解码 Worker。较少核心使用四属性 Worker 保守路径，没有 `SharedArrayBuffer` 时保留同算法的串行兼容路径。加载卡片每 400ms 更新已完成 Worker 数、剩余属性和实际耗时，并在属性完成时推进进度；进度条流光由合成层持续显示繁忙状态，不会再把最慢 Worker 的等待表现成界面卡死。Position/Scale 热循环缓存属性偏移并直接写最终 FP16，Scale/DC 不再创建整段 banks 临时数组；共享 SH 只在 Track 码字更新时重建 45D。属性完成后同时提交全部片段提取请求，规范 RAW4D 由最多 3 个 Loader Worker 并行解析并 Pin 在系统内存驻留池；Loader 池不会跟随逻辑核心数无限放大，以免六个大数组同时分配造成带宽争用。播放与多 RAW4D 共用“当前段 + 未来段”GPU 滑动窗口。命中预取段只切换实体显隐，显存不足时优先淘汰已播放段，当前段始终受保护，不再到段落节点才临时解码和上传。
 
 “导出”对未修改的 4CGS 执行无损 Save As：重新验证头部、清单和流目录后下载同字节 `.4cgs`，不会把当前单段 RAW4D 冒充为完整容器。对 `collected_master_ply4_cleaned_fp16` 的六个指定 RAW4D 源，导出会先在浏览器逐文件校验文件名、字节数和 SHA-256，再下载已通过质量门的 V2.4 bitstream：59.599395M，源数据 335.222844M，压缩比 5.6246x；任何源不一致都会明确拒绝，不会生成伪容器。V2.4 压缩载荷在前端暂按只读语义处理；检测到高斯删除时会拒绝保存并提示撤销，禁止静默丢弃编辑。任意其他新 RAW4D 组合仍需先经过离线编码器，离线编码器不是页面运行依赖。
 
-运行时没有云端 API、Node.js、Python、CUDA 或 localhost 依赖。生产构建中的 Brotli WASM 当前约 1.06 MB，4CGS 主 Worker 与属性 Worker 分别约 153 KB 和 108 KB；六段专用的已验收 V2.4 导出资源为 59.599395M，只在用户点击导出后按需读取。它们都通过本站带内容哈希的静态 URL 加载。缓存位置是浏览器普通 HTTP Cache，缓存键由构建文件名哈希决定；刷新会复用同版本，部署新哈希后才下载新版本。用户可通过浏览器“清除站点数据/缓存”删除这些资源。本格式不下载模型，也不使用 IndexedDB、Cache Storage 或 OPFS。
+运行时没有云端 API、Node.js、Python、CUDA 或 localhost 依赖。生产构建中的 Brotli WASM 当前约 1.06 MB，4CGS 主 Worker、属性 Worker、辅助 Worker 与 Rotation 分区 Worker 分别约 160 KB、113 KB、85 KB 和 14 KB；六段专用的已验收 V2.4 导出资源为 59.599395M，只在用户点击导出后按需读取。它们都通过本站带内容哈希的静态 URL 加载。缓存位置是浏览器普通 HTTP Cache，缓存键由构建文件名哈希决定；刷新会复用同版本，部署新哈希后才下载新版本。用户可通过浏览器“清除站点数据/缓存”删除这些资源。本格式不下载模型，也不使用 IndexedDB、Cache Storage 或 OPFS。当前 32 逻辑核心工作站对这份 59.599395M 文件的最终生产构建三次完整解码为 2.998–3.281 秒，中位数 3.214 秒；此前 8 个总 Worker 版本中位数为 3.780 秒，同机“四属性 Worker + 主 Worker 串行辅助属性”的基线为 10.968 秒。完整打开三次为 5.435–5.647 秒，中位数 5.442 秒；其中片段提取中位数 0.196 秒、六段并行 CPU 驻留 0.751 秒、首段 GPU 激活 1.358 秒。GPU 传输继续服从单队列和显存预算，不随 CPU Worker 数盲目并发。
 
-<!-- #WDD-gpt 2026-08-16 - 记录六段 RAW4D 默认导出质量验收版 4CGS，以及 4CGS 系统内存驻留和显存预取边界。 -->
+<!-- #WDD-gpt 2026-08-16 - 记录六段 RAW4D 默认导出质量验收版 4CGS、多线程位级等价解码，以及系统内存驻留和显存预取边界。 -->
 
 “变换”页可通过数值输入实时修改活动 RAW4D 对象的位置、欧拉旋转和缩放，也可使用视口中的彩色 Gizmo 直接拖拽。工具栏与变换页都可切换移动、旋转和缩放，数字键 `1/2/3/4` 对应选择、移动、旋转和缩放；变换支持世界/局部坐标切换、等比缩放以及分组/全部重置。
 

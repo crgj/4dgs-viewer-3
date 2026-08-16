@@ -1,4 +1,5 @@
 import type { UiLanguage } from '../../app/i18n';
+import { ValidatedNumberInput } from '../../app/components/ValidatedNumberInput';
 import type {
   RelightingLightPatch,
   RelightingSettings,
@@ -118,7 +119,7 @@ export function RelightingPanel({
         </label>
         <label>
           <span>{copy.quality}</span>
-          <select onChange={(event) => onSettingsChange({ textureScale: Number(event.target.value) })} value={state.textureScale}>
+          <select className="ui-select" onChange={(event) => onSettingsChange({ textureScale: Number(event.target.value) })} value={state.textureScale}>
             <option value="0.5">50% · Fast</option>
             <option value="0.75">75% · Balanced</option>
             <option value="1">100% · Sharp</option>
@@ -155,7 +156,7 @@ export function RelightingPanel({
         <div className="relighting-light-editor">
           <div className="relighting-editor-title">
             <strong>{selected.name}</strong>
-            <button aria-label={copy.remove} onClick={() => onRemoveLight(selected.id)} title={copy.remove} type="button">×</button>
+            <button aria-label={copy.remove} className="has-tip" data-tip={copy.remove} onClick={() => onRemoveLight(selected.id)} type="button">×</button>
           </div>
           <fieldset>
             <legend>{copy.position}</legend>
@@ -163,15 +164,17 @@ export function RelightingPanel({
               {axes.map((axis, index) => (
                 <label key={axis}>
                   <b className={`axis-${axis.toLowerCase()}`}>{axis}</b>
-                  <input
+                  <ValidatedNumberInput
                     aria-label={`${copy.position} ${axis}`}
-                    onChange={(event) => {
+                    max={100_000}
+                    min={-100_000}
+                    onCommit={(value) => {
                       const next = [...selected.position] as [number, number, number];
-                      next[index] = Number(event.target.value);
+                      next[index] = value;
                       onLightChange(selected.id, { position: next });
                     }}
-                    step="0.05"
-                    type="number"
+                    precision={3}
+                    step={0.05}
                     value={Math.round(selected.position[index] * 1000) / 1000}
                   />
                 </label>
@@ -180,8 +183,8 @@ export function RelightingPanel({
           </fieldset>
           <div className="relighting-light-properties">
             <label><span>{copy.color}</span><input onChange={(event) => onLightChange(selected.id, { color: event.target.value })} type="color" value={selected.color} /></label>
-            <label><span>{copy.intensity}</span><input max="50" min="0" onChange={(event) => onLightChange(selected.id, { intensity: Number(event.target.value) })} step="0.1" type="number" value={selected.intensity} /></label>
-            <label><span>{copy.range}</span><input min="0.01" onChange={(event) => onLightChange(selected.id, { range: Number(event.target.value) })} step="0.1" type="number" value={Math.round(selected.range * 1000) / 1000} /></label>
+            <label><span>{copy.intensity}</span><ValidatedNumberInput aria-label={copy.intensity} max={50} min={0} onCommit={(intensity) => onLightChange(selected.id, { intensity })} precision={2} step={0.1} value={selected.intensity} /></label>
+            <label><span>{copy.range}</span><ValidatedNumberInput aria-label={copy.range} max={100_000} min={0.01} onCommit={(range) => onLightChange(selected.id, { range })} precision={3} step={0.1} value={Math.round(selected.range * 1000) / 1000} /></label>
           </div>
           <label className="relighting-shadow-toggle"><input checked={selected.castShadows} onChange={(event) => onLightChange(selected.id, { castShadows: event.target.checked })} type="checkbox" />{copy.shadows}</label>
           <p className="relighting-gizmo-hint">{copy.gizmo}</p>

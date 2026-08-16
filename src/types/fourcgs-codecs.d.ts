@@ -7,6 +7,8 @@ declare module '*fourcgs-prs-codec.mjs' {
 
 declare module '*fourcgs-so3-temporal-codec.mjs' {
   export const decodeSo3RotationStreams: (...arguments_: any[]) => any;
+  export const prepareSo3RotationStreams: (...arguments_: any[]) => any;
+  export const decodeSo3RotationPartition: (...arguments_: any[]) => any;
 }
 
 declare module '*fourcgs-temporal-attribute-codec.mjs' {
@@ -32,6 +34,11 @@ declare module '*fourcgs-scalar-rq-codec.mjs' {
 
 declare module '*fourcgs-temporal-rq-codec.mjs' {
   export const decodeTemporalRq: (...arguments_: any[]) => any;
+}
+
+// #WDD-gpt 2026-08-16 - 声明 V2.5 全 Opacity 位级无损混合流的浏览器 Worker 解码入口。
+declare module '*fourcgs-opacity-hybrid-codec.mjs' {
+  export const decodeOpacityHybrid: (...arguments_: any[]) => any;
 }
 
 declare module 'xzwasm' {
