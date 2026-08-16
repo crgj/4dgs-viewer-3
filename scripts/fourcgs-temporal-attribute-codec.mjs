@@ -187,17 +187,23 @@ export function decodeTemporalAttribute(encoded, manifest, activeSlots, rows, in
 
 // #WDD-gpt 2026-08-16 - V2.4 允许 Scale/DC 从结构化外层的原始上下文流直接写入行缓冲，消除重复熵编解码。
 export function decodeTemporalAttributeStreams(metadata, streams, manifest, activeSlots, rows, indices) {
+  const readers = new Map([...streams].map(([name, bytes]) => [name, new ByteReader(bytes)]));
+  return decodeTemporalAttributeReaders(metadata, readers, manifest, activeSlots, rows, indices);
+}
+
+// #WDD-gpt 2026-08-16 - V2.4 接受按需 Rice reader，与普通 Varint reader 共享同一套时间重建和行写入逻辑。
+export function decodeTemporalAttributeReaders(metadata, readers, manifest, activeSlots, rows, indices) {
   if (metadata.slotCount !== manifest.slotCount || metadata.bankCounts.length !== manifest.segments.length) {
     throw new Error('Temporal attribute layout mismatch.');
   }
   const dimensions = metadata.components.length;
-  const birthReader = new ByteReader(streams.get('birth'));
+  const birthReader = readers.get('birth');
   const birth = new Int32Array(manifest.slotCount * dimensions);
   for (let index = 0; index < birth.length; index += 1) birth[index] = metadata.exactHalf ? birthReader.ushort() : birthReader.sint();
   birthReader.done();
   const contextReaders = Object.fromEntries(['boundary', 'endpoint', 'internal'].map((context) => [
     context,
-    Array.from({ length: dimensions }, (_, component) => new ByteReader(streams.get(`${context}:${component}`))),
+    Array.from({ length: dimensions }, (_, component) => readers.get(`${context}:${component}`)),
   ]));
   const endState = new Int32Array(manifest.slotCount * dimensions);
   const initialized = new Uint8Array(manifest.slotCount);

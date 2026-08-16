@@ -75,6 +75,48 @@ class PackedBitReader {
   done() { if (this.bitOffset !== this.totalBits) throw new Error(`Unused Rice bits: ${this.totalBits - this.bitOffset}`); }
 }
 
+class PredictiveRiceSignedReader {
+  constructor(header, parameters, bits) {
+    this.valueCount = header.readUInt32LE(0);
+    this.blockSize = header.readUInt32LE(4);
+    this.blockCount = header.readUInt32LE(8);
+    this.totalBits = header.readUInt32LE(12);
+    if (parameters.length !== this.blockCount || bits.length !== Math.ceil(this.totalBits / 8)) throw new Error('Invalid direct predictive Rice parts.');
+    const bitReader = new PackedBitReader(bits, this.totalBits);
+    this.values = new Int32Array(this.valueCount);
+    this.index = 0;
+    for (let block = 0; block < this.blockCount; block += 1) {
+      const parameter = parameters[block];
+      const mode = parameter >>> 5;
+      const k = parameter & 31;
+      const first = block * this.blockSize;
+      const last = Math.min(this.valueCount, first + this.blockSize);
+      let anchor = 0;
+      let previous = 0;
+      let previous2 = 0;
+      for (let ordinal = first; ordinal < last; ordinal += 1) {
+        const blockOffset = ordinal - first;
+        const unsigned = bitReader.unary() * (2 ** k) + bitReader.read(k);
+        const residual = unsigned & 1 ? -(unsigned + 1) / 2 : unsigned / 2;
+        let value = residual;
+        if (mode === 1 && blockOffset > 0) value += previous;
+        else if (mode === 2 && blockOffset === 1) value += previous;
+        else if (mode === 2 && blockOffset > 1) value += 2 * previous - previous2;
+        else if (mode === 3 && blockOffset > 0) value += anchor;
+        if (blockOffset === 0) anchor = value;
+        previous2 = previous;
+        previous = value;
+        this.values[ordinal] = value;
+      }
+    }
+    bitReader.done();
+  }
+  sint() { if (this.index >= this.valueCount) throw new Error('Unexpected direct predictive Rice end.'); return this.values[this.index++]; }
+  done() {
+    if (this.index !== this.valueCount) throw new Error(`Unused direct predictive Rice values: ${this.valueCount - this.index}`);
+  }
+}
+
 function decodeUnsignedVarints(bytes) {
   const reader = new ByteReader(bytes, 'unsigned-varint stream');
   const values = [];
@@ -736,6 +778,36 @@ export async function decodeV22StructuredParts(name, encoded) {
     throw new Error(`Unsupported V2.4 direct transform ${metadata.transform}.`);
   }
   return { metadata: streamMetadata, streams, envelopeMetadata: metadata };
+}
+
+// #WDD-gpt 2026-08-16 - V2.4 Scale 从 Rice bitstream 按需取整数，避免先生成 21.1M Varint 再二次解析。
+export async function decodeV22ScaleReaders(encoded) {
+  const { metadata, blocks } = unpackEnvelope(encoded);
+  if (metadata.streamName !== 'tattr_scale' || metadata.transform !== 'scale-quantized-predictive-rice64-contexts') {
+    throw new Error('V2.4 direct Scale reader requires the quantized predictive Rice stream.');
+  }
+  const payload = await decodeXzBrowser(blocks.get('payload'));
+  const names = compactV22PartNames(metadata);
+  if (names.length !== metadata.partBytes?.length) throw new Error('V2.4 Scale compact part count mismatch.');
+  const parts = new Map();
+  let offset = 0;
+  for (let index = 0; index < names.length; index += 1) {
+    const bytes = metadata.partBytes[index];
+    parts.set(names[index], payload.subarray(offset, offset + bytes));
+    offset += bytes;
+  }
+  if (offset !== payload.length) throw new Error('V2.4 Scale payload length mismatch.');
+  const streamMetadata = JSON.parse(Buffer.from(metadata.directoryBase64, 'base64').toString('utf8'));
+  const readers = new Map();
+  for (const entry of streamMetadata.streams) {
+    if (metadata.emptyResidualNames?.includes(entry.name)) throw new Error(`V2.4 Scale unexpectedly contains empty stream ${entry.name}.`);
+    readers.set(entry.name, new PredictiveRiceSignedReader(
+      parts.get(`${entry.name}$header`),
+      parts.get(`${entry.name}$parameters`),
+      parts.get(`${entry.name}$bits`),
+    ));
+  }
+  return { metadata: streamMetadata, readers, envelopeMetadata: metadata };
 }
 
 export async function decodeV21StructuredStream(name, encoded, manifest) {
