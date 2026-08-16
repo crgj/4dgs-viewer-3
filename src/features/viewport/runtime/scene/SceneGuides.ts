@@ -36,7 +36,10 @@ function readNumberParameter(material: Material, name: string, fallback: number)
 
 export class SceneGuides {
   private readonly entity = new Entity('Grid & Axes');
-  private readonly mesh: Mesh;
+  private readonly gridEntity = new Entity('Grid');
+  private readonly axesEntity = new Entity('Axes');
+  private readonly gridMesh: Mesh;
+  private readonly axesMesh: Mesh;
   private readonly material = new StandardMaterial();
   private readonly depthLayer = new Layer({
     name: 'Gaussian Guide Depth',
@@ -61,17 +64,27 @@ export class SceneGuides {
     size = 10,
     divisions = 20,
   ) {
-    const positions: number[] = [];
-    const colors: number[] = [];
+    const gridPositions: number[] = [];
+    const gridColors: number[] = [];
+    const axesPositions: number[] = [];
+    const axesColors: number[] = [];
     const half = size / 2;
     const step = size / divisions;
-    const pushLine = (
+    const pushGridLine = (
       start: [number, number, number],
       end: [number, number, number],
       color: [number, number, number, number],
     ) => {
-      positions.push(...start, ...end);
-      colors.push(...color, ...color);
+      gridPositions.push(...start, ...end);
+      gridColors.push(...color, ...color);
+    };
+    const pushAxisLine = (
+      start: [number, number, number],
+      end: [number, number, number],
+      color: [number, number, number, number],
+    ) => {
+      axesPositions.push(...start, ...end);
+      axesColors.push(...color, ...color);
     };
 
     for (let i = 0; i <= divisions; i += 1) {
@@ -81,19 +94,23 @@ export class SceneGuides {
         ? [58, 71, 94, 150]
         : [34, 42, 57, 95];
 
-      pushLine([-half, 0, offset], [half, 0, offset], color);
-      pushLine([offset, 0, -half], [offset, 0, half], color);
+      pushGridLine([-half, 0, offset], [half, 0, offset], color);
+      pushGridLine([offset, 0, -half], [offset, 0, half], color);
     }
 
     // #WDD-gpt 2026-08-15 - 世界坐标采用米制，X/Y/Z 三色轴从原点起均精确显示 1 m。
-    pushLine([0, AXIS_SURFACE_OFFSET, 0], [AXIS_LENGTH_METERS, AXIS_SURFACE_OFFSET, 0], [245, 64, 78, 255]);
-    pushLine([0, AXIS_SURFACE_OFFSET, 0], [0, AXIS_LENGTH_METERS, 0], [74, 226, 126, 255]);
-    pushLine([0, AXIS_SURFACE_OFFSET, 0], [0, AXIS_SURFACE_OFFSET, AXIS_LENGTH_METERS], [57, 125, 255, 255]);
+    pushAxisLine([0, AXIS_SURFACE_OFFSET, 0], [AXIS_LENGTH_METERS, AXIS_SURFACE_OFFSET, 0], [245, 64, 78, 255]);
+    pushAxisLine([0, AXIS_SURFACE_OFFSET, 0], [0, AXIS_LENGTH_METERS, 0], [74, 226, 126, 255]);
+    pushAxisLine([0, AXIS_SURFACE_OFFSET, 0], [0, AXIS_SURFACE_OFFSET, AXIS_LENGTH_METERS], [57, 125, 255, 255]);
 
-    this.mesh = new Mesh(app.graphicsDevice);
-    this.mesh.setPositions(positions);
-    this.mesh.setColors32(colors);
-    this.mesh.update(PRIMITIVE_LINES);
+    this.gridMesh = new Mesh(app.graphicsDevice);
+    this.gridMesh.setPositions(gridPositions);
+    this.gridMesh.setColors32(gridColors);
+    this.gridMesh.update(PRIMITIVE_LINES);
+    this.axesMesh = new Mesh(app.graphicsDevice);
+    this.axesMesh.setPositions(axesPositions);
+    this.axesMesh.setColors32(axesColors);
+    this.axesMesh.update(PRIMITIVE_LINES);
 
     this.material.useLighting = false;
     this.material.emissiveVertexColor = true;
@@ -103,9 +120,10 @@ export class SceneGuides {
     this.material.depthWrite = false;
     this.material.update();
 
-    const meshInstance = new MeshInstance(this.mesh, this.material, this.entity);
-    meshInstance.castShadow = false;
-    meshInstance.receiveShadow = false;
+    const gridInstance = new MeshInstance(this.gridMesh, this.material, this.gridEntity);
+    const axesInstance = new MeshInstance(this.axesMesh, this.material, this.axesEntity);
+    gridInstance.castShadow = false; gridInstance.receiveShadow = false;
+    axesInstance.castShadow = false; axesInstance.receiveShadow = false;
 
     // #WDD-gpt  2026-08-15 - 彩色高斯保持标准透明混合；单独追加仅深度通道后再绘制网格，避免动画帧被深度写入切碎。
     app.scene.layers.pushTransparent(this.depthLayer);
@@ -113,8 +131,12 @@ export class SceneGuides {
     this.cameraLayerIds = [...camera.layers];
     camera.layers = [...camera.layers, this.depthLayer.id, this.guideLayer.id];
 
-    this.entity.addComponent('render', { layers: [this.guideLayer.id] });
-    this.entity.render!.meshInstances = [meshInstance];
+    this.gridEntity.addComponent('render', { layers: [this.guideLayer.id] });
+    this.axesEntity.addComponent('render', { layers: [this.guideLayer.id] });
+    this.gridEntity.render!.meshInstances = [gridInstance];
+    this.axesEntity.render!.meshInstances = [axesInstance];
+    this.entity.addChild(this.gridEntity);
+    this.entity.addChild(this.axesEntity);
     app.root.addChild(this.entity);
 
     this.preRenderLayer = app.scene.on('prerender:layer', this.onPreRenderLayer);
@@ -128,12 +150,25 @@ export class SceneGuides {
 
   setEnabled(enabled: boolean): void {
     this.entity.enabled = enabled;
-    this.depthLayer.enabled = enabled;
+    this.syncEnabledState();
   }
 
   getEnabled(): boolean {
     return this.entity.enabled;
   }
+
+  setGridVisible(visible: boolean): void {
+    this.gridEntity.enabled = visible;
+    this.syncEnabledState();
+  }
+
+  setAxesVisible(visible: boolean): void {
+    this.axesEntity.enabled = visible;
+    this.syncEnabledState();
+  }
+
+  getGridVisible(): boolean { return this.gridEntity.enabled; }
+  getAxesVisible(): boolean { return this.axesEntity.enabled; }
 
   setGaussianDepthSourceEnabled(enabled: boolean): void {
     this.gaussianDepthSourceEnabled = enabled;
@@ -155,8 +190,13 @@ export class SceneGuides {
     this.camera.layers = this.cameraLayerIds;
     this.app.scene.layers.removeTransparent(this.guideLayer);
     this.app.scene.layers.removeTransparent(this.depthLayer);
-    this.mesh.destroy();
+    this.gridMesh.destroy();
+    this.axesMesh.destroy();
     this.material.destroy();
+  }
+
+  private syncEnabledState(): void {
+    this.depthLayer.enabled = this.entity.enabled && (this.gridEntity.enabled || this.axesEntity.enabled);
   }
 
   private readonly onGaussianMaterialCreated = (

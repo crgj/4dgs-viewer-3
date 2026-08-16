@@ -1,9 +1,9 @@
 import { parentPort, workerData } from 'node:worker_threads';
 import { performance } from 'node:perf_hooks';
-import { decodePositions } from './fourcgs-prs-codec.mjs';
+import { decodePositionContextStreams, decodePositions } from './fourcgs-prs-codec.mjs';
 import { decodeSo3RotationStreams } from './fourcgs-so3-temporal-codec.mjs';
 import { decodeTemporalAttributeReaders, decodeTemporalAttributeStreams } from './fourcgs-temporal-attribute-codec.mjs';
-import { decodeV22ScaleReaders, decodeV22StructuredParts } from './fourcgs-v21-lossless-codec.mjs';
+import { decodeV21PositionContexts, decodeV22ScaleReaders, decodeV22StructuredParts, isV21StructuredStream } from './fourcgs-v21-lossless-codec.mjs';
 
 function propertyNames(segment) {
   const names = [];
@@ -29,7 +29,12 @@ async function main() {
   let metrics;
   let prepareMilliseconds = 0;
   if (task === 'position') {
-    metrics = decodePositions(stream, manifest, activeSlots, rows, indices);
+    if (isV21StructuredStream(stream)) {
+      const prepareStarted = performance.now();
+      const direct = await decodeV21PositionContexts(stream);
+      prepareMilliseconds = performance.now() - prepareStarted;
+      metrics = decodePositionContextStreams(direct.contexts, manifest, activeSlots, rows, indices);
+    } else metrics = decodePositions(stream, manifest, activeSlots, rows, indices);
   } else if (task === 'scale') {
     const prepareStarted = performance.now();
     const direct = await decodeV22ScaleReaders(stream);

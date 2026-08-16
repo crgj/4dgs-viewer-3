@@ -29,6 +29,7 @@ interface Raw4DResourceMetadata {
 export class Raw4DResource extends GSplatResourceBase {
   readonly shBands: number;
   readonly gpuByteSize: number;
+  private displayShBands: number;
 
   constructor(device: GraphicsDevice, private readonly asset: Raw4DAsset) {
     const metadata: Raw4DResourceMetadata = {
@@ -41,6 +42,7 @@ export class Raw4DResource extends GSplatResourceBase {
     };
     super(device, metadata as never, { prepareCenters: false });
     this.shBands = asset.shBands;
+    this.displayShBands = asset.shBands;
     const streams: Array<{ name: string; format: number }> = [
       { name: 'splatColor', format: PIXELFORMAT_RGBA16F },
       { name: 'transformA', format: PIXELFORMAT_RGBA32U },
@@ -72,7 +74,18 @@ export class Raw4DResource extends GSplatResourceBase {
   }
 
   override configureMaterialDefines(defines: Map<string, string | number | boolean>): void {
-    defines.set('SH_BANDS', String(this.shBands));
+    defines.set('SH_BANDS', String(this.displayShBands));
+  }
+
+  setDisplayShBands(level: number): number {
+    this.displayShBands = Math.max(0, Math.min(this.shBands, Math.round(level)));
+    return this.displayShBands;
+  }
+
+  refreshSourceData(): void {
+    this.uploadColorAndTransform();
+    if (this.shBands > 0) this.uploadSH();
+    this.aabb.setMinMax(new Vec3(...this.asset.bounds.min), new Vec3(...this.asset.bounds.max));
   }
 
   private uploadColorAndTransform(): void {
@@ -130,6 +143,10 @@ export class Raw4DResource extends GSplatResourceBase {
     const sh4to7 = sh4to7Texture?.lock() as Uint32Array | undefined;
     const sh8to11 = sh8to11Texture?.lock() as Uint32Array | undefined;
     const sh12to15 = sh12to15Texture?.lock() as Uint32Array | undefined;
+    sh1to3.fill(0);
+    sh4to7?.fill(0);
+    sh8to11?.fill(0);
+    sh12to15?.fill(0);
     const coefficientCount = ({ 1: 3, 2: 8, 3: 15 } as const)[this.shBands as 1 | 2 | 3];
     const values = new Array<number>(coefficientCount * 3).fill(0);
     const floatBits = new Float32Array(1);

@@ -10,4 +10,10 @@ describe('UI localization', () => {
     expect(localizeRendererLabel('zh', 'WebGPU · GPU Sort')).toBe('WebGPU · GPU 排序');
     expect(localizeRuntimeMessage('en', '正在读取高斯数据 42%')).toBe('Reading Gaussian data 42%');
   });
+
+  it('provides Chinese labels for render and guide switches', () => {
+    expect(UI_COPY.zh.renderAll).toBe('全部');
+    expect(UI_COPY.zh.grid).toBe('网格');
+    expect(UI_COPY.zh.axes).toBe('坐标轴');
+  });
 });

@@ -40,6 +40,7 @@ uniform float dongRaw4dTextureWidth;
 uniform vec4 dongRaw4dTrackKeys;
 uniform vec4 dongRaw4dTrackStrides;
 uniform vec2 dongRaw4dOpacityTrack;
+uniform float dongRaw4dAllMode;
 
 struct DongTrackSpan {
     int left;
@@ -156,7 +157,9 @@ void modifySplatColor(vec3 center, inout vec4 color) {
     float deleted = texelFetch(dongRaw4dDeleteMaskTex, dongTextureUv(splat.index), 0).r;
     float selected = texelFetch(dongRaw4dSelectionMaskTex, dongTextureUv(splat.index), 0).r;
     color.rgb = mix(color.rgb, vec3(1.0, 0.58, 0.08), step(0.5, selected) * 0.82);
-    color.a = dongSigmoid(opacityLogit) * gate * (1.0 - step(0.5, deleted));
+    float alive = 1.0 - step(0.5, deleted);
+    float visibleAlpha = dongSigmoid(opacityLogit) * gate * alive;
+    color.a = mix(visibleAlpha, 0.82 * alive, step(0.5, dongRaw4dAllMode));
 }
 `;
 
@@ -175,6 +178,7 @@ uniform dongRaw4dTextureWidth: f32;
 uniform dongRaw4dTrackKeys: vec4f;
 uniform dongRaw4dTrackStrides: vec4f;
 uniform dongRaw4dOpacityTrack: vec2f;
+uniform dongRaw4dAllMode: f32;
 
 struct DongTrackSpan {
     left: i32,
@@ -291,7 +295,9 @@ fn modifySplatColor(center: vec3f, color: ptr<function, vec4f>) {
     let deleted = textureLoad(dongRaw4dDeleteMaskTex, dongTextureUv(splat.index), 0).x;
     let selected = textureLoad(dongRaw4dSelectionMaskTex, dongTextureUv(splat.index), 0).x;
     (*color).rgb = mix((*color).rgb, vec3f(1.0, 0.58, 0.08), step(0.5, selected) * 0.82);
-    (*color).a = dongSigmoid(opacityLogit) * gate * (1.0 - step(0.5, deleted));
+    let alive = 1.0 - step(0.5, deleted);
+    let visibleAlpha = dongSigmoid(opacityLogit) * gate * alive;
+    (*color).a = mix(visibleAlpha, 0.82 * alive, step(0.5, uniform.dongRaw4dAllMode));
 }
 `;
 
@@ -716,6 +722,12 @@ export class Raw4DGpuPlayback {
         playback.configureStorageBuffers(storageResources);
         return playback;
       } catch (error) {
+        // #WDD-gpt 2026-08-16 - 显存预算/OOM 必须交给段落缓存淘汰后重试，禁止回退到更占显存的全量纹理路径。
+        if (error instanceof Error && /GPU memory budget exceeded|out of memory/i.test(error.message)) {
+          deletionTexture.destroy();
+          selectionTexture.destroy();
+          throw error;
+        }
         console.warn('RAW4D StorageBuffer path unavailable; using texture fallback.', error);
       }
     }
@@ -875,6 +887,7 @@ export class Raw4DGpuPlayback {
       this.asset.opacity.keyframes.length,
       trackStride(this.asset.opacity),
     ]));
+    component.setParameter('dongRaw4dAllMode', 0);
   }
 
   private ensureStorageFrame(frame: number): void {
@@ -966,6 +979,14 @@ export class Raw4DGpuPlayback {
       this.resource.centersVersion += 1;
       this.lastCenterFrame = frame;
     }
+  }
+
+  setAllMode(enabled: boolean): void {
+    if (this.disposed) return;
+    const component = this.entity.gsplat;
+    if (!component) return;
+    component.setParameter('dongRaw4dAllMode', enabled ? 1 : 0);
+    component.workBufferUpdate = WORKBUFFER_UPDATE_ONCE;
   }
 
   destroy(): void {

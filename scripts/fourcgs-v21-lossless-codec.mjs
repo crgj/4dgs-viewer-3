@@ -82,38 +82,40 @@ class PredictiveRiceSignedReader {
     this.blockCount = header.readUInt32LE(8);
     this.totalBits = header.readUInt32LE(12);
     if (parameters.length !== this.blockCount || bits.length !== Math.ceil(this.totalBits / 8)) throw new Error('Invalid direct predictive Rice parts.');
-    const bitReader = new PackedBitReader(bits, this.totalBits);
-    this.values = new Int32Array(this.valueCount);
+    this.parameters = parameters;
+    this.reader = new PackedBitReader(bits, this.totalBits);
     this.index = 0;
-    for (let block = 0; block < this.blockCount; block += 1) {
-      const parameter = parameters[block];
-      const mode = parameter >>> 5;
-      const k = parameter & 31;
-      const first = block * this.blockSize;
-      const last = Math.min(this.valueCount, first + this.blockSize);
-      let anchor = 0;
-      let previous = 0;
-      let previous2 = 0;
-      for (let ordinal = first; ordinal < last; ordinal += 1) {
-        const blockOffset = ordinal - first;
-        const unsigned = bitReader.unary() * (2 ** k) + bitReader.read(k);
-        const residual = unsigned & 1 ? -(unsigned + 1) / 2 : unsigned / 2;
-        let value = residual;
-        if (mode === 1 && blockOffset > 0) value += previous;
-        else if (mode === 2 && blockOffset === 1) value += previous;
-        else if (mode === 2 && blockOffset > 1) value += 2 * previous - previous2;
-        else if (mode === 3 && blockOffset > 0) value += anchor;
-        if (blockOffset === 0) anchor = value;
-        previous2 = previous;
-        previous = value;
-        this.values[ordinal] = value;
-      }
-    }
-    bitReader.done();
+    this.anchor = 0;
+    this.previous = 0;
+    this.previous2 = 0;
   }
-  sint() { if (this.index >= this.valueCount) throw new Error('Unexpected direct predictive Rice end.'); return this.values[this.index++]; }
+  sint() {
+    if (this.index >= this.valueCount) throw new Error('Unexpected direct predictive Rice end.');
+    const blockOffset = this.index % this.blockSize;
+    if (blockOffset === 0) {
+      this.anchor = 0;
+      this.previous = 0;
+      this.previous2 = 0;
+    }
+    const parameter = this.parameters[Math.floor(this.index / this.blockSize)];
+    const mode = parameter >>> 5;
+    const k = parameter & 31;
+    const unsigned = this.reader.unary() * (2 ** k) + this.reader.read(k);
+    const residual = unsigned & 1 ? -(unsigned + 1) / 2 : unsigned / 2;
+    let value = residual;
+    if (mode === 1 && blockOffset > 0) value += this.previous;
+    else if (mode === 2 && blockOffset === 1) value += this.previous;
+    else if (mode === 2 && blockOffset > 1) value += 2 * this.previous - this.previous2;
+    else if (mode === 3 && blockOffset > 0) value += this.anchor;
+    if (blockOffset === 0) this.anchor = value;
+    this.previous2 = this.previous;
+    this.previous = value;
+    this.index += 1;
+    return value;
+  }
   done() {
     if (this.index !== this.valueCount) throw new Error(`Unused direct predictive Rice values: ${this.valueCount - this.index}`);
+    this.reader.done();
   }
 }
 
@@ -808,6 +810,21 @@ export async function decodeV22ScaleReaders(encoded) {
     ));
   }
   return { metadata: streamMetadata, readers, envelopeMetadata: metadata };
+}
+
+// #WDD-gpt 2026-08-16 - V2.4 Position Worker 直接取得六条上下文流，不再合并成 P3D 后执行第二次 rANS 解码。
+export async function decodeV21PositionContexts(encoded) {
+  const { metadata, blocks } = unpackEnvelope(encoded);
+  if (metadata.streamName !== 'prs_position' || metadata.transform !== 'position-context-split') {
+    throw new Error('V2.4 direct Position reader requires position-context-split.');
+  }
+  const contexts = new Map();
+  for (const part of metadata.parts) {
+    const decoded = await decodeXzBrowser(blocks.get(part.name));
+    if (decoded.length !== part.bytes) throw new Error(`V2.4 Position ${part.name} length mismatch.`);
+    contexts.set(part.name, decoded);
+  }
+  return { contexts, envelopeMetadata: metadata };
 }
 
 export async function decodeV21StructuredStream(name, encoded, manifest) {

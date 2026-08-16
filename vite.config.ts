@@ -1,3 +1,4 @@
+import { fileURLToPath, URL } from 'node:url';
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 
@@ -11,6 +12,18 @@ const isolationHeaders = {
 export default defineConfig({
   base: './',
   plugins: [react()],
+  // #WDD-gpt 2026-08-16 - 复用离线 V2.4 纯 JS 解码器时，只把 Node 内建模块映射到浏览器安全实现；编码端系统调用在前端会明确报错。
+  resolve: {
+    alias: {
+      'node:crypto': fileURLToPath(new URL('./src/features/gaussian/formats/fourcgs/shims/node-crypto.ts', import.meta.url)),
+      'node:zlib': fileURLToPath(new URL('./src/features/gaussian/formats/fourcgs/shims/node-zlib.ts', import.meta.url)),
+      'node:child_process': fileURLToPath(new URL('./src/features/gaussian/formats/fourcgs/shims/node-child-process.ts', import.meta.url)),
+      'node:fs/promises': fileURLToPath(new URL('./src/features/gaussian/formats/fourcgs/shims/node-fs-promises.ts', import.meta.url)),
+      'node:os': fileURLToPath(new URL('./src/features/gaussian/formats/fourcgs/shims/node-os.ts', import.meta.url)),
+      'node:path': fileURLToPath(new URL('./src/features/gaussian/formats/fourcgs/shims/node-path.ts', import.meta.url)),
+      'node:util': fileURLToPath(new URL('./src/features/gaussian/formats/fourcgs/shims/node-util.ts', import.meta.url)),
+    },
+  },
   // #WDD-gpt 2026-08-15 - MediaPipe 已是浏览器 ESM，跳过 Vite 预打包以避免多个开发服务器争用 .vite 哈希导致 Worker 504。
   optimizeDeps: {
     exclude: ['@mediapipe/tasks-vision'],

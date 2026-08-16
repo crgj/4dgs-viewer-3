@@ -46,9 +46,14 @@ describe('GaussianRenderMode', () => {
     expect(gsplat.minPixelSize).toBe(2);
     expect(gsplat.minContribution).toBe(3);
 
+    setGaussianRenderMode(app, 'all');
+    expect(gsplat.minPixelSize).toBe(0);
+    expect(gsplat.minContribution).toBe(0);
+
     expect(material.setParameter).toHaveBeenNthCalledWith(1, 'dongRenderMode', 1);
     expect(material.setParameter).toHaveBeenNthCalledWith(2, 'dongRenderMode', 2);
-    expect(material.update).toHaveBeenCalledTimes(2);
+    expect(material.setParameter).toHaveBeenNthCalledWith(3, 'dongRenderMode', 3);
+    expect(material.update).toHaveBeenCalledTimes(3);
   });
 
   it('composes relighting with the existing point and ellipse fragment modes', () => {

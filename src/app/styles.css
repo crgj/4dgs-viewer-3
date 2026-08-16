@@ -66,9 +66,59 @@ input:focus-visible {
   height: 100%;
   overflow: hidden;
   color: var(--text);
+  /* #WDD-gpt 2026-08-16 - 编辑器说明、标签和按钮禁止文本拖选，避免框选/拖拽时出现浏览器蓝色选区。 */
+  user-select: none;
   background:
     radial-gradient(circle at 72% -15%, rgba(45, 76, 94, 0.12), transparent 38%),
     #050608;
+}
+
+/* #WDD-gpt 2026-08-16 - 精确数值与文本输入仍保留光标定位和文字选择能力。 */
+.studio-shell input,
+.studio-shell textarea,
+.studio-shell [contenteditable="true"] {
+  user-select: text;
+}
+
+/* #WDD-gpt 2026-08-16 - 文件拖入覆盖整个编辑器，明确提示该操作会重新打开场景。 */
+.file-drop-overlay {
+  position: fixed;
+  inset: 8px;
+  z-index: 100;
+  display: grid;
+  place-items: center;
+  border: 2px dashed rgba(74, 231, 185, 0.74);
+  border-radius: 18px;
+  background: rgba(4, 13, 13, 0.82);
+  box-shadow: inset 0 0 100px rgba(32, 208, 156, 0.12), 0 20px 80px rgba(0, 0, 0, 0.5);
+  pointer-events: none;
+  backdrop-filter: blur(12px);
+}
+
+.file-drop-overlay > div {
+  display: grid;
+  width: min(470px, calc(100vw - 48px));
+  justify-items: center;
+  gap: 10px;
+  padding: 30px;
+  border: 1px solid rgba(83, 230, 187, 0.22);
+  border-radius: 15px;
+  color: #ecfff9;
+  background: rgba(11, 25, 23, 0.94);
+}
+
+.file-drop-overlay svg {
+  color: #47deb2;
+}
+
+.file-drop-overlay strong {
+  font-size: 18px;
+}
+
+.file-drop-overlay span {
+  color: #91aaa2;
+  font-size: 11px;
+  text-align: center;
 }
 
 .glass-panel {
@@ -899,8 +949,17 @@ input:focus-visible {
   display: flex;
   align-items: center;
   gap: 6px;
+  max-width: calc(100% - 24px);
+  overflow-x: auto;
+  overflow-y: hidden;
   transform: translateX(-50%);
+  white-space: nowrap;
   pointer-events: auto;
+  scrollbar-width: none;
+}
+
+.viewport-toolbar::-webkit-scrollbar {
+  display: none;
 }
 
 /* #WDD-gpt 2026-08-15 - 常驻显示镜头快捷键，降低首次使用 WASD+QE 漫游的发现成本。 */
@@ -918,6 +977,25 @@ input:focus-visible {
   font-size: 10px;
   pointer-events: auto;
   backdrop-filter: blur(14px);
+}
+
+.raw4d-sequence-badge {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 8px;
+  border: 1px solid rgba(57, 221, 176, 0.18);
+  border-radius: 7px;
+  color: #879991;
+  background: rgba(10, 16, 17, 0.82);
+  font-size: 8px;
+  backdrop-filter: blur(14px);
+}
+
+.raw4d-sequence-badge strong {
+  color: #5addb7;
+  font-size: 9px;
 }
 
 .render-mode-switch {
@@ -995,6 +1073,50 @@ input:focus-visible {
   border-radius: 50%;
   background: rgba(255, 255, 255, 0.04);
   transform: rotate(-18deg);
+}
+
+.render-mode-glyph.all {
+  width: 8px;
+  height: 8px;
+  border: 1px solid currentColor;
+  border-radius: 2px;
+  box-shadow: inset 0 0 0 2px rgba(63, 210, 164, 0.35);
+}
+
+.sh-level-switch,
+.guide-switches {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  height: 27px;
+  padding: 2px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 8px;
+  background: rgba(14, 15, 18, 0.88);
+}
+
+.sh-level-switch button,
+.guide-switches button {
+  height: 21px;
+  padding: 0 6px;
+  border: 0;
+  border-radius: 6px;
+  color: #767d88;
+  background: transparent;
+  font: inherit;
+  font-size: 8px;
+  cursor: pointer;
+}
+
+.sh-level-switch button.active,
+.guide-switches button.active {
+  color: #f7f9fb;
+  background: rgba(52, 58, 65, 0.96);
+}
+
+.sh-level-switch button:disabled {
+  opacity: 0.28;
+  cursor: not-allowed;
 }
 
 .viewport-error {
@@ -1840,6 +1962,14 @@ input:focus-visible {
   transform: translateY(-50%);
 }
 
+.vector-row .scrub-handle {
+  padding: 5px 4px;
+  margin: -5px -4px;
+  cursor: ew-resize;
+  user-select: none;
+  touch-action: none;
+}
+
 .vector-row input {
   width: 100%;
   height: 24px;
@@ -1956,6 +2086,46 @@ input:focus-visible {
   font-size: 6px;
   line-height: 1.55;
 }
+
+.performance-diagnostics {
+  display: grid;
+  gap: 6px;
+}
+
+.performance-metrics {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.performance-metrics div {
+  display: grid;
+  gap: 2px;
+  padding: 7px;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.025);
+}
+
+.performance-metrics span { color: #69717d; font-size: 7px; }
+.performance-metrics strong { color: #d8f7ec; font-size: 13px; font-variant-numeric: tabular-nums; }
+.performance-chart { width: 100%; height: 54px; border-radius: 7px; background: rgba(6, 11, 13, 0.65); }
+.performance-chart path { fill: none; stroke: #35d6a5; stroke-width: 1.5; vector-effect: non-scaling-stroke; }
+.performance-device dd { max-width: 58%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.load-timings { display: grid; gap: 4px; padding: 7px; border: 1px solid rgba(255,255,255,.055); border-radius: 7px; font-size: 7px; }
+.load-timings > strong { color: #87909c; }
+.load-timings span { display: flex; justify-content: space-between; color: #747d89; }
+.load-timings b { color: #b9c1ca; font-variant-numeric: tabular-nums; }
+.performance-warnings { margin: 0; padding: 7px 7px 7px 20px; border: 1px solid rgba(255,184,77,.18); border-radius: 7px; color: #e8b568; background: rgba(255,156,52,.055); font-size: 7px; line-height: 1.5; }
+
+.model-health-panel { display: grid; gap: 12px; color: #9199a5; font-size: 11px; line-height: 1.55; }
+.model-health-panel p { margin: 0; }
+.model-health-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.model-health-actions button { min-height: 34px; border: 1px solid rgba(74,222,177,.22); border-radius: 8px; color: #d9fff2; background: rgba(33,175,132,.12); cursor: pointer; }
+.model-health-actions button:disabled { opacity: .38; cursor: not-allowed; }
+.model-health-result { display: grid; gap: 5px; padding: 10px; border: 1px solid rgba(255,180,67,.2); border-radius: 8px; background: rgba(255,147,49,.055); }
+.model-health-result.healthy { border-color: rgba(66,221,172,.2); background: rgba(32,187,140,.06); }
+.model-health-result ul { margin: 4px 0 0; padding-left: 18px; }
 
 /* #WDD-gpt 2026-08-15 - 以轻量仪表和 60 秒折线图展示实际 CPU/GPU 占用，图表不持有大型数据。 */
 .memory-telemetry,
@@ -2321,6 +2491,42 @@ input:focus-visible {
   white-space: nowrap;
 }
 
+.timeline-title {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+}
+
+.timeline-title small {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  color: #68736f;
+  font-size: 6px;
+  white-space: nowrap;
+}
+
+.timeline-title small i {
+  display: inline-block;
+  flex: 0 0 auto;
+}
+
+.keyframe-swatch {
+  width: 1px;
+  height: 4px;
+  background: rgba(122, 214, 187, 0.7);
+}
+
+.segment-swatch {
+  width: 5px;
+  height: 5px;
+  margin-left: 3px;
+  border: 1px solid #59e2ba;
+  background: #132b25;
+  transform: rotate(45deg);
+}
+
 .timeline-header strong {
   color: #f4f5f7;
   font-family: "SFMono-Regular", Consolas, monospace;
@@ -2336,13 +2542,51 @@ input:focus-visible {
 
 .timeline-track input {
   position: relative;
-  z-index: 2;
+  z-index: 3;
   width: 100%;
   height: 15px;
   margin: 0;
   appearance: none;
   background: transparent;
   cursor: pointer;
+}
+
+/* #WDD-gpt 2026-08-16 - 稀疏属性关键帧使用细短刻度，分段首尾使用更大的菱形节点。 */
+.timeline-annotations {
+  position: absolute;
+  top: 0;
+  right: 0;
+  left: 0;
+  z-index: 2;
+  height: 15px;
+  overflow: visible;
+  pointer-events: none;
+}
+
+.timeline-keyframe,
+.timeline-segment-node {
+  position: absolute;
+  display: block;
+  transform: translateX(-50%);
+}
+
+.timeline-keyframe {
+  top: 5px;
+  width: 1px;
+  height: 5px;
+  border-radius: 1px;
+  background: rgba(116, 216, 186, 0.68);
+}
+
+.timeline-segment-node {
+  top: 3px;
+  width: 7px;
+  height: 7px;
+  border: 1px solid #59e2ba;
+  border-radius: 1px;
+  background: #10251f;
+  box-shadow: 0 0 7px rgba(53, 216, 169, 0.3);
+  transform: translateX(-50%) rotate(45deg);
 }
 
 .timeline-track input::-webkit-slider-runnable-track {

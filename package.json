@@ -14,10 +14,15 @@
     "compression-renderer:build": "tsc -p tsconfig.compression-renderer.json --pretty false && vite build --config vite.compression-renderer.config.ts",
     "compression-renderer:preview": "vite preview --config vite.compression-renderer.config.ts",
     "fourcgs:encode-prs": "node scripts/encode-fourcgs-prs-morton.mjs",
-    "fourcgs:decode-prs": "node scripts/decode-fourcgs-prs-morton.mjs"
+    "fourcgs:decode-prs": "node scripts/decode-fourcgs-prs-morton.mjs",
+    "fourcgs:decode-v24": "node scripts/decode-fourcgs-prs-morton.mjs --fast"
   },
   "dependencies": {
     "@mediapipe/tasks-vision": "^1.0.1",
+    "@noble/hashes": "^2.0.1",
+    "brotli-wasm": "^3.0.1",
+    "buffer": "^6.0.3",
+    "fflate": "^0.8.2",
     "isosurface": "^1.0.0",
     "playcanvas": "^2.21.4",
     "react": "^19.2.8",

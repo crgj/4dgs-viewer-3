@@ -606,6 +606,71 @@ export function decodePositions(encoded, manifest, activeSlots, rows, indices) {
   return { observationCount: ordinal, appliedExceptions: exceptionMap.size };
 }
 
+// #WDD-gpt 2026-08-16 - V2.4 直接并行读取 Position 元数据、字典码和 XYZ escape 流，消除旧 P3D/rANS 中间格式。
+export function decodePositionContextStreams(contexts, manifest, activeSlots, rows, indices) {
+  const metadata = new ByteReader(contexts.get('metadata'));
+  const dictionaryCodes = new ByteReader(contexts.get('dictionary_codes'));
+  const escape = [0, 1, 2].map((axis) => new ByteReader(contexts.get(`escape_${axis}`)));
+  const exceptionMap = exceptionRecords(contexts.get('exceptions'));
+  const { center, halfExtent, step, cellSize } = manifest.prs.position;
+  const origin = center.map((value) => value - halfExtent);
+  const cellQuant = Math.max(1, Math.round(cellSize / step));
+  const state = [new Int32Array(manifest.slotCount), new Int32Array(manifest.slotCount), new Int32Array(manifest.slotCount)];
+  const initialized = new Uint8Array(manifest.slotCount);
+  const layerCount = metadata.uint();
+  let decodedLayers = 0;
+  let ordinal = 0;
+  for (let segmentIndex = 0; segmentIndex < manifest.segments.length; segmentIndex += 1) {
+    const active = activeSlots[segmentIndex];
+    const rowValues = rows[segmentIndex];
+    const stride = indices[segmentIndex].size;
+    for (let bank = 0; bank < manifest.segments[segmentIndex].bankCounts.position; bank += 1) {
+      const global = [metadata.sint(), metadata.sint(), metadata.sint()];
+      const cellCount = metadata.uint();
+      const cells = new Map();
+      let key = 0;
+      for (let index = 0; index < cellCount; index += 1) {
+        key += metadata.uint();
+        cells.set(key, readTriple(metadata));
+      }
+      let birth = [0, 0, 0];
+      let hasBirth = false;
+      for (let row = 0; row < active.length; row += 1) {
+        const slot = active[row];
+        const code = dictionaryCodes.uint();
+        const residual = code === 0 ? escape.map((reader) => reader.sint()) : tripleDictionary.entries[code - 1];
+        let quantized;
+        if (initialized[slot]) {
+          const cellKey = Math.floor(state[0][slot] / cellQuant)
+            + Math.floor(state[1][slot] / cellQuant) * 32
+            + Math.floor(state[2][slot] / cellQuant) * 1024;
+          const cell = cells.get(cellKey) ?? [0, 0, 0];
+          quantized = residual.map((value, axis) => state[axis][slot] + global[axis] + cell[axis] + value);
+        } else {
+          quantized = residual.map((value, axis) => (hasBirth ? birth[axis] : 0) + value);
+          birth = quantized;
+          hasBirth = true;
+        }
+        const exception = exceptionMap.get(ordinal);
+        for (let axis = 0; axis < 3; axis += 1) {
+          state[axis][slot] = quantized[axis];
+          const name = `xyz_bank_${bank}_${['x', 'y', 'z'][axis]}`;
+          rowValues[row * stride + indices[segmentIndex].get(name)] = exception?.[axis]
+            ?? floatToHalf(origin[axis] + quantized[axis] * step);
+        }
+        initialized[slot] = 1;
+        ordinal += 1;
+      }
+      decodedLayers += 1;
+    }
+  }
+  if (decodedLayers !== layerCount) throw new Error(`Direct Position layer mismatch ${decodedLayers} != ${layerCount}`);
+  metadata.done();
+  dictionaryCodes.done();
+  for (const reader of escape) reader.done();
+  return { observationCount: ordinal, appliedExceptions: exceptionMap.size };
+}
+
 function normalizedQuaternion(values) {
   const length = Math.hypot(...values);
   return length > 0 && Number.isFinite(length) ? values.map((value) => value / length) : [1, 0, 0, 0];

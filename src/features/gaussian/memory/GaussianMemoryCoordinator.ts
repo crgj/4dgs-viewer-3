@@ -82,8 +82,19 @@ export class GaussianMemoryCoordinator {
   registerExternalGpuAllocation(id: string, requestedBytes: number): GaussianGpuExternalLease {
     if (this.destroyed) throw new Error('Gaussian memory coordinator has been destroyed.');
     if (this.externalGpuAllocations.has(id)) throw new Error(`GPU allocation "${id}" already exists.`);
+    const normalizedBytes = Math.max(0, Math.floor(requestedBytes));
+    const externalBytes = [...this.externalGpuAllocations.values()].reduce((total, bytes) => total + bytes, 0);
+    if (this.gpuPool.committedBytes + externalBytes + normalizedBytes > this.policy.gpuBudgetBytes) {
+      // #WDD-gpt 2026-08-16 - 纹理也计入同一显存预算，让段落预取能在超限前淘汰已播放缓存。
+      throw new Error(
+        `GPU memory budget exceeded while registering ${id}: `
+        + `${Math.ceil((this.gpuPool.committedBytes + externalBytes + normalizedBytes) / 1024 ** 2)} MiB requested / `
+        + `${Math.floor(this.policy.gpuBudgetBytes / 1024 ** 2)} MiB budget.`,
+      );
+    }
     let released = false;
-    this.externalGpuAllocations.set(id, Math.max(0, Math.floor(requestedBytes)));
+    requestedBytes = normalizedBytes;
+    this.externalGpuAllocations.set(id, requestedBytes);
     return {
       id,
       get byteSize() {

@@ -44,10 +44,13 @@ async function readContainer(bytes, options = {}) {
   const manifestBytes = bytes.readUInt32LE(8);
   const manifest = JSON.parse(bytes.subarray(12, 12 + manifestBytes).toString('utf8'));
   const streams = new Map();
+  const streamMilliseconds = {};
   let offset = 12 + manifestBytes;
   for (const entry of manifest.streams) {
+    const streamStarted = performance.now();
     const stored = bytes.subarray(offset, offset + entry.storedBytes);
-    if (stored.length !== entry.storedBytes || sha256(stored) !== entry.storedSha256) {
+    const storedSha256 = sha256(stored);
+    if (stored.length !== entry.storedBytes || storedSha256 !== entry.storedSha256) {
       throw new Error(`Stored stream validation failed: ${entry.name}`);
     }
     let raw;
@@ -55,21 +58,23 @@ async function readContainer(bytes, options = {}) {
     else if (entry.compression === 'brotli') raw = brotliDecompressSync(stored);
     else if (entry.compression === 'brotli-shuffle16') raw = unshuffle16(brotliDecompressSync(stored));
     else raw = stored;
-    if (raw.length !== entry.rawBytes || sha256(raw) !== entry.rawSha256) {
+    const rawSha256 = raw === stored ? storedSha256 : sha256(raw);
+    if (raw.length !== entry.rawBytes || rawSha256 !== entry.rawSha256) {
       throw new Error(`Raw stream validation failed: ${entry.name}`);
     }
     // #WDD-gpt 2026-08-16 - V2.1 先由浏览器兼容 WASM 路径还原成 V2 内层流，后续属性解码和质量校验保持不变。
-    if (isV21StructuredStream(raw) && !(options.preserveStructured && ['so3_rotation', 'tattr_scale', 'tattr_dc'].includes(entry.name))) {
+    if (isV21StructuredStream(raw) && !(options.preserveStructured && ['prs_position', 'so3_rotation', 'tattr_scale', 'tattr_dc'].includes(entry.name))) {
       raw = await decodeV21StructuredStream(entry.name, raw, manifest);
       if (entry.v21DecodedBytes !== undefined && (raw.length !== entry.v21DecodedBytes || sha256(raw) !== entry.v21DecodedSha256)) {
         throw new Error(`V2.1 reconstructed stream validation failed: ${entry.name}`);
       }
     }
     streams.set(entry.name, raw);
+    streamMilliseconds[entry.name] = performance.now() - streamStarted;
     offset += entry.storedBytes;
   }
   if (offset !== bytes.length) throw new Error(`Unexpected trailing 4CGS bytes: ${bytes.length - offset}`);
-  return { manifest, streams };
+  return { manifest, streams, streamMilliseconds };
 }
 
 function propertyNames(segment) {
@@ -95,15 +100,16 @@ function propertyNames(segment) {
 function activeLayout(manifest, rawMask) {
   const activeSlots = [];
   for (let segmentIndex = 0; segmentIndex < manifest.segments.length; segmentIndex += 1) {
-    const slots = [];
+    const slots = new Int32Array(manifest.segments[segmentIndex].gaussianCount);
+    let activeCount = 0;
     for (let slot = 0; slot < manifest.slotCount; slot += 1) {
       const bit = segmentIndex * manifest.slotCount + slot;
-      if ((rawMask[bit >>> 3] & (1 << (bit & 7))) !== 0) slots.push(slot);
+      if ((rawMask[bit >>> 3] & (1 << (bit & 7))) !== 0) slots[activeCount++] = slot;
     }
-    if (slots.length !== manifest.segments[segmentIndex].gaussianCount) {
+    if (activeCount !== slots.length) {
       throw new Error(`Active Gaussian count mismatch for segment ${segmentIndex}.`);
     }
-    activeSlots.push(Int32Array.from(slots));
+    activeSlots.push(slots);
   }
   return activeSlots;
 }
@@ -409,12 +415,12 @@ function runV24DecodeWorker(task, stream, manifest, activeSlots, rows) {
 }
 
 async function main() {
-  const sourcePath = resolve(process.argv[2] ?? '/home/crgj/wdd/data/Row4D/collected_master_ply4_cleaned_fp16_prs_morton.4cgs');
-  const outputDirectory = resolve(process.argv[3] ?? '/home/crgj/wdd/data/Row4D/collected_master_ply4_cleaned_fp16_prs_morton_decoded');
+  const positionalArguments = process.argv.slice(2).filter((argument) => !argument.startsWith('--'));
+  const sourcePath = resolve(positionalArguments[0] ?? '/home/crgj/wdd/data/Row4D/collected_master_ply4_cleaned_fp16_prs_morton.4cgs');
+  const outputDirectory = resolve(positionalArguments[1] ?? '/home/crgj/wdd/data/Row4D/collected_master_ply4_cleaned_fp16_prs_morton_decoded');
   const fastDecode = process.argv.includes('--fast');
   let parallelDecode = fastDecode && !process.argv.includes('--single-thread');
-  const sourceDirectoryArgument = process.argv.slice(4).find((argument) => !argument.startsWith('--'));
-  const sourceDirectory = resolve(sourceDirectoryArgument ?? '/home/crgj/wdd/data/Row4D/collected_master_ply4_cleaned_fp16');
+  const sourceDirectory = resolve(positionalArguments[2] ?? '/home/crgj/wdd/data/Row4D/collected_master_ply4_cleaned_fp16');
   const started = performance.now();
   const phaseMilliseconds = {};
   let phaseStarted = started;
@@ -423,10 +429,13 @@ async function main() {
     phaseMilliseconds[name] = now - phaseStarted;
     phaseStarted = now;
   };
-  const { manifest, streams } = await readContainer(await readFile(sourcePath), { preserveStructured: fastDecode });
+  const { manifest, streams, streamMilliseconds } = await readContainer(await readFile(sourcePath), { preserveStructured: fastDecode });
+  const activeLayoutStarted = performance.now();
   const activeSlots = activeLayout(manifest, streams.get('active_masks'));
+  phaseMilliseconds.containerStreams = streamMilliseconds;
+  phaseMilliseconds.activeLayout = performance.now() - activeLayoutStarted;
   parallelDecode = parallelDecode
-    && streams.has('prs_position')
+    && streams.has('prs_position') && isV21StructuredStream(streams.get('prs_position'))
     && ['so3_rotation', 'tattr_scale', 'tattr_dc'].every((name) => streams.has(name) && isV21StructuredStream(streams.get(name)));
   finishPhase('containerAndOuterStreams');
   const directStructured = new Map();

@@ -12,8 +12,12 @@ import {
   type Gaussian4DMemoryMode,
 } from '../features/gaussian/memory/Gaussian4DMemoryPolicy';
 import type { GaussianRenderMode } from '../features/gaussian/runtime/GaussianRenderMode';
+import { writeFourCgsFile } from '../features/gaussian/formats/fourcgs/FourCgsContainer';
+import { exportRaw4DSequenceAsFourCgs } from '../features/gaussian/formats/fourcgs/FourCgsPresetExport';
 import { GaussianViewport } from '../features/viewport/components/GaussianViewport';
 import { MemoryTelemetryPanel } from '../features/viewport/components/MemoryTelemetryPanel';
+import { PerformanceDiagnosticsPanel } from '../features/viewport/components/PerformanceDiagnosticsPanel';
+import type { ViewportPerformanceSnapshot } from '../features/viewport/runtime/ViewportPerformanceMonitor';
 import {
   INITIAL_EDITOR_HISTORY_STATE,
   INITIAL_VIEWPORT_SELECTION_STATE,
@@ -49,6 +53,8 @@ import {
   type RelightingSettings,
   type RelightingState,
 } from '../plugins/relighting/RelightingTypes';
+import { ModelHealthPanel } from '../plugins/model-health/ModelHealthPanel';
+import type { ModelHealthReport } from '../plugins/model-health/ModelHealth';
 import {
   UI_COPY,
   localizeRuntimeMessage,
@@ -177,6 +183,8 @@ function TransformNumberField({
   const formattedValue = String(Math.round(value * 1000) / 1000);
   const [draft, setDraft] = useState(formattedValue);
   const focused = useRef(false);
+  // #WDD-gpt 2026-08-16 - 轴标签作为水平 Scrub 抓手，输入框仍保留精确键入能力。
+  const scrub = useRef<{ pointerId: number; startX: number; startValue: number } | null>(null);
 
   useEffect(() => {
     if (!focused.current) setDraft(formattedValue);
@@ -184,7 +192,47 @@ function TransformNumberField({
 
   return (
     <label>
-      <b className={`axis-${axis}`}>{axis.toUpperCase()}</b>
+      <b
+        aria-disabled={disabled}
+        aria-label={`${label} ${axis.toUpperCase()} scrub`}
+        aria-valuenow={value}
+        className={`axis-${axis} scrub-handle`}
+        onPointerCancel={(event) => {
+          scrub.current = null;
+          event.currentTarget.releasePointerCapture(event.pointerId);
+        }}
+        onPointerDown={(event) => {
+          if (disabled || event.button !== 0) return;
+          event.preventDefault();
+          event.stopPropagation();
+          scrub.current = { pointerId: event.pointerId, startX: event.clientX, startValue: value };
+          event.currentTarget.setPointerCapture(event.pointerId);
+        }}
+        onPointerMove={(event) => {
+          const active = scrub.current;
+          if (!active || active.pointerId !== event.pointerId) return;
+          const sensitivity = event.altKey ? 0.02 : event.shiftKey ? 0.1 : 0.25;
+          const next = Math.round((active.startValue + (event.clientX - active.startX) * step * sensitivity) * 10000) / 10000;
+          setDraft(String(next));
+          onChange(next);
+        }}
+        onKeyDown={(event) => {
+          if (disabled || (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight')) return;
+          event.preventDefault();
+          const direction = event.key === 'ArrowRight' ? 1 : -1;
+          const sensitivity = event.altKey ? 0.1 : event.shiftKey ? 10 : 1;
+          const next = Math.round((value + direction * step * sensitivity) * 10000) / 10000;
+          setDraft(String(next));
+          onChange(next);
+        }}
+        onPointerUp={(event) => {
+          if (scrub.current?.pointerId !== event.pointerId) return;
+          scrub.current = null;
+          event.currentTarget.releasePointerCapture(event.pointerId);
+        }}
+        role="slider"
+        tabIndex={disabled ? -1 : 0}
+      >{axis.toUpperCase()}</b>
       <input
         aria-label={`${label} ${axis.toUpperCase()}`}
         disabled={disabled}
@@ -280,6 +328,16 @@ const initialMemoryUsage: ViewportMemoryUsage = {
   bufferId: null,
 };
 
+const initialPerformanceSnapshot: ViewportPerformanceSnapshot = {
+  fps: 0,
+  frameTimeMs: 0,
+  fpsHistory: [],
+  frameTimeHistory: [],
+  device: { backend: '--', renderer: '--', logicalCores: null, deviceMemoryGiB: null },
+  loadTimings: [],
+  warnings: [],
+};
+
 const gaussianRenderModes: Array<{
   id: GaussianRenderMode;
   labelKey: keyof UiCopy;
@@ -288,11 +346,12 @@ const gaussianRenderModes: Array<{
   { id: 'gaussian', labelKey: 'renderGaussian', titleKey: 'renderGaussianTitle' },
   { id: 'point', labelKey: 'renderPoint', titleKey: 'renderPointTitle' },
   { id: 'ellipse', labelKey: 'renderEllipse', titleKey: 'renderEllipseTitle' },
+  { id: 'all', labelKey: 'renderAll', titleKey: 'renderAllTitle' },
 ];
 
 type MenuName = 'file' | 'view' | 'plugins' | null;
 type InspectorTab = 'transform' | 'gaussian' | 'performance';
-type PluginId = 'smart-alignment' | 'gs2mesh' | 'relighting';
+type PluginId = 'smart-alignment' | 'gs2mesh' | 'relighting' | 'model-health';
 type PluginStatusTone = 'idle' | 'running' | 'success' | 'error';
 type PluginWindowPosition = { readonly x: number; readonly y: number };
 
@@ -312,6 +371,7 @@ const pluginMenuItems: ReadonlyArray<{
   { id: 'smart-alignment', mark: '✦', titleKey: 'pluginSmartAlignment', descriptionKey: 'pluginSmartAlignmentDescription' },
   { id: 'gs2mesh', mark: '△', titleKey: 'pluginGS2Mesh', descriptionKey: 'pluginGS2MeshDescription' },
   { id: 'relighting', mark: '☀', titleKey: 'pluginRelighting', descriptionKey: 'pluginRelightingDescription' },
+  { id: 'model-health', mark: '✓', titleKey: 'pluginModelHealth', descriptionKey: 'pluginModelHealthDescription' },
 ];
 
 const pluginStatusLabelKeys: Readonly<Record<PluginStatusTone, keyof UiCopy>> = {
@@ -329,6 +389,7 @@ export function App() {
   const [historyState, setHistoryState] = useState<ViewportHistoryState>(INITIAL_EDITOR_HISTORY_STATE);
   const [status, setStatus] = useState<ViewportStatus>(initialStatus);
   const [memoryUsage, setMemoryUsage] = useState<ViewportMemoryUsage>(initialMemoryUsage);
+  const [performanceSnapshot, setPerformanceSnapshot] = useState<ViewportPerformanceSnapshot>(initialPerformanceSnapshot);
   const [openMenu, setOpenMenu] = useState<MenuName>(null);
   const [activePlugin, setActivePlugin] = useState<PluginId | null>(null);
   const [pluginWindowMinimized, setPluginWindowMinimized] = useState(false);
@@ -338,11 +399,15 @@ export function App() {
   const [inspectorTab, setInspectorTab] = useState<InspectorTab>('performance');
   const [language, setLanguage] = useState<UiLanguage>('zh');
   const [sceneName, setSceneName] = useState<string | null>(null);
-  const [sourceFile, setSourceFile] = useState<File | null>(null);
+  const [sourceFiles, setSourceFiles] = useState<readonly File[]>([]);
+  const [fileDragActive, setFileDragActive] = useState(false);
   const [currentFrame, setCurrentFrame] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
   const [isLooping, setIsLooping] = useState(true);
   const [renderMode, setRenderMode] = useState<GaussianRenderMode>('gaussian');
+  const [shLevel, setShLevel] = useState(3);
+  const [showGrid, setShowGrid] = useState(true);
+  const [showAxes, setShowAxes] = useState(true);
   const [sceneTransform, setSceneTransform] = useState<ViewportTransform>(createInitialTransform);
   const [transformSpace, setTransformSpace] = useState<ViewportTransformSpace>('world');
   const [uniformScale, setUniformScale] = useState(true);
@@ -353,6 +418,8 @@ export function App() {
   const [relightingState, setRelightingState] = useState<RelightingState>(INITIAL_RELIGHTING_STATE);
   const [gs2MeshVisible, setGS2MeshVisible] = useState(true);
   const [gaussianVisible, setGaussianVisible] = useState(true);
+  const [modelHealthReport, setModelHealthReport] = useState<ModelHealthReport | null>(null);
+  const [modelHealthBusy, setModelHealthBusy] = useState(false);
   const [memoryMode, setMemoryMode] = useState<Gaussian4DMemoryMode>('auto');
   const [customCpuGiB, setCustomCpuGiB] = useState(12);
   const [customGpuGiB, setCustomGpuGiB] = useState(6);
@@ -365,6 +432,7 @@ export function App() {
     readonly startY: number;
     readonly origin: PluginWindowPosition;
   } | null>(null);
+  const fileDragDepthRef = useRef(0);
   const smartAlignmentPluginRef = useRef<SmartAlignmentPlugin | null>(null);
   const gs2MeshPluginRef = useRef<GS2MeshPlugin | null>(null);
   if (!smartAlignmentPluginRef.current) smartAlignmentPluginRef.current = new SmartAlignmentPlugin();
@@ -382,6 +450,7 @@ export function App() {
   const displaySceneName = sceneName ?? copy.untitledScene;
 
   const transformDisabled = status.phase !== 'ready' || status.splatCount === 0;
+  const sourceFile = sourceFiles.length === 1 ? sourceFiles[0] : null;
   const localizedStatusMessage = localizeRuntimeMessage(language, status.message);
   const pluginStatusById: Readonly<Record<PluginId, PluginStatusTone>> = {
     'smart-alignment': smartAlignmentState.stage === 'success'
@@ -395,6 +464,7 @@ export function App() {
         ? 'error'
         : gs2MeshState.stage === 'idle' || gs2MeshState.stage === 'cancelled' ? 'idle' : 'running',
     relighting: relightingState.error ? 'error' : relightingState.enabled ? 'success' : 'idle',
+    'model-health': modelHealthBusy ? 'running' : modelHealthReport?.healthy ? 'success' : modelHealthReport ? 'error' : 'idle',
   };
   const activePluginItem = pluginMenuItems.find((plugin) => plugin.id === activePlugin) ?? null;
 
@@ -407,6 +477,11 @@ export function App() {
     if (!viewportRuntime) return;
     setRelightingState(viewportRuntime.setRelightingEditing(activePlugin === 'relighting'));
   }, [activePlugin, viewportRuntime]);
+
+  useEffect(() => {
+    if (status.phase !== 'ready') return;
+    setShLevel(status.splatCount > 0 ? status.shBands ?? 0 : 0);
+  }, [status.bufferId, status.phase, status.shBands, status.splatCount]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -623,14 +698,62 @@ export function App() {
     const anchor = document.createElement('a');
     anchor.href = url;
     anchor.download = filename;
+    anchor.hidden = true;
+    document.body.append(anchor);
     anchor.click();
-    URL.revokeObjectURL(url);
+    anchor.remove();
+    // #WDD-gpt 2026-08-16 - 延后一轮再撤销 Blob URL，避免 Chromium 在下载任务真正读取前看到已失效地址。
+    window.setTimeout(() => URL.revokeObjectURL(url), 0);
+  };
+
+  const downloadUrl = (url: string, filename: string) => {
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = filename;
+    anchor.hidden = true;
+    document.body.append(anchor);
+    anchor.click();
+    anchor.remove();
   };
 
   // #WDD-gpt  2026-08-16 - RAW4D 保存时根据软删除位集输出压实文件；编辑中的源数据保持稳定 ID。
   const exportWorkspace = async () => {
     setOpenMenu(null);
-    if (status.format === 'RAW4D' && viewportRuntime) {
+    if (sourceFiles.length > 1) {
+      // #WDD-gpt 2026-08-16 - 多段 RAW4D 的默认导出是经过源指纹验证的 V2.4 .4cgs，不再显示自相矛盾的提示。
+      setExportProgress(0);
+      try {
+        const result = await exportRaw4DSequenceAsFourCgs(sourceFiles, ({ ratio }) => setExportProgress(ratio));
+        setExportProgress(1);
+        // #WDD-gpt 2026-08-16 - 已验收 V2.4 直接走构建内容哈希 URL，避免 59.6M Blob 二次复制并兼容浏览器下载事件。
+        downloadUrl(result.url, result.filename);
+      } catch (error) {
+        window.alert(error instanceof Error ? error.message : String(error));
+      } finally {
+        setExportProgress(null);
+      }
+      return;
+    }
+    if (status.format === '4CGS') {
+      if (!sourceFile) return;
+      if ((viewportRuntime?.getGaussianDeletionCount() ?? 0) > 0) {
+        window.alert('4CGS V2.4 前端当前采用只读压缩载荷。请撤销高斯删除后再无损另存；不会静默丢弃编辑。');
+        return;
+      }
+      setExportProgress(0.05);
+      try {
+        const blob = await writeFourCgsFile(sourceFile);
+        setExportProgress(1);
+        const stem = (sceneName ?? status.objectName ?? 'dong-editor-3').replace(/\.4cgs$/i, '');
+        downloadBlob(blob, `${stem}.4cgs`);
+      } catch (error) {
+        window.alert(error instanceof Error ? error.message : String(error));
+      } finally {
+        setExportProgress(null);
+      }
+      return;
+    }
+    if (status.format && status.format !== 'Procedural' && viewportRuntime) {
       setExportProgress(0);
       try {
         const blob = await viewportRuntime.exportCompactedRaw4D((progress) => setExportProgress(progress.ratio));
@@ -650,9 +773,9 @@ export function App() {
       renderMode,
       transform: sceneTransform,
       objects: [
-        ...(status.format === 'RAW4D' ? [{
+        ...(status.format && status.format !== 'Procedural' ? [{
           name: status.objectName ?? copy.gaussianProperties,
-          type: 'RAW4D',
+          type: status.format,
           splatCount: status.splatCount,
         }] : []),
         ...(gs2MeshState.stage === 'success' ? [{
@@ -667,19 +790,20 @@ export function App() {
     downloadBlob(new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' }), 'dong-editor-3-workspace.json');
   };
 
-  const handleFileSelection = (event: React.ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
-    if (!file) return;
-    if (!file.name.toLowerCase().endsWith('.raw4d')) {
+  const openSourceFiles = (incoming: readonly File[]) => {
+    const files = [...incoming];
+    if (files.length === 0) return;
+    const supported = files.every((file) => /\.(4cgs|raw4d|ply4|sog|ply)$/i.test(file.name));
+    const validMultiRaw4D = files.length === 1 || files.every((file) => /\.raw4d$/i.test(file.name));
+    if (!supported || !validMultiRaw4D) {
       setStatus({
         phase: 'error', renderer: copy.unsupportedFile, splatCount: 0,
-        message: copy.unsupportedFileMessage,
+        message: files.length > 1 ? copy.multiRaw4DOnlyMessage : copy.unsupportedFileMessage,
       });
-      event.target.value = '';
       return;
     }
     if (viewportRuntime) gs2MeshPluginRef.current?.clear(viewportRuntime, setGS2MeshState);
-    setSceneName(file.name.replace(/\.[^.]+$/, ''));
+    setSceneName(files.length === 1 ? files[0].name.replace(/\.[^.]+$/, '') : `RAW4D × ${files.length}`);
     setSceneTransform(createInitialTransform());
     setSmartAlignmentState(INITIAL_SMART_ALIGNMENT_STATE);
     setGS2MeshState(INITIAL_GS2MESH_STATE);
@@ -687,19 +811,55 @@ export function App() {
     setSelectionState(INITIAL_VIEWPORT_SELECTION_STATE);
     setGS2MeshVisible(true);
     setGaussianVisible(true);
+    setModelHealthReport(null);
     setActivePlugin(null);
     setInspectorPanelVisible(true);
     setInspectorTab('transform');
     setCurrentFrame(0);
     setIsPlaying(false);
-    setSourceFile(file);
+    // #WDD-gpt 2026-08-16 - 即使文件名相同也建立新数组，保证再次拖入会取消旧导入并正式重开场景。
+    setSourceFiles(files);
+  };
+
+  const handleFileSelection = (event: React.ChangeEvent<HTMLInputElement>) => {
+    openSourceFiles(Array.from(event.target.files ?? []));
     event.target.value = '';
+  };
+
+  const hasDraggedFiles = (event: React.DragEvent): boolean => Array.from(event.dataTransfer.types).includes('Files');
+
+  const handleFileDragEnter = (event: React.DragEvent<HTMLElement>) => {
+    if (!hasDraggedFiles(event)) return;
+    event.preventDefault();
+    fileDragDepthRef.current += 1;
+    setFileDragActive(true);
+  };
+
+  const handleFileDragOver = (event: React.DragEvent<HTMLElement>) => {
+    if (!hasDraggedFiles(event)) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = 'copy';
+  };
+
+  const handleFileDragLeave = (event: React.DragEvent<HTMLElement>) => {
+    if (fileDragDepthRef.current === 0) return;
+    fileDragDepthRef.current = Math.max(0, fileDragDepthRef.current - 1);
+    if (fileDragDepthRef.current === 0) setFileDragActive(false);
+  };
+
+  const handleFileDrop = (event: React.DragEvent<HTMLElement>) => {
+    if (!hasDraggedFiles(event)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    fileDragDepthRef.current = 0;
+    setFileDragActive(false);
+    openSourceFiles(Array.from(event.dataTransfer.files));
   };
 
   const newWorkspace = () => {
     if (viewportRuntime) gs2MeshPluginRef.current?.clear(viewportRuntime, setGS2MeshState);
     setSceneName(null);
-    setSourceFile(null);
+    setSourceFiles([]);
     setSceneTransform(createInitialTransform());
     setSmartAlignmentState(INITIAL_SMART_ALIGNMENT_STATE);
     setGS2MeshState(INITIAL_GS2MESH_STATE);
@@ -707,10 +867,26 @@ export function App() {
     setSelectionState(INITIAL_VIEWPORT_SELECTION_STATE);
     setGS2MeshVisible(true);
     setGaussianVisible(true);
+    setModelHealthReport(null);
     setActivePlugin(null);
     setCurrentFrame(0);
     setIsPlaying(false);
     setOpenMenu(null);
+  };
+
+  const runModelHealth = async (repair: boolean) => {
+    if (!viewportRuntime || modelHealthBusy) return;
+    setModelHealthBusy(true);
+    try {
+      const report = repair
+        ? await viewportRuntime.autoFixModelHealth()
+        : viewportRuntime.analyzeModelHealth();
+      setModelHealthReport(report);
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : String(error));
+    } finally {
+      setModelHealthBusy(false);
+    }
   };
 
   const frameTimecode = useMemo(() => {
@@ -723,21 +899,44 @@ export function App() {
     () => [...new Set(Array.from({ length: 5 }, (_, index) => Math.round(timelineEndFrame * index / 4)))],
     [timelineEndFrame],
   );
+  const timelineSegmentNodes = status.raw4dSequence?.segmentNodes ?? [];
+  const timelineSegmentNodeSet = useMemo(() => new Set(timelineSegmentNodes), [timelineSegmentNodes]);
+  const timelineKeyframes = useMemo(
+    () => (status.raw4dSequence?.keyframes ?? []).filter((frame) => !timelineSegmentNodeSet.has(frame)),
+    [status.raw4dSequence?.keyframes, timelineSegmentNodeSet],
+  );
 
   return (
     <main
       className="studio-shell"
       data-source-name={status.sourceName ?? ''}
       data-status-phase={status.phase}
+      data-raw4d-segments={status.raw4dSequence?.segmentCount ?? 0}
+      data-raw4d-permanent-tracks={status.raw4dSequence?.permanentTrackCount ?? 0}
+      data-raw4d-sh-updates={status.raw4dSequence?.sharedShUpdateStateCount ?? 0}
       lang={language === 'zh' ? 'zh-CN' : 'en'}
       onClick={() => setOpenMenu(null)}
+      onDragEnter={handleFileDragEnter}
+      onDragLeave={handleFileDragLeave}
+      onDragOver={handleFileDragOver}
+      onDrop={handleFileDrop}
     >
+      {fileDragActive && (
+        <div aria-label={copy.dropFilesToOpen} className="file-drop-overlay" role="status">
+          <div>
+            <Icon name="folder" size={30} />
+            <strong>{copy.dropFilesToOpen}</strong>
+            <span>{copy.dropFilesHint}</span>
+          </div>
+        </div>
+      )}
       <input
-        accept=".raw4d"
+        accept=".4cgs,.raw4d,.ply4,.sog,.ply"
         aria-label={copy.chooseImportFile}
         className="visually-hidden"
         onChange={handleFileSelection}
         ref={fileInputRef}
+        multiple
         type="file"
       />
       <header className="topbar" data-camera-input-block>
@@ -759,6 +958,8 @@ export function App() {
             {openMenu === 'view' && (
               <div className="dropdown-menu">
                 <button onClick={toggleInspectorPanel} type="button"><span>{copy.inspector}</span><b>{inspectorPanelVisible ? '✓' : ''}</b></button>
+                <button onClick={() => setShowGrid((visible) => !visible)} type="button"><span>{copy.grid}</span><b>{showGrid ? '✓' : ''}</b></button>
+                <button onClick={() => setShowAxes((visible) => !visible)} type="button"><span>{copy.axes}</span><b>{showAxes ? '✓' : ''}</b></button>
               </div>
             )}
           </div>
@@ -860,15 +1061,19 @@ export function App() {
             memoryPolicy={memoryPolicy}
             onHistoryChange={setHistoryState}
             onMemoryChange={setMemoryUsage}
+            onPerformanceChange={setPerformanceSnapshot}
             onRelightingChange={setRelightingState}
             onRuntimeChange={setViewportRuntime}
             onSelectionChange={setSelectionState}
             onStatusChange={setStatus}
             onTransformChange={setSceneTransform}
             renderMode={renderMode}
+            shLevel={shLevel}
             selectionScope={selectionScope}
+            showAxes={showAxes}
+            showGrid={showGrid}
             showGuides
-            sourceFile={sourceFile}
+            sourceFiles={sourceFiles}
             transform={sceneTransform}
             transformSpace={transformSpace}
             uniformScale={uniformScale}
@@ -890,6 +1095,34 @@ export function App() {
                 </button>
               ))}
             </div>
+            <div aria-label="SH display level" className="sh-level-switch" role="group">
+              {[0, 1, 2, 3].map((level) => (
+                <button
+                  aria-pressed={shLevel === level}
+                  className={shLevel === level ? 'active' : ''}
+                  disabled={level > (status.shBands ?? 0)}
+                  key={level}
+                  onClick={() => setShLevel(level)}
+                  title={`SH${level}`}
+                  type="button"
+                >SH{level}</button>
+              ))}
+            </div>
+            <div className="guide-switches">
+              <button aria-pressed={showGrid} className={showGrid ? 'active' : ''} onClick={() => setShowGrid((visible) => !visible)} type="button">{copy.grid}</button>
+              <button aria-pressed={showAxes} className={showAxes ? 'active' : ''} onClick={() => setShowAxes((visible) => !visible)} type="button">{copy.axes}</button>
+            </div>
+            {/* #WDD-gpt 2026-08-16 - 序列摘要并入顶部工具栏，避免单独占用第二行遮挡视口。 */}
+            {status.phase === 'ready' && status.raw4dSequence && (
+              <div className="raw4d-sequence-badge">
+                <strong>RAW4D × {status.raw4dSequence.segmentCount}</strong>
+                <span>{copy.sequenceSegment} {status.raw4dSequence.segmentIndex + 1}/{status.raw4dSequence.segmentCount}</span>
+                <span>{copy.sequenceBoundaryMerged} {status.raw4dSequence.boundaryFramesRemoved}</span>
+                <span>{copy.sequenceTracks} {status.raw4dSequence.permanentTrackCount.toLocaleString(language === 'zh' ? 'zh-CN' : 'en-US')}</span>
+                <span>SH{status.shBands ?? 0} · {status.raw4dSequence.sharedShCoefficientCount}D</span>
+                <span>{copy.sequenceShSeparated} {(Math.max(0, status.raw4dSequence.sharedShSavedBytes) / 1_000_000).toFixed(3)}M</span>
+              </div>
+            )}
           </div>
           <div className="camera-help" data-camera-input-block>{copy.cameraMoveHint}</div>
           {status.phase === 'error' && (
@@ -900,7 +1133,7 @@ export function App() {
           )}
           {status.phase === 'loading' && (
             <div className="viewport-loading" role="status">
-              <span className="loading-kicker">{copy.raw4dStream}</span>
+              <span className="loading-kicker">{status.format === '4CGS' ? '4CGS V2.4' : copy.raw4dStream}</span>
               <strong>{localizedStatusMessage}</strong>
               <div className="loading-progress"><i style={{ width: `${(status.progress ?? 0) * 100}%` }} /></div>
               <small>{Math.round((status.progress ?? 0) * 100)}%</small>
@@ -1098,7 +1331,7 @@ export function App() {
                 <h3><Icon name="chevron" size={13} />{copy.gaussianProperties}</h3>
                 <dl className="property-list">
                   <div><dt>{copy.gaussianCount}</dt><dd>{status.splatCount.toLocaleString(language === 'zh' ? 'zh-CN' : 'en-US')}</dd></div>
-                  <div><dt>{copy.activeGaussianCount}</dt><dd>{Math.max(0, status.splatCount - (selectionState.deletedCount ?? 0)).toLocaleString(language === 'zh' ? 'zh-CN' : 'en-US')}</dd></div>
+                  <div><dt>{copy.activeGaussianCount}</dt><dd>{Math.max(0, (selectionState.pointCount ?? status.splatCount) - (selectionState.deletedCount ?? 0)).toLocaleString(language === 'zh' ? 'zh-CN' : 'en-US')}</dd></div>
                   <div><dt>{copy.markedDeletedCount}</dt><dd className={(selectionState.deletedCount ?? 0) > 0 ? 'deleted-text' : ''}>{(selectionState.deletedCount ?? 0).toLocaleString(language === 'zh' ? 'zh-CN' : 'en-US')}</dd></div>
                   <div><dt>{copy.shBands}</dt><dd>{status.shBands ?? 0}</dd></div>
                   <div><dt>{copy.renderMode}</dt><dd>{copy[gaussianRenderModes.find((mode) => mode.id === renderMode)?.labelKey ?? 'renderGaussian']}</dd></div>
@@ -1111,6 +1344,7 @@ export function App() {
             {inspectorTab === 'performance' && (
               <section aria-labelledby="inspector-tab-performance" className="inspector-section memory-settings" id="inspector-panel-performance" role="tabpanel">
                 <h3><Icon name="chevron" size={13} />{copy.memoryAndVram}</h3>
+                <PerformanceDiagnosticsPanel snapshot={performanceSnapshot} />
                 <label className="memory-mode-field">
                   <span>{copy.budgetMode}</span>
                   <select
@@ -1137,8 +1371,8 @@ export function App() {
                 <MemoryTelemetryPanel language={language} usage={memoryUsage} />
                 <dl className="property-list memory-details">
                   <div><dt>{copy.transport}</dt><dd>{memoryUsage.transport === 'shared-array-buffer' ? 'SharedArrayBuffer' : 'Transferable'}</dd></div>
-                  <div><dt>{copy.loaderWorker}</dt><dd>{status.decodeBackend === 'wasm' ? 'WASM + TypedArray' : status.decodeBackend === 'fp16-bits' ? 'FP16 Bits + TypedArray' : status.format === 'RAW4D' ? 'TypedArray' : '--'}</dd></div>
-                  <div><dt>{copy.gpuDecode}</dt><dd>{status.gpuBackend === 'storage-buffer' ? 'StorageBuffer · WGSL' : status.format === 'RAW4D' ? 'Texture · WGSL' : '--'}</dd></div>
+                  <div><dt>{copy.loaderWorker}</dt><dd>{status.decodeBackend === 'wasm' ? 'WASM + TypedArray' : status.decodeBackend === 'fp16-bits' ? 'FP16 Bits + TypedArray' : status.decodeBackend === 'image-codebook' ? 'Image Codebook' : status.decodeBackend ? 'TypedArray' : '--'}</dd></div>
+                  <div><dt>{copy.gpuDecode}</dt><dd>{status.gpuBackend === 'storage-buffer' ? 'StorageBuffer · WGSL' : status.gpuBackend === 'texture' ? 'Texture · WGSL' : '--'}</dd></div>
                   <div><dt>{copy.bufferId}</dt><dd className="buffer-id" title={status.bufferId}>{status.bufferId ?? '--'}</dd></div>
                   <div><dt>{copy.sourceResident}</dt><dd>{status.sourceToResidentRatio ? `${status.sourceToResidentRatio.toFixed(2)}×` : '--'}</dd></div>
                 </dl>
@@ -1217,6 +1451,15 @@ export function App() {
                     state={relightingState}
                   />
                 )}
+                {activePlugin === 'model-health' && (
+                  <ModelHealthPanel
+                    busy={modelHealthBusy}
+                    disabled={transformDisabled}
+                    onAnalyze={() => { void runModelHealth(false); }}
+                    onRepair={() => { void runModelHealth(true); }}
+                    report={modelHealthReport}
+                  />
+                )}
               </div>}
             </section>
           </div>
@@ -1235,10 +1478,33 @@ export function App() {
 
         <div className="timeline-main">
           <div className="timeline-header">
-            <span>{copy.masterTimeline}</span>
+            <div className="timeline-title">
+              <span>{copy.masterTimeline}</span>
+              {status.raw4dSequence && (
+                <small><i className="keyframe-swatch" />{copy.timelineKeyframes}<i className="segment-swatch" />{copy.timelineSegments}</small>
+              )}
+            </div>
             <strong>{frameTimecode}</strong>
           </div>
           <div className="timeline-track">
+            {status.raw4dSequence && (
+              <div aria-hidden="true" className="timeline-annotations">
+                {timelineKeyframes.map((frame) => (
+                  <i
+                    className="timeline-keyframe"
+                    key={`key-${frame}`}
+                    style={{ left: `${frame / Math.max(1, timelineEndFrame) * 100}%` }}
+                  />
+                ))}
+                {timelineSegmentNodes.map((frame) => (
+                  <b
+                    className="timeline-segment-node"
+                    key={`segment-${frame}`}
+                    style={{ left: `${frame / Math.max(1, timelineEndFrame) * 100}%` }}
+                  />
+                ))}
+              </div>
+            )}
             <input
               aria-label={copy.currentFrame}
               max={timelineEndFrame}

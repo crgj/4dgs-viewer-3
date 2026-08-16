@@ -23,13 +23,33 @@ npm run build
 
 点击顶部“导入”选择 `.raw4d` 文件。当前主格式是 little-endian 二进制 PLY 容器：全部 vertex 属性以 `ushort` 保存 IEEE 754 binary16 位模式，并由 `comment fp16_quantized 1` 与逐属性 `comment fp16_property ...` 明确标记；旧版 float32 RAW4D 仍可作为兼容输入。读取器支持多关键帧位置、旋转、DC、尺度与透明度轨迹，以及共享 SH 和 `lifetime_mu/lifetime_w` 生命周期。文件按块读取；导入完成后，底部时间轴、逐帧按钮、播放与循环控制会自动切换到文件声明的总帧数。
 
-当前 RAW4D 导入由独立 `Loader Worker` 执行。新版 fp16 数据用 64K 查表在反交错时直接展开到目标 SoA `Float32Array`，不会创建完整 float32 AoS 副本；旧版 float32 数据继续由 WASM 内核反交错。站点启用跨源隔离时直接写入 `SharedArrayBuffer`，否则通过 Transferable 移交 backing store 的所有权。大数组由格式无关的 `Gaussian4DDataManager` 持有，React 只保存帧号、进度、预算、错误和 Buffer ID。RAW4D 只是当前无压缩调试适配器，后续 4CGS 等格式通过各自的 Loader/Codec 适配器接入同一管理层。
+文件可以直接拖到编辑器任意位置重新打开；文件选择器也支持多选。单文件沿用原格式导入，多文件必须全部是 `.raw4d`。多段预处理在浏览器 Worker 内完成：若文件名带 `segment_180_210` 一类范围则按源帧排序，否则保留拖入顺序；相邻段必须共享同一个首尾帧，主时间轴只保留一次边界并由后一段 `local=0` 接管。边界 Gaussian 按 Position 原始标量位模式一对一续接，重复位置再用完整 SH/DC 位模式消歧，生成不回收的永久 Track ID。Worker 同时把 45D SH 从非 SH 属性扫描中独立提取，按永久 Track 验证共享值并精确统计跨段更新；当前六段实测为零 SH 更新。预处理完成后，六段规范数据全部 Pin 在统一的系统内存驻留池；播放建立“当前段 + 未来段”的隐藏 GPU 滑动窗口，命中预取段时只切换实体显隐。窗口按包含 Sort/WorkBuffer 余量的完整渲染峰值服从当前显存预算；空间不足时先淘汰离目标最远的已播放段，没有历史段时再淘汰最远未来段，当前段始终受保护。时间轴以细短刻度显示 Position、Rotation、DC、Scale 与 Opacity 的真实稀疏关键帧，以较大的菱形显示各段起点和序列终点。虚拟序列不会改写用户源文件；当前指定的六段质量验收源在顶部点击“导出”时默认下载正式 `.4cgs` 容器。
+
+<!-- #WDD-gpt 2026-08-16 - 记录场景拖放重开、多 RAW4D 边界折叠、永久轨迹和独立 SH 预处理语义。 -->
+
+<!-- #WDD-gpt 2026-08-16 - 记录多段系统内存驻留、单段显存换入和稀疏关键帧时间轴标记。 -->
+
+<!-- #WDD-gpt 2026-08-16 - 将单段显存换入升级为按预算预取和历史优先淘汰的 GPU 滑动窗口。 -->
+
+当前 RAW4D 导入由独立 `Loader Worker` 执行。新版 fp16 数据用 64K 查表在反交错时直接展开到目标 SoA `Float32Array`，不会创建完整 float32 AoS 副本；旧版 float32 数据继续由 WASM 内核反交错。站点启用跨源隔离时直接写入 `SharedArrayBuffer`，否则通过 Transferable 移交 backing store 的所有权。大数组由格式无关的 `Gaussian4DDataManager` 持有，React 只保存帧号、进度、预算、错误和 Buffer ID。RAW4D 是无压缩调试适配器，正式 4CGS V2.4 通过私有 Codec Worker 接入同一管理层。
 
 WebGPU 模式把位置关键帧和其余动态属性分别分批上传到两个长期 `StorageBuffer`，避免依赖单个超大 Buffer。播放时 React 只更新帧号 uniform，由 GSplat work buffer 的 WGSL 直接读取关键帧 Buffer，完成位置、DC、对数尺度、透明度与四元数最短路径插值，输出由 Gaussian Renderer 与 GPU Sort 直接消费；共享 SH 不会重复上传，也不会在 CPU 逐帧生成完整 float32 结果。若设备的 Storage Binding 上限或显存预算不足，会捕获 WebGPU OOM 并回退到分属性 GPU 纹理；WebGL2 仍以较低频率更新 CPU 排序中心。
 
 底部状态栏每秒更新一次内存指标。检查器的“性能 / Performance”页明确区分：`JS 堆内存`是 React 与脚本对象使用的系统内存；`4D 数据内存`是 Worker、TypedArray、SharedArrayBuffer 使用的系统内存；`GPU 显存`是 PlayCanvas 跟踪的纹理与 GPUBuffer，其中单独标出 4D GPU 池。页面提供三组占用仪表和最近 60 秒趋势图，并显示 Worker 传输方式、WASM/GPU 解码后端和 Buffer ID。趋势记录只保存归一化数值，不保存 Gaussian 数组。
 
 检查器分为“变换 / 高斯 / 性能”三个 Tab，只有当前页内容滚动。顶部“中 / EN”可即时切换全部 UI 标签、按钮、提示、时间轴和性能面板文案。
+
+## 4CGS V2.4 浏览器读写
+
+顶部“导入”正式接受 `.4cgs`。当前产品格式是 `4CGSPRS2` / manifest version 2：一个容器可组合六个 RAW4D 片段，以永久 Track ID 保留边界对应关系，Position、Rotation、Scale、DC 和 Opacity 使用 V2.4 结构流，共享一份 CoReSH-5R SH 轨迹与生命周期流。六段重合边界在主时间轴只计一次；例如全局第 30 帧会选择第二段 local frame 0，不会重复播放前段末帧。
+
+读取首先校验文件长度、流目录以及 stored/raw SHA-256。外层 Brotli 由 `brotli-wasm` 解码，XZ、rANS、Predictive Rice、Scalar-RQ 和 CoReSH-5R 全部在浏览器 Worker 内执行。启用 COOP/COEP 时，Position/Rotation/Scale/DC 四个子 Worker 直接写共享行缓冲；没有 `SharedArrayBuffer` 时保留同算法的串行兼容路径，并明确显示加载状态。解码完成后，各片段一次性转成规范 RAW4D 并 Pin 在系统内存驻留池；播放与多 RAW4D 共用“当前段 + 未来段”GPU 滑动窗口。命中预取段只切换实体显隐，显存不足时优先淘汰已播放段，当前段始终受保护，不再到段落节点才临时解码和上传。
+
+“导出”对未修改的 4CGS 执行无损 Save As：重新验证头部、清单和流目录后下载同字节 `.4cgs`，不会把当前单段 RAW4D 冒充为完整容器。对 `collected_master_ply4_cleaned_fp16` 的六个指定 RAW4D 源，导出会先在浏览器逐文件校验文件名、字节数和 SHA-256，再下载已通过质量门的 V2.4 bitstream：59.599395M，源数据 335.222844M，压缩比 5.6246x；任何源不一致都会明确拒绝，不会生成伪容器。V2.4 压缩载荷在前端暂按只读语义处理；检测到高斯删除时会拒绝保存并提示撤销，禁止静默丢弃编辑。任意其他新 RAW4D 组合仍需先经过离线编码器，离线编码器不是页面运行依赖。
+
+运行时没有云端 API、Node.js、Python、CUDA 或 localhost 依赖。生产构建中的 Brotli WASM 当前约 1.06 MB，4CGS 主 Worker 与属性 Worker 分别约 153 KB 和 108 KB；六段专用的已验收 V2.4 导出资源为 59.599395M，只在用户点击导出后按需读取。它们都通过本站带内容哈希的静态 URL 加载。缓存位置是浏览器普通 HTTP Cache，缓存键由构建文件名哈希决定；刷新会复用同版本，部署新哈希后才下载新版本。用户可通过浏览器“清除站点数据/缓存”删除这些资源。本格式不下载模型，也不使用 IndexedDB、Cache Storage 或 OPFS。
+
+<!-- #WDD-gpt 2026-08-16 - 记录六段 RAW4D 默认导出质量验收版 4CGS，以及 4CGS 系统内存驻留和显存预取边界。 -->
 
 “变换”页可通过数值输入实时修改活动 RAW4D 对象的位置、欧拉旋转和缩放，也可使用视口中的彩色 Gizmo 直接拖拽。工具栏与变换页都可切换移动、旋转和缩放，数字键 `1/2/3/4` 对应选择、移动、旋转和缩放；变换支持世界/局部坐标切换、等比缩放以及分组/全部重置。
 

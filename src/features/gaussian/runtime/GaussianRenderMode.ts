@@ -1,11 +1,12 @@
 import type { Application } from 'playcanvas';
 
-export type GaussianRenderMode = 'gaussian' | 'point' | 'ellipse';
+export type GaussianRenderMode = 'gaussian' | 'point' | 'ellipse' | 'all';
 
 export const gaussianRenderModeValues: Record<GaussianRenderMode, number> = {
   gaussian: 0,
   point: 1,
   ellipse: 2,
+  all: 3,
 };
 
 interface GaussianRenderThresholds {
@@ -37,7 +38,7 @@ const modifyFragmentGLSL = `
 uniform float dongRenderMode;
 
 void modifySplatColor(vec2 gaussianUV, inout vec4 color) {
-    if (dongRenderMode < 0.5) {
+    if (dongRenderMode < 0.5 || dongRenderMode > 2.5) {
         return;
     }
 
@@ -80,7 +81,7 @@ const modifyFragmentWGSL = `
 uniform dongRenderMode: f32;
 
 fn modifySplatColor(gaussianUV: vec2f, color: ptr<function, vec4f>) {
-    if (uniform.dongRenderMode < 0.5) {
+    if (uniform.dongRenderMode < 0.5 || uniform.dongRenderMode > 2.5) {
         return;
     }
 
@@ -110,7 +111,7 @@ uniform float uRelightBrightness;
 uniform float uRelightBackground;
 
 void modifySplatColor(vec2 gaussianUV, inout vec4 color) {
-    if (dongRenderMode > 0.5) {
+    if (dongRenderMode > 0.5 && dongRenderMode < 2.5) {
         float radialDistance = dot(gaussianUV, gaussianUV);
         float exp4 = exp(-4.0);
         float gaussianProfile = (exp(-4.0 * radialDistance) - exp4) / (1.0 - exp4);
@@ -148,7 +149,7 @@ uniform uRelightBrightness: f32;
 uniform uRelightBackground: f32;
 
 fn modifySplatColor(gaussianUV: vec2f, color: ptr<function, vec4f>) {
-    if (uniform.dongRenderMode > 0.5) {
+    if (uniform.dongRenderMode > 0.5 && uniform.dongRenderMode < 2.5) {
         let radialDistance = dot(gaussianUV, gaussianUV);
         let exp4 = exp(-4.0);
         let gaussianProfile = (exp(-4.0 * radialDistance) - exp4) / (1.0 - exp4);
@@ -210,7 +211,7 @@ export function setGaussianRenderMode(app: Application, mode: GaussianRenderMode
   };
   renderThresholds.set(app, thresholds);
 
-  const keepDistantPoints = mode === 'point';
+  const keepDistantPoints = mode === 'point' || mode === 'all';
   app.scene.gsplat.minPixelSize = keepDistantPoints ? 0 : thresholds.minPixelSize;
   app.scene.gsplat.minContribution = keepDistantPoints ? 0 : thresholds.minContribution;
 
