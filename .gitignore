@@ -1,0 +1,11 @@
+node_modules/
+.vite/
+*.local
+*.log
+.DS_Store
+
+# #WDD-gpt 2026-08-16 - 保留本地压缩实验产物和测试缓存，避免将超大文件误提交到 GitHub。
+artifacts/
+.pytest_cache/
+__pycache__/
+*.py[cod]

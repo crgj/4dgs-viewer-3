@@ -1,0 +1,38 @@
+{
+  "name": "dong-editor-3",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "npm run gs2mesh:wasm && tsc -b && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc -b --pretty false",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "gs2mesh:wasm": "node scripts/build-gs2mesh-wasm.mjs",
+    "compression-renderer:build": "tsc -p tsconfig.compression-renderer.json --pretty false && vite build --config vite.compression-renderer.config.ts",
+    "compression-renderer:preview": "vite preview --config vite.compression-renderer.config.ts",
+    "fourcgs:encode-prs": "node scripts/encode-fourcgs-prs-morton.mjs",
+    "fourcgs:decode-prs": "node scripts/decode-fourcgs-prs-morton.mjs"
+  },
+  "dependencies": {
+    "@mediapipe/tasks-vision": "^1.0.1",
+    "isosurface": "^1.0.0",
+    "playcanvas": "^2.21.4",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "xzwasm": "^0.1.2"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.9",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.4",
+    "@vitejs/plugin-react": "^6.0.5",
+    "@webgpu/types": "^0.1.64",
+    "typescript": "^7.0.2",
+    "vite": "^8.2.1",
+    "vitest": "^4.1.10",
+    "wabt": "^1.0.39"
+  }
+}

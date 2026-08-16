@@ -1,0 +1,41 @@
+:root,
+body,
+#root {
+  width: 640px;
+  height: 360px;
+  margin: 0;
+  overflow: hidden;
+  background: #000;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+.compression-renderer {
+  display: grid;
+  grid-template-columns: 640px;
+  width: 640px;
+  height: 360px;
+}
+
+.compression-renderer-panel {
+  position: relative;
+  width: 640px;
+  height: 360px;
+  overflow: hidden;
+}
+
+.viewport-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.compression-renderer-output {
+  position: fixed;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}

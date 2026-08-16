@@ -1,0 +1,7 @@
+{
+  "extends": "./tsconfig.app.json",
+  "compilerOptions": {
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.compression-renderer.tsbuildinfo"
+  },
+  "include": ["src", "tools/compression-renderer"]
+}

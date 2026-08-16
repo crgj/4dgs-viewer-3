@@ -1,0 +1,135 @@
+.smart-alignment-card {
+  display: grid;
+  gap: 10px;
+  margin-top: 12px;
+  padding: 13px;
+  border: 1px solid rgba(93, 128, 187, 0.22);
+  border-radius: 10px;
+  background:
+    radial-gradient(circle at 12% 0%, rgba(64, 128, 255, 0.13), transparent 42%),
+    rgba(10, 14, 22, 0.58);
+}
+
+.smart-alignment-heading {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.smart-alignment-heading > div {
+  display: grid;
+  gap: 2px;
+}
+
+.smart-alignment-heading strong {
+  color: #edf4ff;
+  font-size: 12px;
+  letter-spacing: 0.02em;
+}
+
+.smart-alignment-heading small {
+  color: #6e89b0;
+  font-size: 9px;
+}
+
+.smart-alignment-mark {
+  display: grid;
+  width: 27px;
+  height: 27px;
+  place-items: center;
+  border: 1px solid rgba(94, 155, 255, 0.36);
+  border-radius: 8px;
+  color: #75a9ff;
+  background: rgba(57, 111, 208, 0.15);
+  box-shadow: 0 0 18px rgba(64, 128, 255, 0.12);
+}
+
+.smart-alignment-card > p,
+.smart-alignment-status {
+  margin: 0;
+  color: #8999b1;
+  font-size: 10px;
+  line-height: 1.55;
+}
+
+.smart-alignment-status {
+  display: grid;
+  gap: 7px;
+  min-height: 16px;
+  color: #b8c8df;
+}
+
+.smart-alignment-card.success .smart-alignment-status {
+  color: #76d8ac;
+}
+
+.smart-alignment-card.error .smart-alignment-status {
+  color: #ff8c93;
+}
+
+.smart-alignment-progress {
+  height: 3px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(91, 115, 153, 0.22);
+}
+
+.smart-alignment-progress i {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #397dff, #67c0ff);
+  transition: width 180ms ease;
+}
+
+.smart-alignment-metrics {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 5px;
+  margin: 0;
+}
+
+.smart-alignment-metrics div {
+  display: grid;
+  gap: 2px;
+  padding: 6px;
+  border-radius: 6px;
+  background: rgba(116, 145, 190, 0.07);
+  text-align: center;
+}
+
+.smart-alignment-metrics dt {
+  color: #667891;
+  font-size: 8px;
+}
+
+.smart-alignment-metrics dd {
+  margin: 0;
+  color: #d8e5f8;
+  font: 600 11px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.smart-alignment-card > button {
+  display: flex;
+  min-height: 32px;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  border: 1px solid rgba(91, 151, 255, 0.48);
+  border-radius: 7px;
+  color: #e8f1ff;
+  background: linear-gradient(180deg, rgba(53, 113, 216, 0.72), rgba(31, 75, 157, 0.72));
+  font: 600 10px/1 system-ui, sans-serif;
+  cursor: pointer;
+  box-shadow: inset 0 1px rgba(255, 255, 255, 0.08);
+}
+
+.smart-alignment-card > button:hover:not(:disabled) {
+  border-color: rgba(118, 174, 255, 0.78);
+  background: linear-gradient(180deg, rgba(64, 131, 239, 0.85), rgba(37, 86, 178, 0.82));
+}
+
+.smart-alignment-card > button:disabled {
+  cursor: not-allowed;
+  opacity: 0.48;
+}

@@ -1,0 +1,42 @@
+.gs2mesh-card {
+  display: grid;
+  gap: 11px;
+  padding: 13px;
+  border: 1px solid rgba(71, 210, 176, 0.24);
+  border-radius: 10px;
+  background: radial-gradient(circle at 12% 0%, rgba(36, 201, 151, 0.12), transparent 44%), rgba(9, 17, 19, 0.68);
+}
+
+.gs2mesh-heading { display: flex; align-items: center; gap: 9px; }
+.gs2mesh-heading > span { display: grid; width: 28px; height: 28px; place-items: center; border: 1px solid rgba(57, 221, 176, 0.38); border-radius: 8px; color: #54ddb6; background: rgba(36, 201, 151, 0.12); }
+.gs2mesh-heading > div { display: grid; gap: 2px; }
+.gs2mesh-heading strong { color: #effff9; font-size: 12px; }
+.gs2mesh-heading small { color: #659b8b; font-size: 9px; }
+.gs2mesh-card > p, .gs2mesh-status { margin: 0; color: #8ca9a0; font-size: 10px; line-height: 1.55; }
+
+.gs2mesh-config-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
+.gs2mesh-config-grid label { display: grid; gap: 4px; color: #718d85; font-size: 9px; }
+.gs2mesh-config-grid input, .gs2mesh-config-grid select { width: 100%; min-width: 0; height: 29px; padding: 0 8px; border: 1px solid rgba(108, 147, 137, 0.25); border-radius: 6px; color: #d9ede7; background: rgba(5, 10, 12, 0.75); font: 10px ui-monospace, monospace; }
+.gs2mesh-config-grid .gs2mesh-baseline { position: relative; }
+.gs2mesh-baseline b { position: absolute; right: 8px; bottom: 7px; color: #5f8178; font-size: 9px; }
+
+.gs2mesh-status { display: grid; gap: 7px; min-height: 17px; color: #b8d3cb; }
+.gs2mesh-card.error .gs2mesh-status { color: #ff9298; }
+.gs2mesh-card.success .gs2mesh-status { color: #71ddb2; }
+.gs2mesh-card.success.warning .gs2mesh-status { color: #f2c66d; }
+.gs2mesh-status > div { height: 3px; overflow: hidden; border-radius: 999px; background: rgba(76, 124, 111, 0.22); }
+.gs2mesh-status i { display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, #22a77f, #55e0bc); transition: width 180ms ease; }
+
+.gs2mesh-metrics { display: grid; grid-template-columns: 1fr 1fr; gap: 5px; margin: 0; }
+.gs2mesh-metrics div { display: grid; gap: 2px; padding: 6px; border-radius: 6px; background: rgba(80, 157, 136, 0.08); }
+.gs2mesh-metrics dt { color: #66877d; font-size: 8px; }
+.gs2mesh-metrics dd { margin: 0; overflow: hidden; color: #d9eee7; font: 600 10px/1.2 ui-monospace, monospace; text-overflow: ellipsis; white-space: nowrap; }
+
+.gs2mesh-visibility { display: flex; gap: 14px; color: #9ab4ac; font-size: 9px; }
+.gs2mesh-visibility label { display: flex; align-items: center; gap: 5px; }
+.gs2mesh-visibility input { accent-color: #28c99a; }
+.gs2mesh-actions { display: grid; grid-template-columns: 1.6fr 1fr 1fr; gap: 5px; }
+.gs2mesh-actions button { min-height: 31px; border: 1px solid rgba(99, 142, 130, 0.3); border-radius: 7px; color: #bcd1ca; background: rgba(24, 45, 40, 0.58); font: 600 9px/1 system-ui, sans-serif; cursor: pointer; }
+.gs2mesh-actions button.primary { border-color: rgba(69, 218, 174, 0.46); color: #effff9; background: linear-gradient(180deg, rgba(32, 164, 124, 0.76), rgba(22, 104, 81, 0.78)); }
+.gs2mesh-actions button.danger { border-color: rgba(255, 116, 125, 0.46); color: #ffe9eb; background: rgba(128, 43, 52, 0.72); }
+.gs2mesh-actions button:disabled { cursor: not-allowed; opacity: 0.42; }
