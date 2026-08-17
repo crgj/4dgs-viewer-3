@@ -80,6 +80,7 @@ import { ViewCube3D } from './components/ViewCube3D';
 import { ReleaseNotesDialog } from './components/ReleaseNotesDialog';
 import { MemoryPressureTestDialog } from './components/MemoryPressureTestDialog';
 import { AppNoticeDialog, type AppNoticeTone } from './components/AppNoticeDialog';
+import { FourCgsGalleryDialog } from './components/FourCgsGalleryDialog';
 import { parseReleaseNotes } from './releaseNotes';
 import type { BrowserMemoryPressureResult } from '../features/gaussian/memory/BrowserMemoryPressureTest';
 import {
@@ -91,6 +92,10 @@ import {
   isFilePickerAbort,
   writeBlobToFileHandle,
 } from './fourCgsFileSave';
+import {
+  fetchFourCgsGalleryFile,
+  type FourCgsGalleryItem,
+} from './fourCgsGallery';
 
 type IconName =
   | 'cursor'
@@ -426,6 +431,8 @@ export function App() {
   const [sceneName, setSceneName] = useState<string | null>(null);
   const [sourceFiles, setSourceFiles] = useState<readonly File[]>([]);
   const [fileDragActive, setFileDragActive] = useState(false);
+  const [fourCgsGalleryVisible, setFourCgsGalleryVisible] = useState(false);
+  const [activeGalleryId, setActiveGalleryId] = useState<string | null>(null);
   const [currentFrame, setCurrentFrame] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
   const [isLooping, setIsLooping] = useState(true);
@@ -919,6 +926,17 @@ export function App() {
     setOpenMenu(null);
     // #WDD-gpt 2026-08-17 - 所有场景文件导出在读取当前帧数据前先暂停，避免编码期间时间轴继续变化。
     setIsPlaying(false);
+    // #WDD-gpt 2026-08-17 - 空场景在任何文件选择或编码分支前终止，避免下载没有实际高斯内容的工作区 JSON。
+    if (sourceFiles.length === 0 || status.splatCount <= 0) {
+      showAppNotice(
+        language === 'zh'
+          ? '当前场景没有可导出的高斯数据，请先从相册或本地文件导入场景。'
+          : 'The scene has no Gaussian data to export. Open a gallery item or import a local file first.',
+        language === 'zh' ? '场景为空' : 'Empty scene',
+        'warning',
+      );
+      return;
+    }
     const canonicalDataDirty = viewportRuntime?.hasCanonicalGaussianDataChanges() ?? false;
     const exportsFourCgs = status.format === 'RAW4D' || status.format === '4CGS';
     let fourCgsFileHandle: FileSystemFileHandle | null = null;
@@ -1289,6 +1307,7 @@ export function App() {
     setOriginBakeProgress(null);
     setOriginBakeResult(null);
     setOriginBakeError(null);
+    setActiveGalleryId(null);
     setActivePlugin(null);
     setInspectorPanelVisible(true);
     setInspectorTab('transform');
@@ -1296,6 +1315,22 @@ export function App() {
     setIsPlaying(false);
     // #WDD-gpt 2026-08-16 - 即使文件名相同也建立新数组，保证再次拖入会取消旧导入并正式重开场景。
     setSourceFiles(files);
+  };
+
+  const openGalleryScene = async (
+    item: FourCgsGalleryItem,
+    onProgress: (ratio: number) => void,
+  ) => {
+    setIsPlaying(false);
+    const file = await fetchFourCgsGalleryFile(item, onProgress);
+    openSourceFiles([file]);
+    setActiveGalleryId(item.id);
+  };
+
+  const openFourCgsGallery = () => {
+    setOpenMenu(null);
+    setIsPlaying(false);
+    setFourCgsGalleryVisible(true);
   };
 
   const handleFileSelection = (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -1334,26 +1369,9 @@ export function App() {
   };
 
   const newWorkspace = () => {
-    if (viewportRuntime) gs2MeshPluginRef.current?.clear(viewportRuntime, setGS2MeshState);
-    setSceneName(null);
-    setSourceFiles([]);
-    setSceneTransform(createInitialTransform());
-    setSmartAlignmentState(INITIAL_SMART_ALIGNMENT_STATE);
-    setGS2MeshState(INITIAL_GS2MESH_STATE);
-    setRelightingState(INITIAL_RELIGHTING_STATE);
-    setRelightingWorkflowStep('mesh');
-    setSelectionState(INITIAL_VIEWPORT_SELECTION_STATE);
-    setGS2MeshVisible(true);
-    setGaussianVisible(true);
-    setModelHealthReport(null);
-    setOriginBakeDialogVisible(false);
-    setOriginBakeProgress(null);
-    setOriginBakeResult(null);
-    setOriginBakeError(null);
-    setActivePlugin(null);
-    setCurrentFrame(0);
-    setIsPlaying(false);
+    // #WDD-gpt 2026-08-17 - 新建工作区强制刷新当前地址，确保 Worker、WASM、GPU 与大型场景内存全部从浏览器层重新初始化。
     setOpenMenu(null);
+    window.location.reload();
   };
 
   const runModelHealth = async (clean: boolean) => {
@@ -1488,6 +1506,10 @@ export function App() {
               </div>
             )}
           </div>
+          {/* #WDD-gpt 2026-08-17 - 相册作为主菜单一级入口展示，不再占用右侧快捷操作区或藏在文件子菜单。 */}
+          <button className="menu-trigger" onClick={openFourCgsGallery} type="button">
+            {language === 'zh' ? '相册' : 'Gallery'}
+          </button>
           <div className="menu-anchor">
             <button
               aria-expanded={openMenu === 'plugins'}
@@ -1595,6 +1617,15 @@ export function App() {
           onClose={() => setAppNotice(null)}
           title={appNotice.title}
           tone={appNotice.tone}
+        />
+      )}
+
+      {fourCgsGalleryVisible && (
+        <FourCgsGalleryDialog
+          activeId={activeGalleryId}
+          language={language}
+          onClose={() => setFourCgsGalleryVisible(false)}
+          onSelect={openGalleryScene}
         />
       )}
 

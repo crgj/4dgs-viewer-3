@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "updatedAt": "2026-08-17",
+  "items": [
+    {
+      "id": "red",
+      "name": "Red · 人物动态序列",
+      "file": "red.4cgs",
+      "snapshot": "thumbnails/red.webp",
+      "description": "背负包裹的单人动态高斯序列，覆盖源帧 270–330；适合检查跨片段播放、人物朝向、时序属性插值和 CoRe4D V2.6 浏览器解码。",
+      "fileBytes": 21392186,
+      "sourceBytes": 82490728,
+      "frameCount": 61,
+      "frameRange": [270, 330],
+      "segmentCount": 2,
+      "gaussianCount": 335265,
+      "sourceGaussianCount": 339883,
+      "deletedGaussianCount": 4618,
+      "codec": "CoRe4D V2.6 · AdaptivePQ / Brotli9",
+      "codecName": "CoRe4D-V2.6-AdaptivePQ-Brotli9-BoundedTemporal-Scale3Way",
+      "tags": ["人物", "动态", "双片段", "V2.6"]
+    }
+  ]
+}

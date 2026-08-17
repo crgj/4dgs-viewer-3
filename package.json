@@ -17,7 +17,8 @@
     "compression-renderer:preview": "vite preview --config vite.compression-renderer.config.ts",
     "fourcgs:encode-prs": "node scripts/encode-fourcgs-prs-morton.mjs",
     "fourcgs:decode-prs": "node scripts/decode-fourcgs-prs-morton.mjs",
-    "fourcgs:decode-v24": "node scripts/decode-fourcgs-prs-morton.mjs --fast"
+    "fourcgs:decode-v24": "node scripts/decode-fourcgs-prs-morton.mjs --fast",
+    "gallery:verify": "node scripts/verify-fourcgs-gallery.mjs"
   },
   "dependencies": {
     "@mediapipe/tasks-vision": "^1.0.1",
