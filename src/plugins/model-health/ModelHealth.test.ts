@@ -1,7 +1,7 @@
 import { FloatPacking } from 'playcanvas';
 import { describe, expect, it } from 'vitest';
 import { makeStaticAsset } from '../../features/gaussian/formats/import/GaussianImportUtils';
-import { findCompletelyInvisibleStableIds, inspectGaussianModel } from './ModelHealth';
+import { findCompletelyInvisibleStableIds, inspectGaussianModel, mergeModelHealthReports } from './ModelHealth';
 
 describe('model health', () => {
   it('reports and safely repairs invalid values without changing point count', () => {
@@ -145,6 +145,38 @@ describe('model health', () => {
     expect(findCompletelyInvisibleStableIds(asset)).toEqual([0]);
     const report = inspectGaussianModel(asset);
     expect(report.safeDeletionCandidates).toBe(1);
+  });
+
+  it('merges full-sequence health counts without weakening deletion evidence', () => {
+    const first = makeStaticAsset({
+      sourceName: 'segment-1.raw4d',
+      position: [new Float32Array(2), new Float32Array(2), new Float32Array(2)],
+      rotation: [new Float32Array([1, 1]), new Float32Array(2), new Float32Array(2), new Float32Array(2)],
+      colorDc: [new Float32Array(2), new Float32Array(2), new Float32Array(2)],
+      scale: [new Float32Array(2), new Float32Array(2), new Float32Array(2)],
+      opacity: new Float32Array([Number.NEGATIVE_INFINITY, 0]),
+      shRest: [],
+    });
+    const second = makeStaticAsset({
+      sourceName: 'segment-2.raw4d',
+      position: [new Float32Array([Number.NaN]), new Float32Array(1), new Float32Array(1)],
+      rotation: [new Float32Array([1]), new Float32Array(1), new Float32Array(1), new Float32Array(1)],
+      colorDc: [new Float32Array(1), new Float32Array(1), new Float32Array(1)],
+      scale: [new Float32Array(1), new Float32Array(1), new Float32Array(1)],
+      opacity: new Float32Array([Number.NEGATIVE_INFINITY]),
+      shRest: [],
+    });
+
+    const merged = mergeModelHealthReports([
+      inspectGaussianModel(first),
+      inspectGaussianModel(second),
+    ]);
+
+    expect(merged.checkedSegments).toBe(2);
+    expect(merged.checkedPoints).toBe(3);
+    expect(merged.safeDeletionCandidates).toBe(2);
+    expect(merged.healthy).toBe(false);
+    expect(merged.issues.find((issue) => issue.code === 'nonfinite-position')?.count).toBe(1);
   });
 
   it('repairs positive infinite opacity without making an opaque point disappear', () => {

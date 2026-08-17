@@ -245,8 +245,9 @@ void modifySplatRotationScale(vec3 originalCenter, vec3 modifiedCenter, inout ve
 void modifySplatColor(vec3 center, inout vec4 color) {
     if (dongRenderMode > 2.5) {
         bool finiteCenter = all(equal(center, center)) && all(lessThan(abs(center), vec3(100000.0)));
-        bool finiteColor = all(equal(color, color));
-        bool validPoint = finiteCenter && finiteColor && color.a >= 0.0039215686;
+        bool finiteColor = all(equal(color, color)) && all(lessThan(abs(color), vec4(100000.0)));
+        // #WDD-gpt 2026-08-17 - 当前帧低透明度、生命周期门控和合法 -Infinity opacity 都不是数据异常；ALL 红色只表达不可用的解码值。
+        bool validPoint = finiteCenter && finiteColor;
         color = vec4(validPoint ? vec3(0.12, 1.0, 0.34) : vec3(1.0, 0.12, 0.10), 1.0);
     }
 }
@@ -300,8 +301,9 @@ fn modifySplatColor(center: vec3f, color: ptr<function, vec4f>) {
     if (uniform.dongRenderMode > 2.5) {
         let finiteCenter = all(center == center) && all(abs(center) < vec3f(100000.0));
         let currentColor = *color;
-        let finiteColor = all(currentColor == currentColor);
-        let validPoint = finiteCenter && finiteColor && currentColor.a >= 0.0039215686;
+        let finiteColor = all(currentColor == currentColor) && all(abs(currentColor) < vec4f(100000.0));
+        // #WDD-gpt 2026-08-17 - 与 GLSL 保持一致，透明度大小不参与异常判定，避免把正常的时序隐藏点误报为红点。
+        let validPoint = finiteCenter && finiteColor;
         let diagnosticColor = select(vec3f(1.0, 0.12, 0.10), vec3f(0.12, 1.0, 0.34), validPoint);
         *color = vec4f(diagnosticColor, 1.0);
     }

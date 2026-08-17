@@ -114,12 +114,27 @@ function resampleBrushPath(points: readonly GaussianScreenPoint[], spacing: numb
   return samples;
 }
 
+export interface GaussianBrushScreenMetrics {
+  readonly radius: number;
+  readonly diameter: number;
+  readonly visibleDiameter: number;
+}
+
+// #WDD-gpt 2026-08-17 - 命中区域、圆形光标和 SVG 笔迹共用同一组 CSS 像素尺寸，防止视觉半径与实际选择半径分叉。
+export function gaussianBrushScreenMetrics(requestedRadius: number): GaussianBrushScreenMetrics {
+  const radius = Math.max(2, requestedRadius);
+  const diameter = radius * 2;
+  // #WDD-gpt 2026-08-17 - 圆圈光标 CSS 有 1px 向外扩展环；SVG 痕迹必须覆盖相同可见外径，不能只匹配元素盒尺寸。
+  const visibleDiameter = diameter + 2;
+  return { radius, diameter, visibleDiameter };
+}
+
 // #WDD-gpt  2026-08-16 - Brush 路径按半径建立屏幕网格，跨帧命中时只查询邻近桶，避免点数乘笔迹长度的扫描开销。
 export function createGaussianBrushSelectionRegion(
   path: readonly GaussianScreenPoint[],
   requestedRadius: number,
 ): GaussianScreenSelectionRegion {
-  const radius = Math.max(2, requestedRadius);
+  const { radius } = gaussianBrushScreenMetrics(requestedRadius);
   const samples = resampleBrushPath(path, Math.max(2, radius * 0.4));
   const bounds = pointsBounds(samples, radius);
   const buckets = new Map<string, GaussianScreenPoint[]>();

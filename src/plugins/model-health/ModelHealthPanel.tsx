@@ -6,20 +6,28 @@ export function ModelHealthPanel({
   busy,
   disabled,
   onAnalyze,
-  onRepair,
+  onClean,
   report,
 }: {
   readonly busy: boolean;
   readonly disabled: boolean;
   readonly onAnalyze: () => void;
-  readonly onRepair: () => void;
+  readonly onClean: () => void;
   readonly report: ModelHealthReport | null;
 }) {
   const issueCount = report?.issues.reduce((sum, issue) => sum + issue.count, 0) ?? 0;
   const hasSafeDeletionCandidates = (report?.safeDeletionCandidates ?? 0) > 0;
   return (
     <section className="model-health-panel">
-      <p>检查非有限值、四元数、缩放、透明度、生命周期和包围盒。透明度 Logit 的 <code>-Infinity</code> 是合法的“完全透明”表示，不属于异常，也不会被改写。</p>
+      <p>检查非有限值、四元数、缩放、透明度、生命周期和包围盒。透明度 Logit 的 <code>-Infinity</code> 是合法的“完全透明”表示，不属于属性异常，也不会被改写。</p>
+
+      {/* #WDD-gpt 2026-08-17 - 明示 ALL 颜色与安全删除证据的边界，禁止用户把红色诊断点误当成可批量删除点。 */}
+      <div className="model-health-all-legend">
+        <strong>ALL 诊断说明</strong>
+        <span><i className="valid" />绿色：当前解码的位置和颜色数值可用，透明点也属于绿色。</span>
+        <span><i className="invalid" />红色：当前解码出现 NaN、Infinity 或超范围坐标；仅用于定位，绝不自动删除。</span>
+        <small>旧版还会把当前帧 Alpha &lt; 1/255 的正常时序点染红，本版已取消这一误判。</small>
+      </div>
 
       {/* #WDD-gpt 2026-08-17 - 在插件内直接展示严格删除证明，让用户能区分精确零贡献与仅低于阈值。 */}
       <figure aria-label="最安全点删除判定流程" className="model-health-proof">
@@ -57,21 +65,23 @@ export function ModelHealthPanel({
       <div className="model-health-actions">
         <button disabled={disabled || busy} onClick={onAnalyze} type="button">检查模型</button>
         <button
-          disabled={disabled || busy || !report || (report.healthy && !hasSafeDeletionCandidates)}
-          onClick={onRepair}
+          disabled={disabled || busy || !report || !hasSafeDeletionCandidates}
+          onClick={onClean}
           type="button"
-        >最安全自动修复</button>
+        >安全清理完全透明点</button>
       </div>
-      {busy && <p role="status">正在检查并刷新 GPU 数据…</p>}
+      {busy && <p role="status">正在检查全部片段并核对透明度证据…</p>}
       {report && (
         <div className={report.healthy ? 'model-health-result healthy' : 'model-health-result warning'}>
+          <small>
+            已检查 {report.checkedSegments.toLocaleString()} 个片段、{report.checkedPoints.toLocaleString()} 个高斯点
+          </small>
           <strong>{report.healthy ? '模型属性正常' : `发现 ${issueCount.toLocaleString()} 项属性异常`}</strong>
           {hasSafeDeletionCandidates && (
             <small className="model-health-safe-candidates">
               发现 {report.safeDeletionCandidates.toLocaleString()} 个最安全删除候选：全部 opacity 关键帧均为 −∞
             </small>
           )}
-          {report.fixedValues > 0 && <small>已安全修复 {report.fixedValues.toLocaleString()} 个数值</small>}
           {report.markedDeletedPoints > 0 && <small>已标记删除 {report.markedDeletedPoints.toLocaleString()} 个 Alpha 恒为 0 的点（可撤销，保存时才正式删除）</small>}
           {report.issues.length > 0 && <ul>{report.issues.map((issue) => <li key={issue.code}>{issue.label}：{issue.count.toLocaleString()}</li>)}</ul>}
         </div>

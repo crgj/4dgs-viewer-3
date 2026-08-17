@@ -100,14 +100,29 @@ function transformNormalsToLocal(normals: Float32Array, localToWorld: Mat4): Flo
   return output;
 }
 
+function transformNormalsToWorld(normals: Float32Array, localToWorld: Mat4): Float32Array {
+  const matrix = localToWorld.data;
+  const output = new Float32Array(normals.length);
+  for (let offset = 0; offset < normals.length; offset += 3) {
+    const x = matrix[0] * normals[offset] + matrix[4] * normals[offset + 1] + matrix[8] * normals[offset + 2];
+    const y = matrix[1] * normals[offset] + matrix[5] * normals[offset + 1] + matrix[9] * normals[offset + 2];
+    const z = matrix[2] * normals[offset] + matrix[6] * normals[offset + 1] + matrix[10] * normals[offset + 2];
+    const inverseLength = 1 / Math.max(1e-12, Math.hypot(x, y, z));
+    output.set([x * inverseLength, y * inverseLength, z * inverseLength], offset);
+  }
+  return output;
+}
+
 export class GS2MeshSceneObject {
   private readonly entity = new Entity('GS2Mesh · Current Frame');
   private readonly mesh: Mesh;
   private readonly material = new StandardMaterial();
   private relightingEntity: Entity | null = null;
   private relightingMaterial: StandardMaterial | null = null;
-  private readonly boundsCenter: readonly [number, number, number];
-  private readonly boundsRadius: number;
+  private positions: Float32Array;
+  private normals: Float32Array;
+  private boundsCenter: [number, number, number] = [0, 0, 0];
+  private boundsRadius = 0.01;
   readonly stats: GS2MeshSceneStats;
 
   constructor(app: Application, data: GS2MeshData, transformSource?: Entity | null) {
@@ -119,6 +134,8 @@ export class GS2MeshSceneObject {
       ? sourceWorld ? transformNormalsToLocal(data.normals, sourceWorld) : data.normals
       : Float32Array.from(calculateNormals(Array.from(positions), Array.from(data.indices)));
     const normals = orientNormalsOutward(positions, sourceNormals, data.indices);
+    this.positions = positions;
+    this.normals = normals;
     this.mesh = new Mesh(app.graphicsDevice);
     // #WDD-gpt 2026-08-15 - Preserve typed mesh buffers so a sparse 1024³ result is not duplicated into large boxed-number arrays during scene installation.
     this.mesh.setPositions(positions);
@@ -144,29 +161,33 @@ export class GS2MeshSceneObject {
     this.entity.render!.meshInstances = [meshInstance];
     app.root.addChild(this.entity);
     if (transformSource) this.syncTransform(transformSource);
+    this.updateBounds();
+    this.stats = {
+      vertexCount: data.positions.length / 3,
+      triangleCount: data.indices.length / 3,
+    };
+  }
+
+  private updateBounds(): void {
     let minX = Number.POSITIVE_INFINITY;
     let minY = Number.POSITIVE_INFINITY;
     let minZ = Number.POSITIVE_INFINITY;
     let maxX = Number.NEGATIVE_INFINITY;
     let maxY = Number.NEGATIVE_INFINITY;
     let maxZ = Number.NEGATIVE_INFINITY;
-    for (let index = 0; index < positions.length; index += 3) {
-      minX = Math.min(minX, positions[index]);
-      minY = Math.min(minY, positions[index + 1]);
-      minZ = Math.min(minZ, positions[index + 2]);
-      maxX = Math.max(maxX, positions[index]);
-      maxY = Math.max(maxY, positions[index + 1]);
-      maxZ = Math.max(maxZ, positions[index + 2]);
+    for (let index = 0; index < this.positions.length; index += 3) {
+      minX = Math.min(minX, this.positions[index]);
+      minY = Math.min(minY, this.positions[index + 1]);
+      minZ = Math.min(minZ, this.positions[index + 2]);
+      maxX = Math.max(maxX, this.positions[index]);
+      maxY = Math.max(maxY, this.positions[index + 1]);
+      maxZ = Math.max(maxZ, this.positions[index + 2]);
     }
     this.boundsCenter = [(minX + maxX) / 2, (minY + maxY) / 2, (minZ + maxZ) / 2];
     this.boundsRadius = Math.max(
       0.01,
       Math.hypot(maxX - minX, maxY - minY, maxZ - minZ) / 2,
     );
-    this.stats = {
-      vertexCount: data.positions.length / 3,
-      triangleCount: data.indices.length / 3,
-    };
   }
 
   setVisible(visible: boolean): void {
@@ -198,6 +219,25 @@ export class GS2MeshSceneObject {
       this.relightingEntity.setPosition(position);
       this.relightingEntity.setRotation(rotation);
       this.relightingEntity.setLocalScale(scale);
+    }
+  }
+
+  // #WDD-gpt 2026-08-17 - Gaussian 原点重设时把相同世界 TRS 写入派生 Mesh 顶点/法线，随后归一实体，避免 Mesh 与已烘焙高斯错位。
+  bakeTransform(source: Entity): void {
+    const localToWorld = source.getWorldTransform().clone();
+    this.positions = transformPositionsToLocal(this.positions, localToWorld);
+    this.normals = transformNormalsToWorld(this.normals, localToWorld);
+    this.mesh.setPositions(this.positions);
+    this.mesh.setNormals(this.normals);
+    this.mesh.update(PRIMITIVE_TRIANGLES);
+    this.updateBounds();
+    this.entity.setLocalPosition(0, 0, 0);
+    this.entity.setLocalEulerAngles(0, 0, 0);
+    this.entity.setLocalScale(1, 1, 1);
+    if (this.relightingEntity) {
+      this.relightingEntity.setLocalPosition(0, 0, 0);
+      this.relightingEntity.setLocalEulerAngles(0, 0, 0);
+      this.relightingEntity.setLocalScale(1, 1, 1);
     }
   }
 

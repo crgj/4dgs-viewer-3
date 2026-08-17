@@ -113,6 +113,7 @@ import {
   createGaussianBrushSelectionRegion,
   createGaussianPolygonSelectionRegion,
   createGaussianRectSelectionRegion,
+  gaussianBrushScreenMetrics,
   gaussianSelectionIdsFromMask,
   gaussianSelectionModeFromModifiers,
   normalizeGaussianSelectionRect,
@@ -124,6 +125,13 @@ import {
 import { Raw4DSelectionFrameSampler } from './selection/Raw4DSelectionFrameSampler';
 import { GaussianSequenceEditStore } from './selection/GaussianSequenceEditStore';
 import {
+  bakeGaussianAssetTransform,
+  gaussianTransformBakeTrackCount,
+  isIdentityGaussianBakeTransform,
+  validateGaussianAssetTransformBake,
+  type GaussianTransformBakeStage,
+} from '../../gaussian/transform/GaussianTransformBaker';
+import {
   computeGaussianEnvelopeMesh,
   type GaussianEnvelopeSource,
 } from './scene/GaussianEnvelope';
@@ -132,6 +140,7 @@ import { ViewportPerformanceMonitor, type ViewportPerformanceSnapshot } from './
 import {
   findCompletelyInvisibleStableIds,
   inspectGaussianModel,
+  mergeModelHealthReports,
   type ModelHealthReport,
 } from '../../../plugins/model-health/ModelHealth';
 
@@ -177,6 +186,23 @@ export interface ViewportRaw4DResidencyProgress {
   readonly segmentCount: number;
   readonly ratio: number;
   readonly message: string;
+}
+
+export interface ViewportTransformBakeProgress {
+  readonly ratio: number;
+  readonly stage: GaussianTransformBakeStage | 'upload';
+  readonly segmentIndex: number;
+  readonly segmentCount: number;
+}
+
+export interface ViewportTransformBakeResult {
+  readonly pointCount: number;
+  readonly positionKeyframes: number;
+  readonly rotationKeyframes: number;
+  readonly scaleKeyframes: number;
+  readonly segmentCount: number;
+  readonly shBands: number;
+  readonly shRotated: boolean;
 }
 
 export interface ViewportGaussianSelectionSequenceSegment {
@@ -347,6 +373,7 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
   private relighting: GaussianRelightingController | null = null;
   private memoryCoordinator: GaussianMemoryCoordinator | null = null;
   private gaussianImporter: GaussianAssetImporter | null = null;
+  private readonly dirtyRaw4DAssets = new WeakSet<Raw4DAsset>();
   private readonly residentRaw4DSegments = new Map<string, ResidentRaw4DEntry>();
   private readonly residentRaw4DGpuCache = new Map<string, ResidentRaw4DGpuEntry>();
   private readonly residentRaw4DGpuLoads = new Map<string, ResidentRaw4DGpuLoad>();
@@ -387,6 +414,8 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
   private selectionBrushOverlay: HTMLDivElement | null = null;
   private selectionBrushTrailOverlay: SVGSVGElement | null = null;
   private selectionBrushTrailShape: SVGPathElement | null = null;
+  private selectionBrushTrailPreview: GaussianScreenPoint[] = [];
+  private selectionBrushTrailClearTimer: number | null = null;
   private selectionPolygonOverlay: SVGSVGElement | null = null;
   private selectionPolygonShape: SVGPolygonElement | null = null;
   private selectionPolygonCursorLine: SVGLineElement | null = null;
@@ -722,7 +751,9 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
     const raw4D = this.activeRaw4D;
     const asset = this.activeRaw4DAsset;
     if (!raw4D || !asset) throw new Error('No active RAW4D dataset.');
-    return this.activeRaw4DSource && (this.activeFormat === 'RAW4D' || this.activeFormat === 'PLY4')
+    return this.activeRaw4DSource
+      && !this.dirtyRaw4DAssets.has(asset)
+      && (this.activeFormat === 'RAW4D' || this.activeFormat === 'PLY4')
       ? exportCompactedRaw4DSource(this.activeRaw4DSource, raw4D.edits.deletionWords, { onProgress })
       : encodeCompactedRaw4D(asset, raw4D.edits.deletionWords, { onProgress });
   }
@@ -769,6 +800,16 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
 
   getGaussianDeletionCount(): number {
     return this.gaussianDeletionCount();
+  }
+
+  hasCanonicalGaussianDataChanges(): boolean {
+    if (this.raw4DSequenceGpuOrder.length > 0) {
+      return this.raw4DSequenceGpuOrder.some((residentId) => {
+        const asset = this.residentRaw4DSegments.get(residentId)?.loaded.asset;
+        return asset ? this.dirtyRaw4DAssets.has(asset) : false;
+      });
+    }
+    return this.activeRaw4DAsset ? this.dirtyRaw4DAssets.has(this.activeRaw4DAsset) : false;
   }
 
   // #WDD-gpt 2026-08-17 - PLY 序列导出不依赖拖入 File 身份，直接按时间轴顺序快照驻留 Canonical 段。
@@ -871,6 +912,108 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
     this.gs2MeshObject?.syncTransform(entity);
     this.activeGizmo()?.update();
     this.pushTransformHistory(previous, next);
+  }
+
+  // #WDD-gpt 2026-08-17 - 把当前世界 TRS 原子写入全部驻留片段的 Canonical 关键帧，更新 SH/Mesh 后再将实体变换归一为世界原点。
+  async bakeSceneTransformIntoGaussianData(
+    onProgress?: (progress: ViewportTransformBakeProgress) => void,
+  ): Promise<ViewportTransformBakeResult> {
+    if (!this.activeRaw4D || !this.activeRaw4DAsset) throw new Error('没有可重设原点的 Gaussian 模型。');
+    const transform = this.getSceneTransform();
+    if (isIdentityGaussianBakeTransform(transform)) throw new Error('当前模型变换已经位于世界原点。');
+    const assets = this.raw4DSequenceGpuOrder.length > 0
+      ? this.raw4DSequenceGpuOrder.map((residentId, index) => {
+        const resident = this.residentRaw4DSegments.get(residentId);
+        if (!resident) throw new Error(`RAW4D 第 ${index + 1} 段已退出系统内存，无法重设整个模型原点。`);
+        return resident.loaded.asset;
+      })
+      : [this.activeRaw4DAsset];
+    for (const asset of assets) validateGaussianAssetTransformBake(asset, transform);
+    const weights = assets.map((asset) => asset.splatCount * gaussianTransformBakeTrackCount(asset, transform));
+    const totalWeight = weights.reduce((sum, value) => sum + value, 0);
+    let completedWeight = 0;
+
+    // #WDD-gpt 2026-08-17 - 停止片段预取并释放非活动 GPU 副本；Canonical 系统内存保留，未来切段按新原点重新上传。
+    this.raw4DPrefetchGeneration += 1;
+    for (const load of this.residentRaw4DGpuLoads.values()) load.controller.abort();
+    this.residentRaw4DGpuLoads.clear();
+    for (const [residentId, entry] of [...this.residentRaw4DGpuCache]) {
+      if (entry.raw4D !== this.activeRaw4D) this.disposeRaw4DGpuEntry(residentId, entry);
+    }
+
+    const activeRaw4D = this.activeRaw4D;
+    const wasEnabled = activeRaw4D.entity.enabled;
+    activeRaw4D.entity.enabled = false;
+    let dataBaked = false;
+    try {
+      let pointCount = 0;
+      let positionKeyframes = 0;
+      let rotationKeyframes = 0;
+      let scaleKeyframes = 0;
+      let shRotated = false;
+      let maximumShBands = 0;
+      for (let segmentIndex = 0; segmentIndex < assets.length; segmentIndex += 1) {
+        const asset = assets[segmentIndex];
+        const weight = weights[segmentIndex];
+        const result = await bakeGaussianAssetTransform(asset, transform, {
+          onProgress: (progress) => onProgress?.({
+            ratio: totalWeight === 0 ? 0.92 : (completedWeight + progress.ratio * weight) / totalWeight * 0.92,
+            stage: progress.stage,
+            segmentIndex,
+            segmentCount: assets.length,
+          }),
+        });
+        this.dirtyRaw4DAssets.add(asset);
+        completedWeight += weight;
+        pointCount += result.pointCount;
+        positionKeyframes += result.positionKeyframes;
+        rotationKeyframes += result.rotationKeyframes;
+        scaleKeyframes += result.scaleKeyframes;
+        shRotated ||= result.rotatedSh;
+        maximumShBands = Math.max(maximumShBands, result.shBands);
+      }
+      dataBaked = true;
+      onProgress?.({ ratio: 0.94, stage: 'upload', segmentIndex: assets.length - 1, segmentCount: assets.length });
+      await activeRaw4D.refreshSourceData();
+      activeRaw4D.setAllMode(this.renderMode === 'all');
+      activeRaw4D.setShBands(this.shLevel);
+      activeRaw4D.setFrame(this.pendingFrame);
+
+      // #WDD-gpt 2026-08-17 - Mesh 仍在旧 Gaussian 局部坐标，先用旧实体矩阵烘焙，再归一 Gaussian 实体。
+      this.gs2MeshObject?.bakeTransform(activeRaw4D.entity);
+      const identity: ViewportTransform = { position: [0, 0, 0], rotation: [0, 0, 0], scale: [1, 1, 1] };
+      this.pendingTransform = identity;
+      this.applyTransform(activeRaw4D.entity, identity);
+      this.history.clear();
+      this.activeGizmo()?.update();
+      this.guides?.setGaussianEnvelopeTransform(identity);
+      this.syncSceneTransformDataset(identity);
+      this.options.onTransformChange?.(this.getSceneTransform());
+      this.requestGaussianEnvelopeUpdate(0);
+      onProgress?.({ ratio: 1, stage: 'complete', segmentIndex: assets.length - 1, segmentCount: assets.length });
+      return {
+        pointCount,
+        positionKeyframes,
+        rotationKeyframes,
+        scaleKeyframes,
+        segmentCount: assets.length,
+        shBands: maximumShBands,
+        shRotated,
+      };
+    } catch (error) {
+      // #WDD-gpt 2026-08-17 - 数据完成烘焙后绝不能保留旧实体 TRS，否则模型会被重复变换。
+      if (dataBaked) {
+        const identity: ViewportTransform = { position: [0, 0, 0], rotation: [0, 0, 0], scale: [1, 1, 1] };
+        this.pendingTransform = identity;
+        this.applyTransform(activeRaw4D.entity, identity);
+        this.syncSceneTransformDataset(identity);
+        this.options.onTransformChange?.(this.getSceneTransform());
+      }
+      throw error;
+    } finally {
+      activeRaw4D.entity.enabled = wasEnabled;
+      this.app && (this.app.renderNextFrame = true);
+    }
   }
 
   // #WDD-gpt 2026-08-16 - 文件导入使用无历史记录的原子恢复入口，同时更新渲染实体、Gizmo 与 React 检查器。
@@ -1038,53 +1181,65 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
     });
   }
 
-  analyzeModelHealth(): ModelHealthReport {
-    if (!this.activeRaw4DAsset) throw new Error('没有可检查的 Gaussian 模型。');
-    const edits = this.activeRaw4D?.edits;
-    return inspectGaussianModel(this.activeRaw4DAsset, false, {
-      isDeleted: (stableId) => edits?.isDeleted(stableId) ?? false,
+  async analyzeModelHealth(): Promise<ModelHealthReport> {
+    const reports: ModelHealthReport[] = [];
+    await this.forEachModelHealthSource((asset, edits) => {
+      reports.push(inspectGaussianModel(asset, false, {
+        isDeleted: (stableId) => edits.isDeleted(stableId),
+      }));
     });
+    return mergeModelHealthReports(reports);
   }
 
-  async autoFixModelHealth(): Promise<ModelHealthReport> {
-    if (!this.activeRaw4DAsset || !this.activeRaw4D) throw new Error('没有可修复的 Gaussian 模型。');
-    const asset = this.activeRaw4DAsset;
-    const raw4D = this.activeRaw4D;
-    // #WDD-gpt 2026-08-16 - 删除候选必须在任何数值修复之前取证，避免修复生成的替代值反过来成为删除依据。
-    const invisibleStableIds = findCompletelyInvisibleStableIds(asset, {
-      isDeleted: (stableId) => raw4D.edits.isDeleted(stableId),
-    });
-    const repaired = inspectGaussianModel(asset, true, { includeVisibility: false });
-    if (repaired.fixedValues > 0) {
-      await raw4D.refreshSourceData();
-      raw4D.setAllMode(this.renderMode === 'all');
-      raw4D.setShBands(this.shLevel);
-      raw4D.setFrame(this.pendingFrame);
-    }
-    if (invisibleStableIds.length > 0) {
-      raw4D.edits.setDeleted(invisibleStableIds, true);
-      // #WDD-gpt 2026-08-16 - 健康检查删除仍是可撤销的稳定 ID 软标记，只有导出保存时才压实数据。
-      this.history.pushApplied({
-        label: 'delete-invisible',
-        undo: () => {
-          raw4D.edits.setDeleted(invisibleStableIds, false);
-          this.publishGaussianEditHistoryState(invisibleStableIds.length);
-        },
-        redo: () => {
-          raw4D.edits.setDeleted(invisibleStableIds, true);
-          this.publishGaussianEditHistoryState(invisibleStableIds.length);
-        },
+  async cleanCompletelyInvisibleGaussians(): Promise<ModelHealthReport> {
+    const reports: ModelHealthReport[] = [];
+    const deletionGroups: Array<{ edits: GaussianEditStore; stableIds: readonly number[] }> = [];
+    await this.forEachModelHealthSource((asset, edits) => {
+      // #WDD-gpt 2026-08-17 - 清理只读取原始 opacity 证据并写软删除位，不再顺带修改红点属性或刷新 Canonical/GPU 数据。
+      const report = inspectGaussianModel(asset, false, {
+        isDeleted: (stableId) => edits.isDeleted(stableId),
       });
-      this.publishGaussianEditHistoryState(invisibleStableIds.length);
-    }
-    const verified = inspectGaussianModel(asset, false, {
-      isDeleted: (stableId) => raw4D.edits.isDeleted(stableId),
+      reports.push(report);
+      const stableIds = findCompletelyInvisibleStableIds(asset, {
+        isDeleted: (stableId) => edits.isDeleted(stableId),
+      });
+      if (stableIds.length > 0) deletionGroups.push({ edits, stableIds });
     });
+    const inspected = mergeModelHealthReports(reports);
+    const markedDeletedPoints = this.markGaussianStableIdGroupsDeleted(
+      deletionGroups,
+      'delete-completely-invisible',
+    );
+    if (markedDeletedPoints > 0) this.publishGaussianEditHistoryState(markedDeletedPoints);
     return {
-      ...verified,
-      fixedValues: repaired.fixedValues,
-      markedDeletedPoints: invisibleStableIds.length,
+      ...inspected,
+      markedDeletedPoints,
+      safeDeletionCandidates: Math.max(0, inspected.safeDeletionCandidates - markedDeletedPoints),
     };
+  }
+
+  // #WDD-gpt 2026-08-17 - 健康检查和安全清理遍历序列编辑层全部片段；外部片段按需载入并立即释放，避免只清当前帧所在片段。
+  private async forEachModelHealthSource(
+    visitor: (asset: Raw4DAsset, edits: GaussianEditStore, segmentIndex: number) => void,
+  ): Promise<void> {
+    const sequence = this.gaussianSelectionSequence;
+    if (sequence) {
+      const controller = new AbortController();
+      for (let segmentIndex = 0; segmentIndex < sequence.edits.segmentCount; segmentIndex += 1) {
+        const lease = await sequence.acquireAsset(segmentIndex, controller.signal);
+        try {
+          visitor(lease.asset, sequence.edits.segment(segmentIndex).edits, segmentIndex);
+        } finally {
+          lease.release();
+        }
+        await Promise.resolve();
+      }
+      return;
+    }
+    if (!this.activeRaw4DAsset || !this.activeRaw4D) {
+      throw new Error('没有可检查的 Gaussian 模型。');
+    }
+    visitor(this.activeRaw4DAsset, this.activeRaw4D.edits, 0);
   }
 
   // #WDD-gpt 2026-08-15 - 为 UI 同步和浏览器验收提供只读变换/相机快照，不暴露底层 PlayCanvas 实体。
@@ -2513,7 +2668,10 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
     const point = this.gaussianSelectionCanvasPoint(event);
     drag.currentX = point.x;
     drag.currentY = point.y;
-    if (tool === 'select-brush') drag.path.push(point);
+    if (tool === 'select-brush') {
+      drag.path.push(point);
+      this.selectionBrushTrailPreview = drag.path.map((pathPoint) => ({ ...pathPoint }));
+    }
     const region = tool === 'select-brush'
       ? createGaussianBrushSelectionRegion(drag.path, this.selectionBrushRadius)
       : createGaussianRectSelectionRegion(normalizeGaussianSelectionRect(
@@ -2522,6 +2680,7 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
     const modifiers = this.mergeGaussianSelectionModifiers(drag.modifiers, event);
     this.finishGaussianSelectionDrag(event.pointerId);
     this.startGaussianSelectionRun(region, modifiers);
+    if (tool === 'select-brush') this.scheduleGaussianBrushTrailClear();
   };
 
   private readonly onGaussianSelectionPointerCancel = (event: PointerEvent): void => {
@@ -2567,6 +2726,7 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
     const brushTrailOverlay = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
     brushTrailOverlay.classList.add('gaussian-selection-brush-trail-overlay');
     brushTrailOverlay.setAttribute('aria-hidden', 'true');
+    brushTrailOverlay.setAttribute('preserveAspectRatio', 'none');
     brushTrailOverlay.style.display = 'none';
     const brushTrail = document.createElementNS('http://www.w3.org/2000/svg', 'path');
     brushTrail.classList.add('gaussian-selection-brush-trail');
@@ -2614,6 +2774,7 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
     this.selectionBrushOverlay = null;
     this.selectionBrushTrailOverlay = null;
     this.selectionBrushTrailShape = null;
+    this.clearGaussianBrushTrailPreview();
     this.selectionPolygonOverlay = null;
     this.selectionPolygonShape = null;
     this.selectionPolygonCursorLine = null;
@@ -2627,12 +2788,32 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
     this.updateGaussianBrushTrailOverlay();
   }
 
+  private clearGaussianBrushTrailPreview(): void {
+    if (this.selectionBrushTrailClearTimer !== null) {
+      window.clearTimeout(this.selectionBrushTrailClearTimer);
+      this.selectionBrushTrailClearTimer = null;
+    }
+    this.selectionBrushTrailPreview = [];
+    this.updateGaussianBrushTrailOverlay();
+  }
+
+  private scheduleGaussianBrushTrailClear(): void {
+    if (this.selectionBrushTrailClearTimer !== null) window.clearTimeout(this.selectionBrushTrailClearTimer);
+    // #WDD-gpt 2026-08-17 - 松开后短暂保留最终覆盖区，既便于核对实际范围，也避免选择计算期间痕迹瞬间消失。
+    this.selectionBrushTrailClearTimer = window.setTimeout(() => {
+      this.selectionBrushTrailClearTimer = null;
+      this.selectionBrushTrailPreview = [];
+      this.updateGaussianBrushTrailOverlay();
+    }, 420);
+  }
+
   private cancelGaussianSelectionRun(): void {
     this.selectionRunId += 1;
     this.selectionSegmentImportController?.abort();
     this.selectionSegmentImportController = null;
     const pointerId = this.selectionDrag?.pointerId;
     if (pointerId !== undefined) this.finishGaussianSelectionDrag(pointerId);
+    this.clearGaussianBrushTrailPreview();
     this.selectionPolygonPoints = [];
     this.selectionPolygonCursor = null;
     this.selectionPolygonModifiers = null;
@@ -2701,10 +2882,10 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
       return;
     }
     const offset = this.gaussianSelectionParentOffset();
-    const diameter = this.selectionBrushRadius * 2;
+    const { diameter, radius } = gaussianBrushScreenMetrics(this.selectionBrushRadius);
     overlay.hidden = false;
-    overlay.style.left = `${offset.x + point.x - this.selectionBrushRadius}px`;
-    overlay.style.top = `${offset.y + point.y - this.selectionBrushRadius}px`;
+    overlay.style.left = `${offset.x + point.x - radius}px`;
+    overlay.style.top = `${offset.y + point.y - radius}px`;
     overlay.style.width = `${diameter}px`;
     overlay.style.height = `${diameter}px`;
   }
@@ -2713,22 +2894,35 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
     const overlay = this.selectionBrushTrailOverlay;
     const shape = this.selectionBrushTrailShape;
     const drag = this.selectionDrag;
-    const active = this.selectionToolForEditor() === 'select-brush' && drag !== null && drag.path.length > 0;
+    const pathPoints = drag?.path.length ? drag.path : this.selectionBrushTrailPreview;
+    const active = this.selectionToolForEditor() === 'select-brush' && pathPoints.length > 0;
     if (!overlay || !shape || !active) {
       if (overlay) overlay.style.display = 'none';
       if (shape) shape.removeAttribute('d');
       return;
     }
+    const parent = this.canvas.parentElement;
+    if (!parent) return;
+    const canvasBounds = this.canvas.getBoundingClientRect();
     const offset = this.gaussianSelectionParentOffset();
-    const points = drag.path.map((point) => ({ x: point.x + offset.x, y: point.y + offset.y }));
+    // #WDD-gpt 2026-08-17 - SVG 视口严格贴合 Canvas CSS 像素矩形，避免父级边框、缩放和无 viewBox 默认坐标造成笔迹偏小或偏移。
+    overlay.style.inset = 'auto';
+    overlay.style.left = `${offset.x}px`;
+    overlay.style.top = `${offset.y}px`;
+    overlay.style.width = `${canvasBounds.width}px`;
+    overlay.style.height = `${canvasBounds.height}px`;
+    overlay.setAttribute('viewBox', `0 0 ${canvasBounds.width} ${canvasBounds.height}`);
+    const points = pathPoints;
     const first = points[0];
     // #WDD-gpt  2026-08-16 - 宽圆角 SVG 笔迹持续显示本次刷选覆盖区，松开后立即清除且不截获视口输入。
     const path = points.length === 1
       ? `M ${first.x} ${first.y} l 0.01 0`
       : points.map((point, index) => `${index === 0 ? 'M' : 'L'} ${point.x} ${point.y}`).join(' ');
+    const metrics = gaussianBrushScreenMetrics(this.selectionBrushRadius);
     overlay.style.display = 'block';
     shape.setAttribute('d', path);
-    shape.setAttribute('stroke-width', String(this.selectionBrushRadius * 2));
+    // #WDD-gpt 2026-08-17 - 半透明痕迹本体不再内缩，直径与圆形光标及真实命中区域完全相同。
+    shape.setAttribute('stroke-width', String(metrics.visibleDiameter));
   }
 
   private updateGaussianPolygonOverlay(): void {

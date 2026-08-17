@@ -6,6 +6,7 @@ import {
   gaussianSelectionIdsFromMask,
   gaussianSelectionModeFromModifiers,
   gaussianSelectionRectContains,
+  gaussianBrushScreenMetrics,
   normalizeGaussianSelectionRect,
 } from './GaussianScreenSelection';
 
@@ -36,6 +37,14 @@ describe('GaussianScreenSelection', () => {
     expect(polygon.contains(5, 5)).toBe(true);
     expect(polygon.contains(9, 9)).toBe(false);
     expect(polygon.contains(5, 10)).toBe(true);
+  });
+
+  it('keeps brush hit, cursor and trail dimensions on one CSS-pixel radius', () => {
+    expect(gaussianBrushScreenMetrics(48)).toEqual({ radius: 48, diameter: 96, visibleDiameter: 98 });
+    expect(gaussianBrushScreenMetrics(1)).toEqual({ radius: 2, diameter: 4, visibleDiameter: 6 });
+    const brush = createGaussianBrushSelectionRegion([{ x: 100, y: 100 }], 48);
+    expect(brush.contains(148, 100)).toBe(true);
+    expect(brush.contains(148.01, 100)).toBe(false);
   });
 
   it('maps editor modifiers and extracts stable IDs', () => {

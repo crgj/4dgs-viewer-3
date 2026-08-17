@@ -67,7 +67,7 @@ export async function createRaw4DGaussian(
   if (edits.pointCount !== asset.splatCount) {
     throw new Error(`Gaussian edit store point count ${edits.pointCount} does not match asset ${asset.splatCount}.`);
   }
-  const sampler = app.graphicsDevice.isWebGPU ? null : new Raw4DFrameSampler(asset);
+  let sampler = app.graphicsDevice.isWebGPU ? null : new Raw4DFrameSampler(asset);
   const resource = new Raw4DResource(app.graphicsDevice, asset);
   if (sampler) resource.centers = sampler.gsplatData.getCenters();
   resource.aabb.setMinMax(new Vec3(...asset.bounds.min), new Vec3(...asset.bounds.max));
@@ -124,6 +124,11 @@ export async function createRaw4DGaussian(
       if (disposed) return;
       resource.refreshSourceData();
       gpuPlayback.destroy();
+      // #WDD-gpt 2026-08-17 - Canonical 关键帧整体改写后重建 CPU Sampler，刷新 SLERP 对与静态 SH 视图，禁止继续复用旧旋转缓存。
+      if (!app.graphicsDevice.isWebGPU) {
+        sampler = new Raw4DFrameSampler(asset);
+        resource.centers = sampler.gsplatData.getCenters();
+      }
       gpuPlayback = await Raw4DGpuPlayback.create(
         entity, resource, sampler, asset, edits, app.graphicsDevice, gpuPool,
       );

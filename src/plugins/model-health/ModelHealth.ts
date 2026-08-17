@@ -12,12 +12,36 @@ export interface ModelHealthIssue {
   readonly severity: ModelHealthSeverity;
 }
 export interface ModelHealthReport {
+  readonly checkedPoints: number;
+  readonly checkedSegments: number;
   readonly checkedValues: number;
   readonly fixedValues: number;
   readonly healthy: boolean;
   readonly issues: readonly ModelHealthIssue[];
   readonly markedDeletedPoints: number;
   readonly safeDeletionCandidates: number;
+}
+
+// #WDD-gpt 2026-08-17 - 多片段健康检查按问题代码合并，确保清理结论覆盖整个时序模型而不只覆盖当前画面。
+export function mergeModelHealthReports(reports: readonly ModelHealthReport[]): ModelHealthReport {
+  const issues = new Map<string, ModelHealthIssue>();
+  for (const report of reports) {
+    for (const issue of report.issues) {
+      const previous = issues.get(issue.code);
+      issues.set(issue.code, previous ? { ...previous, count: previous.count + issue.count } : issue);
+    }
+  }
+  const mergedIssues = [...issues.values()];
+  return {
+    checkedPoints: reports.reduce((sum, report) => sum + report.checkedPoints, 0),
+    checkedSegments: reports.reduce((sum, report) => sum + report.checkedSegments, 0),
+    checkedValues: reports.reduce((sum, report) => sum + report.checkedValues, 0),
+    fixedValues: reports.reduce((sum, report) => sum + report.fixedValues, 0),
+    healthy: mergedIssues.length === 0,
+    issues: mergedIssues,
+    markedDeletedPoints: reports.reduce((sum, report) => sum + report.markedDeletedPoints, 0),
+    safeDeletionCandidates: reports.reduce((sum, report) => sum + report.safeDeletionCandidates, 0),
+  };
 }
 
 export interface ModelHealthInspectOptions {
@@ -264,6 +288,8 @@ export function inspectGaussianModel(
   }
   const issues = [...counts.entries()].map(([code, issue]) => ({ code, ...issue }));
   return {
+    checkedPoints: asset.splatCount,
+    checkedSegments: 1,
     checkedValues,
     fixedValues,
     healthy: issues.length === 0,

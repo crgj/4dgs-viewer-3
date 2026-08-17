@@ -38,6 +38,8 @@ import {
   type ViewportSelectionTool,
   type ViewportStatus,
   type ViewportTransform,
+  type ViewportTransformBakeProgress,
+  type ViewportTransformBakeResult,
   type ViewportTransformTool,
 } from '../features/viewport/runtime/ViewportRuntime';
 import { SmartAlignmentPanel } from '../plugins/smart-alignment/SmartAlignmentPanel';
@@ -46,14 +48,17 @@ import {
   INITIAL_SMART_ALIGNMENT_STATE,
   type SmartAlignmentState,
 } from '../plugins/smart-alignment/SmartAlignmentTypes';
-import { GS2MeshPanel } from '../plugins/gs2mesh/GS2MeshPanel';
 import { GS2MeshPlugin } from '../plugins/gs2mesh/GS2MeshPlugin';
 import {
   INITIAL_GS2MESH_STATE,
   type GS2MeshOptions,
   type GS2MeshState,
 } from '../plugins/gs2mesh/GS2MeshTypes';
-import { RelightingPanel } from '../plugins/relighting/RelightingPanel';
+import {
+  reconcileRelightingWorkflowStep,
+  RelightingWorkflowPanel,
+  type RelightingWorkflowStep,
+} from '../plugins/relighting/RelightingWorkflowPanel';
 import {
   INITIAL_RELIGHTING_STATE,
   type RelightingLightPatch,
@@ -74,8 +79,18 @@ import { GlobalTooltipLayer } from './components/GlobalTooltipLayer';
 import { ViewCube3D } from './components/ViewCube3D';
 import { ReleaseNotesDialog } from './components/ReleaseNotesDialog';
 import { MemoryPressureTestDialog } from './components/MemoryPressureTestDialog';
+import { AppNoticeDialog, type AppNoticeTone } from './components/AppNoticeDialog';
 import { parseReleaseNotes } from './releaseNotes';
 import type { BrowserMemoryPressureResult } from '../features/gaussian/memory/BrowserMemoryPressureTest';
+import {
+  PLY_SEQUENCE_DIRECTORY_PICKER_OPTIONS,
+  isDirectoryPickerAbort,
+} from './plySequenceDirectory';
+import {
+  createFourCgsSavePickerOptions,
+  isFilePickerAbort,
+  writeBlobToFileHandle,
+} from './fourCgsFileSave';
 
 type IconName =
   | 'cursor'
@@ -361,7 +376,7 @@ const gaussianRenderModes: Array<{
 
 type MenuName = 'file' | 'view' | 'plugins' | null;
 type InspectorTab = 'transform' | 'gaussian' | 'performance';
-type PluginId = 'smart-alignment' | 'gs2mesh' | 'relighting' | 'model-health';
+type PluginId = 'smart-alignment' | 'relighting' | 'model-health';
 type PluginStatusTone = 'idle' | 'running' | 'success' | 'error';
 type PluginWindowPosition = { readonly x: number; readonly y: number };
 
@@ -379,7 +394,6 @@ const pluginMenuItems: ReadonlyArray<{
   readonly descriptionKey: keyof UiCopy;
 }> = [
   { id: 'smart-alignment', mark: '✦', titleKey: 'pluginSmartAlignment', descriptionKey: 'pluginSmartAlignmentDescription' },
-  { id: 'gs2mesh', mark: '△', titleKey: 'pluginGS2Mesh', descriptionKey: 'pluginGS2MeshDescription' },
   { id: 'relighting', mark: '☀', titleKey: 'pluginRelighting', descriptionKey: 'pluginRelightingDescription' },
   { id: 'model-health', mark: '✓', titleKey: 'pluginModelHealth', descriptionKey: 'pluginModelHealthDescription' },
 ];
@@ -432,10 +446,25 @@ export function App() {
   const [smartAlignmentState, setSmartAlignmentState] = useState<SmartAlignmentState>(INITIAL_SMART_ALIGNMENT_STATE);
   const [gs2MeshState, setGS2MeshState] = useState<GS2MeshState>(INITIAL_GS2MESH_STATE);
   const [relightingState, setRelightingState] = useState<RelightingState>(INITIAL_RELIGHTING_STATE);
+  const [relightingWorkflowStep, setRelightingWorkflowStep] = useState<RelightingWorkflowStep>('mesh');
   const [gs2MeshVisible, setGS2MeshVisible] = useState(true);
   const [gaussianVisible, setGaussianVisible] = useState(true);
   const [modelHealthReport, setModelHealthReport] = useState<ModelHealthReport | null>(null);
   const [modelHealthBusy, setModelHealthBusy] = useState(false);
+  const [originBakeDialogVisible, setOriginBakeDialogVisible] = useState(false);
+  const [originBakeBusy, setOriginBakeBusy] = useState(false);
+  const [originBakeProgress, setOriginBakeProgress] = useState<ViewportTransformBakeProgress | null>(null);
+  const [originBakeResult, setOriginBakeResult] = useState<ViewportTransformBakeResult | null>(null);
+  const [originBakeError, setOriginBakeError] = useState<string | null>(null);
+  // #WDD-gpt 2026-08-17 - Chromium 禁止网页直接获准“下载”根目录，导出前先引导选择可写子目录。
+  const [plyDirectoryDialogVisible, setPlyDirectoryDialogVisible] = useState(false);
+  const [plyDirectoryPicking, setPlyDirectoryPicking] = useState(false);
+  const [plyDirectoryError, setPlyDirectoryError] = useState<string | null>(null);
+  const [appNotice, setAppNotice] = useState<{
+    readonly message: string;
+    readonly title: string;
+    readonly tone: AppNoticeTone;
+  } | null>(null);
   const [memoryMode, setMemoryMode] = useState<Gaussian4DMemoryMode>(DEFAULT_GAUSSIAN_4D_MEMORY_MODE);
   const [pendingLocalMaximumMode, setPendingLocalMaximumMode] = useState(false);
   const [releaseNotesVisible, setReleaseNotesVisible] = useState(false);
@@ -499,6 +528,40 @@ export function App() {
     window.addEventListener('keydown', closeOnEscape, true);
     return () => window.removeEventListener('keydown', closeOnEscape, true);
   }, [releaseNotesVisible]);
+  useEffect(() => {
+    if (!originBakeDialogVisible || originBakeBusy) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      setOriginBakeDialogVisible(false);
+    };
+    window.addEventListener('keydown', closeOnEscape, true);
+    return () => window.removeEventListener('keydown', closeOnEscape, true);
+  }, [originBakeBusy, originBakeDialogVisible]);
+  useEffect(() => {
+    if (!plyDirectoryDialogVisible || plyDirectoryPicking) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      setPlyDirectoryDialogVisible(false);
+      setPlyDirectoryError(null);
+    };
+    window.addEventListener('keydown', closeOnEscape, true);
+    return () => window.removeEventListener('keydown', closeOnEscape, true);
+  }, [plyDirectoryDialogVisible, plyDirectoryPicking]);
+  useEffect(() => {
+    if (!appNotice) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      setAppNotice(null);
+    };
+    window.addEventListener('keydown', closeOnEscape, true);
+    return () => window.removeEventListener('keydown', closeOnEscape, true);
+  }, [appNotice]);
   const cameraViewLabels = useMemo(
     () => Object.fromEntries(cameraViews.map((view) => [view.id, {
       long: UI_COPY[language][view.labelKey],
@@ -512,6 +575,14 @@ export function App() {
   const displaySceneName = sceneName ?? copy.untitledScene;
 
   const transformDisabled = status.phase !== 'ready' || status.splatCount === 0;
+  const transformControlsDisabled = transformDisabled || originBakeBusy;
+  const sceneScaleMaximum = Math.max(...sceneTransform.scale, 1);
+  const sceneScaleIsUniform = Math.abs(sceneTransform.scale[0] - sceneTransform.scale[1]) <= sceneScaleMaximum * 1e-6
+    && Math.abs(sceneTransform.scale[0] - sceneTransform.scale[2]) <= sceneScaleMaximum * 1e-6;
+  const sceneTransformIsIdentity = sceneTransform.position.every((value) => Math.abs(value) <= 1e-8)
+    && sceneTransform.rotation.every((value) => Math.abs(value) <= 1e-8)
+    && sceneTransform.scale.every((value) => Math.abs(value - 1) <= 1e-8);
+  const sceneRotationIsIdentity = sceneTransform.rotation.every((value) => Math.abs(value) <= 1e-8);
   const hasGS2Mesh = gs2MeshState.stage === 'success';
   const statusDeletedCount = selectionState.deletedCount ?? 0;
   const statusActiveCount = Math.max(0, (selectionState.pointCount ?? status.splatCount) - statusDeletedCount);
@@ -520,18 +591,24 @@ export function App() {
   const gaussianCountLocale = language === 'zh' ? 'zh-CN' : 'en-US';
   const sourceFile = sourceFiles.length === 1 ? sourceFiles[0] : null;
   const localizedStatusMessage = localizeRuntimeMessage(language, status.message);
+  const showAppNotice = (message: string, title?: string, tone: AppNoticeTone = 'error') => {
+    setAppNotice({
+      message,
+      title: title ?? (language === 'zh' ? '操作未完成' : 'Operation not completed'),
+      tone,
+    });
+  };
   const pluginStatusById: Readonly<Record<PluginId, PluginStatusTone>> = {
     'smart-alignment': smartAlignmentState.stage === 'success'
       ? 'success'
       : smartAlignmentState.stage === 'error'
         ? 'error'
         : smartAlignmentState.stage === 'idle' ? 'idle' : 'running',
-    gs2mesh: gs2MeshState.stage === 'success'
-      ? 'success'
-      : gs2MeshState.stage === 'error'
-        ? 'error'
-        : gs2MeshState.stage === 'idle' || gs2MeshState.stage === 'cancelled' ? 'idle' : 'running',
-    relighting: relightingState.error ? 'error' : relightingState.enabled ? 'success' : 'idle',
+    relighting: relightingState.error || gs2MeshState.stage === 'error'
+      ? 'error'
+      : ['capturing', 'matching', 'fusing', 'installing'].includes(gs2MeshState.stage)
+        ? 'running'
+        : relightingState.enabled ? 'success' : 'idle',
     'model-health': modelHealthBusy ? 'running' : modelHealthReport?.healthy ? 'success' : modelHealthReport ? 'error' : 'idle',
   };
   const activePluginItem = pluginMenuItems.find((plugin) => plugin.id === activePlugin) ?? null;
@@ -553,8 +630,22 @@ export function App() {
 
   useEffect(() => {
     if (!viewportRuntime) return;
-    setRelightingState(viewportRuntime.setRelightingEditing(activePlugin === 'relighting'));
-  }, [activePlugin, viewportRuntime]);
+    setRelightingState(viewportRuntime.setRelightingEditing(
+      activePlugin === 'relighting' && relightingWorkflowStep === 'lighting',
+    ));
+  }, [activePlugin, relightingWorkflowStep, viewportRuntime]);
+
+  const previousGS2MeshStageRef = useRef<GS2MeshState['stage']>(gs2MeshState.stage);
+  useEffect(() => {
+    const previousStage = previousGS2MeshStageRef.current;
+    previousGS2MeshStageRef.current = gs2MeshState.stage;
+    // #WDD-gpt 2026-08-17 - Step 1 首次成功后自动进入布光；Mesh 被清除或重建时退回 Step 1。
+    setRelightingWorkflowStep((current) => reconcileRelightingWorkflowStep(
+      current,
+      previousStage,
+      gs2MeshState.stage,
+    ));
+  }, [gs2MeshState.stage]);
 
   useEffect(() => {
     if (status.phase !== 'ready') return;
@@ -665,6 +756,34 @@ export function App() {
     setSceneTransform((current) => ({ ...current, [key]: initial[key] }));
   };
 
+  const openOriginBakeDialog = () => {
+    if (!viewportRuntime || transformDisabled || sceneTransformIsIdentity) return;
+    setIsPlaying(false);
+    setOriginBakeProgress(null);
+    setOriginBakeResult(null);
+    setOriginBakeError(null);
+    setOriginBakeDialogVisible(true);
+  };
+
+  const runOriginBake = async () => {
+    if (!viewportRuntime || originBakeBusy || !sceneScaleIsUniform) return;
+    setOriginBakeBusy(true);
+    setOriginBakeProgress(null);
+    setOriginBakeResult(null);
+    setOriginBakeError(null);
+    setIsPlaying(false);
+    setActiveTool('select');
+    try {
+      const result = await viewportRuntime.bakeSceneTransformIntoGaussianData(setOriginBakeProgress);
+      setOriginBakeResult(result);
+      setModelHealthReport(null);
+    } catch (error) {
+      setOriginBakeError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setOriginBakeBusy(false);
+    }
+  };
+
   const runSmartAlignment = () => {
     if (!viewportRuntime || transformDisabled) return;
     setIsPlaying(false);
@@ -731,6 +850,7 @@ export function App() {
   };
 
   const openPluginWorkspace = (plugin: PluginId) => {
+    if (plugin === 'relighting') setRelightingWorkflowStep(hasGS2Mesh ? 'lighting' : 'mesh');
     setActivePlugin(plugin);
     setPluginWindowMinimized(false);
     setPluginWindowPosition({ x: 0, y: 0 });
@@ -782,10 +902,69 @@ export function App() {
     window.setTimeout(() => URL.revokeObjectURL(url), 0);
   };
 
+  const commitExportBlob = async (
+    blob: Blob,
+    filename: string,
+    fileHandle: FileSystemFileHandle | null = null,
+  ) => {
+    if (fileHandle) {
+      await writeBlobToFileHandle(fileHandle, blob);
+      return;
+    }
+    downloadBlob(blob, filename);
+  };
+
   // #WDD-gpt  2026-08-16 - RAW4D 保存时根据软删除位集输出压实文件；编辑中的源数据保持稳定 ID。
   const exportWorkspace = async () => {
     setOpenMenu(null);
-    if (status.format === 'RAW4D' && sourceFiles.length > 0) {
+    // #WDD-gpt 2026-08-17 - 所有场景文件导出在读取当前帧数据前先暂停，避免编码期间时间轴继续变化。
+    setIsPlaying(false);
+    const canonicalDataDirty = viewportRuntime?.hasCanonicalGaussianDataChanges() ?? false;
+    const exportsFourCgs = status.format === 'RAW4D' || status.format === '4CGS';
+    let fourCgsFileHandle: FileSystemFileHandle | null = null;
+    if (exportsFourCgs) {
+      if (status.format === '4CGS' && !canonicalDataDirty && !sourceFile) {
+        showAppNotice(
+          language === 'zh' ? '当前 4CGS 场景缺少可保存的源文件。' : 'The current 4CGS scene has no source file to save.',
+          language === 'zh' ? '无法导出 4CGS' : 'Cannot export 4CGS',
+        );
+        return;
+      }
+      if (status.format === '4CGS' && !canonicalDataDirty && (viewportRuntime?.getGaussianDeletionCount() ?? 0) > 0) {
+        showAppNotice(
+          language === 'zh'
+            ? '4CGS V2.4 前端当前采用只读压缩载荷。请撤销高斯删除后再无损另存；不会静默丢弃编辑。'
+            : 'The current 4CGS V2.4 payload is read-only in the browser. Undo Gaussian deletions before saving; edits will not be discarded silently.',
+          language === 'zh' ? '当前编辑无法写入' : 'Current edits cannot be saved',
+          'warning',
+        );
+        return;
+      }
+      if (typeof window.showSaveFilePicker !== 'function') {
+        showAppNotice(
+          language === 'zh'
+            ? '当前浏览器不支持 4CGS“另存为”文件授权，请使用最新版 Chrome 或 Edge。'
+            : 'This browser does not support the 4CGS save-as file permission flow. Use a recent Chrome or Edge release.',
+          language === 'zh' ? '浏览器不支持选择保存位置' : 'Save location picker unavailable',
+          'warning',
+        );
+        return;
+      }
+      const stem = (sceneName ?? status.objectName ?? 'dong-editor-3').replace(/\.(?:4cgs|raw4d|ply4)$/i, '');
+      try {
+        // #WDD-gpt 2026-08-17 - 4CGS 是单文件，使用另存为窗口选择目录和文件名，而非申请整个目录权限。
+        fourCgsFileHandle = await window.showSaveFilePicker(createFourCgsSavePickerOptions(`${stem}.4cgs`));
+      } catch (error) {
+        if (isFilePickerAbort(error)) return;
+        showAppNotice(
+          error instanceof Error ? error.message : String(error),
+          language === 'zh' ? '无法选择 4CGS 保存位置' : 'Cannot choose a 4CGS save location',
+        );
+        return;
+      }
+    }
+    if ((status.format === 'RAW4D' && sourceFiles.length > 0)
+      || (status.format === '4CGS' && canonicalDataDirty)) {
       // #WDD-gpt 2026-08-16 - RAW4D 默认导出冻结当前 Canonical RAM 与编辑位集，不再回读拖入时的 File 属性载荷。
       const controller = new AbortController();
       exportAbortRef.current = controller;
@@ -804,7 +983,10 @@ export function App() {
       });
       try {
         if (!viewportRuntime) throw new Error('视口编辑状态尚未就绪。');
-        const memorySnapshots = viewportRuntime.snapshotRaw4DExportMemory(sourceFiles);
+        // #WDD-gpt 2026-08-17 - 4CGS 原点烘焙后必须从已修改 Canonical RAM 重编码；未修改容器仍保留下面的无损快速另存路径。
+        const memorySnapshots = status.format === '4CGS'
+          ? viewportRuntime.snapshotResidentSequenceExportMemory()
+          : viewportRuntime.snapshotRaw4DExportMemory(sourceFiles);
         const result = await encodeRaw4DMemoryAsFourCgs(memorySnapshots, (progress) => {
           setExportProgress(progress.ratio);
           setExportMonitor((current) => {
@@ -821,7 +1003,7 @@ export function App() {
         setExportMonitor((current) => current ? {
           ...current,
           progress: {
-            ratio: 0.98, message: '正在写入场景变换并提交浏览器下载', stage: '最终文件提交',
+            ratio: 0.98, message: '正在写入场景变换并提交到所选 4CGS 文件', stage: '最终文件提交',
             stageRatio: 0.5, workerCount: result.encodeTimings?.workerCount ?? 1,
             completedTasks: 8, totalTasks: 8,
           },
@@ -833,13 +1015,14 @@ export function App() {
         const blob = await writeFourCgsFile(result.blob, sceneTransform);
         if (controller.signal.aborted) throw new DOMException('4CGS 保存已取消。', 'AbortError');
         setExportProgress(1);
-        downloadBlob(blob, result.filename);
+        const outputFilename = fourCgsFileHandle?.name ?? result.filename;
+        await commitExportBlob(blob, result.filename, fourCgsFileHandle);
         setExportElapsedMs(performance.now() - exportStartedAtRef.current);
         setExportMonitor((current) => current ? {
           ...current,
           phase: 'success', result, outputBytes: blob.size,
           progress: {
-            ratio: 1, message: `已生成并下载 ${result.filename}`, stage: '完成', stageRatio: 1,
+            ratio: 1, message: `已生成并保存 ${outputFilename}`, stage: '完成', stageRatio: 1,
             workerCount: result.encodeTimings?.workerCount ?? current.progress.workerCount,
             completedTasks: 8, totalTasks: 8,
           },
@@ -870,18 +1053,17 @@ export function App() {
     }
     if (status.format === '4CGS') {
       if (!sourceFile) return;
-      if ((viewportRuntime?.getGaussianDeletionCount() ?? 0) > 0) {
-        window.alert('4CGS V2.4 前端当前采用只读压缩载荷。请撤销高斯删除后再无损另存；不会静默丢弃编辑。');
-        return;
-      }
       setExportProgress(0.05);
       try {
         const blob = await writeFourCgsFile(sourceFile, sceneTransform);
         setExportProgress(1);
         const stem = (sceneName ?? status.objectName ?? 'dong-editor-3').replace(/\.4cgs$/i, '');
-        downloadBlob(blob, `${stem}.4cgs`);
+        await commitExportBlob(blob, `${stem}.4cgs`, fourCgsFileHandle);
       } catch (error) {
-        window.alert(error instanceof Error ? error.message : String(error));
+        showAppNotice(
+          error instanceof Error ? error.message : String(error),
+          language === 'zh' ? '4CGS 保存失败' : '4CGS save failed',
+        );
       } finally {
         setExportProgress(null);
       }
@@ -895,7 +1077,10 @@ export function App() {
         const stem = (sceneName ?? status.objectName ?? 'dong-editor-3').replace(/\.(?:raw4d|ply4)$/i, '');
         downloadBlob(blob, `${stem}.${preservePly4Extension ? 'ply4' : 'raw4d'}`);
       } catch (error) {
-        window.alert(error instanceof Error ? error.message : String(error));
+        showAppNotice(
+          error instanceof Error ? error.message : String(error),
+          language === 'zh' ? '场景导出失败' : 'Scene export failed',
+        );
       } finally {
         setExportProgress(null);
       }
@@ -926,35 +1111,8 @@ export function App() {
     downloadBlob(workspaceBlob, 'dong-editor-3-workspace.json');
   };
 
-  // #WDD-gpt 2026-08-17 - 文件菜单导出子菜单的 .ply 序列：选择本地目录后逐帧直写，不再打包 ZIP。
-  const exportPlySequence = async () => {
-    setOpenMenu(null);
-    if (!viewportRuntime || !status.format || status.format === 'Procedural') {
-      window.alert(language === 'zh'
-        ? '当前场景没有 RAW4D / 4CGS 序列数据，无法导出 .ply 序列。'
-        : 'The current scene has no RAW4D / 4CGS sequence data to export as .ply frames.');
-      return;
-    }
-    if (typeof window.showDirectoryPicker !== 'function') {
-      window.alert(language === 'zh'
-        ? '当前浏览器不支持选择本地写入目录（需要 File System Access API，如 Chrome/Edge）。'
-        : 'This browser does not support picking a local output directory (File System Access API).');
-      return;
-    }
-    let directory: FileSystemDirectoryHandle;
-    try {
-      directory = await window.showDirectoryPicker({
-        id: 'dong-editor-3-ply-sequence',
-        mode: 'readwrite',
-      });
-    } catch (error) {
-      // 用户在目录选择器里取消不算错误，保持静默返回。
-      if (error instanceof DOMException && error.name === 'AbortError') return;
-      window.alert(language === 'zh'
-        ? `选择目录失败：${error instanceof Error ? error.message : String(error)}`
-        : `Failed to pick a directory: ${error instanceof Error ? error.message : String(error)}`);
-      return;
-    }
+  // #WDD-gpt 2026-08-17 - 文件菜单导出子菜单的 .ply 序列：获准目录后逐帧直写，不再打包 ZIP。
+  const runPlySequenceExport = async (runtime: ViewportRuntime, directory: FileSystemDirectoryHandle) => {
     const controller = new AbortController();
     exportAbortRef.current = controller;
     exportStartedAtRef.current = performance.now();
@@ -971,7 +1129,7 @@ export function App() {
       logs: [{ elapsedMs: 0, message: `开始向目录 ${directory.name} 导出 .ply 序列` }],
     });
     try {
-      const sources = viewportRuntime.snapshotResidentSequenceExportMemory();
+      const sources = runtime.snapshotResidentSequenceExportMemory();
       const result = await exportRaw4DSequenceAsPlyDirectory(sources, directory, (progress) => {
         setExportProgress(progress.ratio);
         setExportMonitor((current) => {
@@ -1038,6 +1196,65 @@ export function App() {
     }
   };
 
+  const exportPlySequence = () => {
+    setOpenMenu(null);
+    // #WDD-gpt 2026-08-17 - 目录选择也属于导出流程，打开系统选择器前固定当前帧。
+    setIsPlaying(false);
+    if (!viewportRuntime || !status.format || status.format === 'Procedural') {
+      showAppNotice(
+        language === 'zh'
+          ? '当前场景没有 RAW4D / 4CGS 序列数据，无法导出 .ply 序列。'
+          : 'The current scene has no RAW4D / 4CGS sequence data to export as .ply frames.',
+        language === 'zh' ? '无法导出 PLY 序列' : 'Cannot export PLY sequence',
+      );
+      return;
+    }
+    if (typeof window.showDirectoryPicker !== 'function') {
+      showAppNotice(
+        language === 'zh'
+          ? '当前浏览器不支持选择本地写入目录（需要 File System Access API，如 Chrome/Edge）。'
+          : 'This browser does not support picking a local output directory (File System Access API).',
+        language === 'zh' ? '浏览器不支持目录写入' : 'Directory writing unavailable',
+        'warning',
+      );
+      return;
+    }
+    setPlyDirectoryError(null);
+    setPlyDirectoryDialogVisible(true);
+  };
+
+  const choosePlySequenceDirectory = async () => {
+    const runtime = viewportRuntime;
+    if (!runtime || typeof window.showDirectoryPicker !== 'function' || plyDirectoryPicking) return;
+    setPlyDirectoryPicking(true);
+    setPlyDirectoryError(null);
+    let directory: FileSystemDirectoryHandle;
+    try {
+      directory = await window.showDirectoryPicker(PLY_SEQUENCE_DIRECTORY_PICKER_OPTIONS);
+    } catch (error) {
+      if (isDirectoryPickerAbort(error)) {
+        setPlyDirectoryError(language === 'zh'
+          ? '尚未选择输出目录。如果浏览器提示“包含系统文件”，请在“下载”中新建并进入一个子文件夹后再选择。'
+          : 'No output folder was selected. If the browser reports system files, create and enter a subfolder inside Downloads, then choose it.');
+      } else {
+        setPlyDirectoryError(language === 'zh'
+          ? `无法使用所选目录：${error instanceof Error ? error.message : String(error)}`
+          : `The selected folder cannot be used: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      setPlyDirectoryPicking(false);
+      return;
+    }
+    setPlyDirectoryPicking(false);
+    setPlyDirectoryDialogVisible(false);
+    await runPlySequenceExport(runtime, directory);
+  };
+
+  const exportGS2Mesh = () => {
+    // #WDD-gpt 2026-08-17 - 插件内 Mesh PLY 导出与主文件导出保持一致，先暂停播放再下载当前结果。
+    setIsPlaying(false);
+    gs2MeshPluginRef.current?.exportLastResult();
+  };
+
   const cancelExport = () => exportAbortRef.current?.abort();
 
   const closeExportMonitor = () => {
@@ -1063,10 +1280,15 @@ export function App() {
     setSmartAlignmentState(INITIAL_SMART_ALIGNMENT_STATE);
     setGS2MeshState(INITIAL_GS2MESH_STATE);
     setRelightingState(INITIAL_RELIGHTING_STATE);
+    setRelightingWorkflowStep('mesh');
     setSelectionState(INITIAL_VIEWPORT_SELECTION_STATE);
     setGS2MeshVisible(true);
     setGaussianVisible(true);
     setModelHealthReport(null);
+    setOriginBakeDialogVisible(false);
+    setOriginBakeProgress(null);
+    setOriginBakeResult(null);
+    setOriginBakeError(null);
     setActivePlugin(null);
     setInspectorPanelVisible(true);
     setInspectorTab('transform');
@@ -1119,26 +1341,34 @@ export function App() {
     setSmartAlignmentState(INITIAL_SMART_ALIGNMENT_STATE);
     setGS2MeshState(INITIAL_GS2MESH_STATE);
     setRelightingState(INITIAL_RELIGHTING_STATE);
+    setRelightingWorkflowStep('mesh');
     setSelectionState(INITIAL_VIEWPORT_SELECTION_STATE);
     setGS2MeshVisible(true);
     setGaussianVisible(true);
     setModelHealthReport(null);
+    setOriginBakeDialogVisible(false);
+    setOriginBakeProgress(null);
+    setOriginBakeResult(null);
+    setOriginBakeError(null);
     setActivePlugin(null);
     setCurrentFrame(0);
     setIsPlaying(false);
     setOpenMenu(null);
   };
 
-  const runModelHealth = async (repair: boolean) => {
+  const runModelHealth = async (clean: boolean) => {
     if (!viewportRuntime || modelHealthBusy) return;
     setModelHealthBusy(true);
     try {
-      const report = repair
-        ? await viewportRuntime.autoFixModelHealth()
-        : viewportRuntime.analyzeModelHealth();
+      const report = clean
+        ? await viewportRuntime.cleanCompletelyInvisibleGaussians()
+        : await viewportRuntime.analyzeModelHealth();
       setModelHealthReport(report);
     } catch (error) {
-      window.alert(error instanceof Error ? error.message : String(error));
+      showAppNotice(
+        error instanceof Error ? error.message : String(error),
+        language === 'zh' ? '模型健康操作失败' : 'Model health operation failed',
+      );
     } finally {
       setModelHealthBusy(false);
     }
@@ -1239,7 +1469,7 @@ export function App() {
                     <button disabled={exportProgress !== null} onClick={() => void exportWorkspace()} type="button">
                       <span>{copy.exportFourCgsFile}</span>
                     </button>
-                    <button disabled={exportProgress !== null} onClick={() => void exportPlySequence()} type="button">
+                    <button disabled={exportProgress !== null} onClick={exportPlySequence} type="button">
                       <span>{copy.exportPlySequence}</span>
                     </button>
                   </div>
@@ -1358,6 +1588,16 @@ export function App() {
         />
       )}
 
+      {appNotice && (
+        <AppNoticeDialog
+          confirmLabel={language === 'zh' ? '确定' : 'OK'}
+          message={appNotice.message}
+          onClose={() => setAppNotice(null)}
+          title={appNotice.title}
+          tone={appNotice.tone}
+        />
+      )}
+
       {memoryPressureDialogVisible && (
         <MemoryPressureTestDialog
           availableBudgetBytes={Math.max(0, memoryPolicy.cpuBudgetBytes - memoryUsage.managedCpuBytes)}
@@ -1367,6 +1607,116 @@ export function App() {
           onClose={() => setMemoryPressureDialogVisible(false)}
           onComplete={setLastMemoryPressureResult}
         />
+      )}
+
+      {originBakeDialogVisible && (
+        <div className="memory-confirm-backdrop origin-bake-backdrop" data-camera-input-block>
+          <section aria-label={copy.bakeOriginDialogTitle} aria-modal="true" className="memory-confirm-dialog origin-bake-dialog" role="dialog">
+            <header>
+              <span>{copy.bakeOriginKicker}</span>
+              <strong>{originBakeResult ? copy.bakeOriginComplete : copy.bakeOriginDialogTitle}</strong>
+              <p>{copy.bakeOriginDialogDescription}</p>
+            </header>
+            <dl>
+              <div><dt>{copy.bakeOriginPositionRule}</dt><dd>{copy.bakeOriginAllKeys}</dd></div>
+              <div><dt>{copy.bakeOriginCovarianceRule}</dt><dd>{copy.bakeOriginAllKeys}</dd></div>
+              <div><dt>{copy.bakeOriginShRule}</dt><dd>{sceneRotationIsIdentity ? copy.bakeOriginNoRotation : copy.bakeOriginShSynchronized}</dd></div>
+            </dl>
+            {!sceneScaleIsUniform && !originBakeResult && (
+              <p className="memory-confirm-warning origin-bake-blocked">{copy.bakeOriginNonUniformWarning}</p>
+            )}
+            {sceneScaleIsUniform && !originBakeResult && !originBakeError && (
+              <p className="memory-confirm-warning">{copy.bakeOriginWarning}</p>
+            )}
+            {originBakeError && <p className="memory-confirm-warning origin-bake-error">{originBakeError}</p>}
+            {originBakeBusy && originBakeProgress && (
+              <div className="origin-bake-progress">
+                <div>
+                  <span>{copy.bakeOriginRunning} · {originBakeProgress.stage === 'position' ? copy.position
+                    : originBakeProgress.stage === 'rotation' ? copy.rotation
+                      : originBakeProgress.stage === 'scale' ? copy.scale
+                        : originBakeProgress.stage === 'sh' ? 'SH'
+                          : originBakeProgress.stage === 'upload' ? 'GPU'
+                            : copy.ready}</span>
+                  <b>{Math.round(originBakeProgress.ratio * 100)}%</b>
+                </div>
+                <div aria-label={copy.bakeOriginRunning} className="origin-bake-progress-track" role="progressbar" aria-valuemax={100} aria-valuemin={0} aria-valuenow={Math.round(originBakeProgress.ratio * 100)}>
+                  <i style={{ width: `${Math.max(0, Math.min(1, originBakeProgress.ratio)) * 100}%` }} />
+                </div>
+                <small>{copy.bakeOriginSegments} {originBakeProgress.segmentIndex + 1}/{originBakeProgress.segmentCount}</small>
+              </div>
+            )}
+            {originBakeResult && (
+              <dl className="origin-bake-result">
+                <div><dt>{copy.bakeOriginSegments}</dt><dd>{originBakeResult.segmentCount}</dd></div>
+                <div><dt>{copy.bakeOriginPoints}</dt><dd>{originBakeResult.pointCount.toLocaleString(language === 'zh' ? 'zh-CN' : 'en-US')}</dd></div>
+                <div><dt>SH</dt><dd>{originBakeResult.shRotated ? `SH${originBakeResult.shBands} ✓` : copy.bakeOriginNoRotation}</dd></div>
+              </dl>
+            )}
+            <footer>
+              {!originBakeResult && (
+                <button className="quiet-button" disabled={originBakeBusy} onClick={() => setOriginBakeDialogVisible(false)} type="button">{copy.cancel}</button>
+              )}
+              {originBakeResult
+                ? <button autoFocus className="primary-button" onClick={() => setOriginBakeDialogVisible(false)} type="button">{copy.bakeOriginClose}</button>
+                : <button autoFocus className="primary-button" disabled={originBakeBusy || !sceneScaleIsUniform} onClick={() => void runOriginBake()} type="button">{originBakeBusy ? copy.bakeOriginRunning : copy.bakeOriginConfirm}</button>}
+            </footer>
+          </section>
+        </div>
+      )}
+
+      {plyDirectoryDialogVisible && (
+        <div className="memory-confirm-backdrop ply-directory-backdrop" data-camera-input-block>
+          <section
+            aria-label={language === 'zh' ? '选择 PLY 序列输出目录' : 'Choose PLY sequence output folder'}
+            aria-modal="true"
+            className="memory-confirm-dialog ply-directory-dialog"
+            role="dialog"
+          >
+            <header>
+              <span>PLY SEQUENCE · LOCAL FOLDER</span>
+              <strong>{language === 'zh' ? '选择一个“下载”子文件夹' : 'Choose a Downloads subfolder'}</strong>
+              <p>{language === 'zh'
+                ? 'Chrome / Edge 为防止网页读取整个下载历史，会拒绝“下载”根目录的读写授权。序列导出必须使用其中的专用子文件夹。'
+                : 'Chrome and Edge block read/write access to the Downloads root to protect the complete download history. Sequence export must use a dedicated subfolder.'}</p>
+            </header>
+            <div className="ply-directory-path" aria-label={language === 'zh' ? '推荐目录' : 'Recommended folder'}>
+              <span>{language === 'zh' ? '下载' : 'Downloads'}</span>
+              <b aria-hidden="true">/</b>
+              <strong>DongEditor3-PLY</strong>
+            </div>
+            <ol className="ply-directory-steps">
+              <li>{language === 'zh' ? '在即将打开的“下载”目录中新建或进入一个子文件夹。' : 'Create or enter a subfolder in the Downloads folder that opens.'}</li>
+              <li>{language === 'zh' ? '进入该子文件夹后点击“选择文件夹”；不要选择“下载”本身。' : 'Enter that subfolder, then choose it; do not choose Downloads itself.'}</li>
+            </ol>
+            <p className="memory-confirm-warning">
+              {language === 'zh'
+                ? '浏览器安全限制无法由网页关闭。首次授权后，后续导出会记住这个专用目录。'
+                : 'A webpage cannot disable this browser security rule. After approval, later exports remember this dedicated folder.'}
+            </p>
+            {plyDirectoryError && <p className="ply-directory-error" role="alert">{plyDirectoryError}</p>}
+            <footer>
+              <button
+                className="quiet-button"
+                disabled={plyDirectoryPicking}
+                onClick={() => {
+                  setPlyDirectoryDialogVisible(false);
+                  setPlyDirectoryError(null);
+                }}
+                type="button"
+              >{language === 'zh' ? '取消' : 'Cancel'}</button>
+              <button
+                autoFocus
+                className="primary-button"
+                disabled={plyDirectoryPicking}
+                onClick={() => void choosePlySequenceDirectory()}
+                type="button"
+              >{plyDirectoryPicking
+                  ? (language === 'zh' ? '正在打开…' : 'Opening…')
+                  : (language === 'zh' ? '打开下载目录' : 'Open Downloads')}</button>
+            </footer>
+          </section>
+        </div>
       )}
 
       {exportMonitor && (
@@ -1764,13 +2114,30 @@ export function App() {
             {inspectorTab === 'transform' && (
               <section aria-labelledby="inspector-tab-transform" className="inspector-section" id="inspector-panel-transform" role="tabpanel">
                 {/* #WDD-gpt 2026-08-16 - 变换统一使用世界空间，移除无实际工作流价值的局部/世界重复开关。 */}
-                <TransformVectorEditor disabled={transformDisabled} label={copy.position} max={100_000} min={-100_000} onChange={(axis, value) => updateTransformVector('position', axis, value)} onReset={() => resetTransformVector('position')} precision={3} resetLabel={copy.reset} scrubStep={0.02} step={0.1} values={sceneTransform.position} />
-                <TransformVectorEditor disabled={transformDisabled} label={copy.rotation} max={360} min={-360} onChange={(axis, value) => updateTransformVector('rotation', axis, value)} onReset={() => resetTransformVector('rotation')} precision={2} resetLabel={copy.reset} scrubStep={0.5} step={1} values={sceneTransform.rotation} />
+                <TransformVectorEditor disabled={transformControlsDisabled} label={copy.position} max={100_000} min={-100_000} onChange={(axis, value) => updateTransformVector('position', axis, value)} onReset={() => resetTransformVector('position')} precision={3} resetLabel={copy.reset} scrubStep={0.02} step={0.1} values={sceneTransform.position} />
+                <TransformVectorEditor disabled={transformControlsDisabled} label={copy.rotation} max={360} min={-360} onChange={(axis, value) => updateTransformVector('rotation', axis, value)} onReset={() => resetTransformVector('rotation')} precision={2} resetLabel={copy.reset} scrubStep={0.5} step={1} values={sceneTransform.rotation} />
                 <div className="scale-link-row">
                   <span>{copy.uniformScale}</span>
-                  <button aria-pressed={uniformScale} className={uniformScale ? 'scale-link active' : 'scale-link'} onClick={() => setUniformScale((linked) => !linked)} type="button">{uniformScale ? '●' : '○'}</button>
+                  <button aria-pressed={uniformScale} className={uniformScale ? 'scale-link active' : 'scale-link'} disabled={transformControlsDisabled} onClick={() => setUniformScale((linked) => !linked)} type="button">{uniformScale ? '●' : '○'}</button>
                 </div>
-                <TransformVectorEditor disabled={transformDisabled} label={copy.scale} max={1_000} min={0.001} onChange={(axis, value) => updateTransformVector('scale', axis, value)} onReset={() => resetTransformVector('scale')} precision={3} resetLabel={copy.reset} scrubStep={0.01} step={0.05} values={sceneTransform.scale} />
+                <TransformVectorEditor disabled={transformControlsDisabled} label={copy.scale} max={1_000} min={0.001} onChange={(axis, value) => updateTransformVector('scale', axis, value)} onReset={() => resetTransformVector('scale')} precision={3} resetLabel={copy.reset} scrubStep={0.01} step={0.05} values={sceneTransform.scale} />
+                {/* #WDD-gpt 2026-08-17 - 原点重设作为独立高风险操作放在变换数值下方，先说明会改写 Canonical 全关键帧再进入确认框。 */}
+                <div className="transform-origin-card">
+                  <div>
+                    <strong>{copy.bakeOriginTitle}</strong>
+                    <p>{copy.bakeOriginDescription}</p>
+                  </div>
+                  <button
+                    className="quiet-button has-tip"
+                    data-tip={copy.bakeOriginTip}
+                    disabled={transformControlsDisabled || sceneTransformIsIdentity}
+                    onClick={openOriginBakeDialog}
+                    type="button"
+                  >
+                    <Icon name="move" size={14} />
+                    {copy.bakeOriginButton}
+                  </button>
+                </div>
                 {/* #WDD-gpt 2026-08-16 - 未删除点外包络诊断独立于网格和坐标轴，默认关闭以免干扰正常编辑。 */}
                 <div className="scale-link-row gaussian-envelope-toggle-row">
                   <span>{copy.gaussianEnvelope}</span>
@@ -1908,35 +2275,38 @@ export function App() {
                 {activePlugin === 'smart-alignment' && (
                   <SmartAlignmentPanel disabled={transformDisabled} language={language} onRun={runSmartAlignment} state={smartAlignmentState} />
                 )}
-                {activePlugin === 'gs2mesh' && (
-                  <GS2MeshPanel
-                    canExport={gs2MeshPluginRef.current?.canExport ?? false}
-                    disabled={transformDisabled}
-                    gaussianVisible={gaussianVisible}
-                    language={language}
-                    meshVisible={gs2MeshVisible}
-                    onCancel={() => gs2MeshPluginRef.current?.cancel()}
-                    onClear={clearGS2Mesh}
-                    onExport={() => gs2MeshPluginRef.current?.exportLastResult()}
-                    onGaussianVisibleChange={changeGaussianVisible}
-                    onMeshVisibleChange={changeGS2MeshVisible}
-                    onRun={runGS2Mesh}
-                    state={gs2MeshState}
-                  />
-                )}
                 {activePlugin === 'relighting' && (
-                  <RelightingPanel
-                    hasMesh={hasGS2Mesh}
+                  <RelightingWorkflowPanel
+                    gs2mesh={{
+                      canExport: gs2MeshPluginRef.current?.canExport ?? false,
+                      disabled: transformDisabled,
+                      gaussianVisible,
+                      language,
+                      meshVisible: gs2MeshVisible,
+                      onCancel: () => gs2MeshPluginRef.current?.cancel(),
+                      onClear: clearGS2Mesh,
+                      onExport: exportGS2Mesh,
+                      onGaussianVisibleChange: changeGaussianVisible,
+                      onMeshVisibleChange: changeGS2MeshVisible,
+                      onRun: runGS2Mesh,
+                      state: gs2MeshState,
+                    }}
                     language={language}
-                    meshVisible={gs2MeshVisible}
-                    onAddLight={addRelightingLight}
-                    onEnabledChange={changeRelightingEnabled}
-                    onLightChange={updateRelightingLight}
-                    onMeshVisibleChange={changeGS2MeshVisible}
-                    onRemoveLight={removeRelightingLight}
-                    onSelectLight={selectRelightingLight}
-                    onSettingsChange={updateRelightingSettings}
-                    state={relightingState}
+                    onStepChange={setRelightingWorkflowStep}
+                    relighting={{
+                      hasMesh: hasGS2Mesh,
+                      language,
+                      meshVisible: gs2MeshVisible,
+                      onAddLight: addRelightingLight,
+                      onEnabledChange: changeRelightingEnabled,
+                      onLightChange: updateRelightingLight,
+                      onMeshVisibleChange: changeGS2MeshVisible,
+                      onRemoveLight: removeRelightingLight,
+                      onSelectLight: selectRelightingLight,
+                      onSettingsChange: updateRelightingSettings,
+                      state: relightingState,
+                    }}
+                    step={relightingWorkflowStep}
                   />
                 )}
                 {activePlugin === 'model-health' && (
@@ -1944,7 +2314,7 @@ export function App() {
                     busy={modelHealthBusy}
                     disabled={transformDisabled}
                     onAnalyze={() => { void runModelHealth(false); }}
-                    onRepair={() => { void runModelHealth(true); }}
+                    onClean={() => { void runModelHealth(true); }}
                     report={modelHealthReport}
                   />
                 )}

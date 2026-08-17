@@ -61,7 +61,7 @@ input:focus-visible {
   --accent-stroke: rgba(36, 201, 151, 0.36);
   display: grid;
   /* #WDD-gpt 2026-08-15 - 压缩非视口行高，让编辑器控制区保持可用但不抢占画布面积。 */
-  grid-template-rows: 48px minmax(0, 1fr) 48px 20px;
+  grid-template-rows: 48px minmax(0, 1fr) 48px 32px;
   width: 100%;
   height: 100%;
   overflow: hidden;
@@ -1012,6 +1012,157 @@ input:focus-visible {
   gap: 8px;
 }
 
+/* #WDD-gpt 2026-08-17 - 应用内通知框覆盖全部浏览器 alert，并始终高于插件、提示和其他确认框。 */
+.app-notice-backdrop {
+  z-index: 44000;
+}
+
+.app-notice-dialog {
+  width: min(440px, calc(100vw - 32px));
+}
+
+.app-notice-dialog.error {
+  border-color: rgba(255, 105, 94, 0.32);
+  background:
+    radial-gradient(circle at 92% 0%, rgba(255, 83, 71, 0.11), transparent 42%),
+    linear-gradient(150deg, rgba(27, 22, 24, 0.99), rgba(10, 10, 13, 0.99));
+}
+
+.app-notice-dialog.error > header span {
+  color: #ff9188;
+}
+
+.app-notice-dialog > header p {
+  overflow-wrap: anywhere;
+  color: #aab3b0;
+  font-size: 12px;
+}
+
+/* #WDD-gpt 2026-08-17 - PLY 序列导出先解释浏览器的受保护目录规则，再从“下载”打开子目录选择器。 */
+.ply-directory-backdrop {
+  z-index: 42000;
+}
+
+.ply-directory-dialog {
+  width: min(510px, calc(100vw - 32px));
+}
+
+.ply-directory-path {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+  padding: 12px 14px;
+  border: 1px solid rgba(67, 226, 181, 0.2);
+  border-radius: 10px;
+  color: #82908b;
+  background: rgba(42, 207, 160, 0.055);
+  font-size: 12px;
+}
+
+.ply-directory-path b {
+  color: #52605c;
+  font-weight: 500;
+}
+
+.ply-directory-path strong {
+  min-width: 0;
+  overflow: hidden;
+  color: #7ce9c6;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ply-directory-steps {
+  display: grid;
+  gap: 7px;
+  margin: 0;
+  padding-left: 22px;
+  color: #a4afab;
+  font-size: 11px;
+  line-height: 1.55;
+}
+
+.ply-directory-steps li::marker {
+  color: var(--accent-bright);
+  font-weight: 800;
+}
+
+.ply-directory-error {
+  margin: 0;
+  padding: 10px 11px;
+  border: 1px solid rgba(255, 100, 90, 0.25);
+  border-radius: 9px;
+  color: #ffaaa2;
+  background: rgba(255, 70, 58, 0.055);
+  font-size: 11px;
+  line-height: 1.55;
+}
+
+/* #WDD-gpt 2026-08-17 - 原点烘焙确认框复用全局最高层弹窗语言，并补充浏览器内分段写入进度。 */
+.origin-bake-backdrop {
+  z-index: 41000;
+}
+
+.origin-bake-dialog {
+  width: min(500px, calc(100vw - 32px));
+}
+
+.origin-bake-blocked,
+.origin-bake-error {
+  color: #ff9b91;
+  border-color: rgba(255, 100, 90, 0.25);
+  background: rgba(255, 70, 58, 0.055);
+}
+
+.origin-bake-progress {
+  display: grid;
+  gap: 7px;
+  padding: 11px;
+  border: 1px solid rgba(68, 221, 174, 0.18);
+  border-radius: 10px;
+  background: rgba(43, 181, 140, 0.055);
+}
+
+.origin-bake-progress > div:first-child {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  color: #92a39d;
+  font-size: 10px;
+}
+
+.origin-bake-progress > div:first-child b {
+  color: #70e7c1;
+  font-size: 12px;
+}
+
+.origin-bake-progress-track {
+  height: 5px;
+  overflow: hidden;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.055);
+}
+
+.origin-bake-progress-track i {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #25b88c, #61e7bf);
+  box-shadow: 0 0 12px rgba(63, 226, 178, 0.34);
+  transition: width 120ms linear;
+}
+
+.origin-bake-progress small {
+  color: #68756f;
+  font-size: 9px;
+}
+
+.origin-bake-result {
+  grid-template-columns: repeat(3, minmax(0, 1fr)) !important;
+}
+
 /* #WDD-gpt 2026-08-16 - 更新信息面板置于全局最高层并使用独立滚动区，避免长版本历史挤压主编辑界面。 */
 .release-notes-backdrop {
   position: fixed;
@@ -1267,7 +1418,6 @@ input:focus-visible {
   width: min(410px, calc(100vw - 48px));
 }
 
-.plugin-workspace-gs2mesh,
 .plugin-workspace-relighting {
   width: min(590px, calc(100vw - 48px));
 }
@@ -1337,12 +1487,6 @@ input:focus-visible {
   background: rgba(255, 255, 255, 0.075);
 }
 
-.plugin-workspace-gs2mesh .plugin-workspace-mark {
-  border-color: rgba(57, 221, 176, 0.3);
-  color: #51dcb5;
-  background: rgba(36, 201, 151, 0.11);
-}
-
 .plugin-workspace-relighting .plugin-workspace-mark {
   border-color: rgba(255, 185, 83, 0.32);
   color: #ffc36f;
@@ -1364,7 +1508,6 @@ input:focus-visible {
 }
 
 .plugin-workspace-content > .smart-alignment-card > .smart-alignment-heading,
-.plugin-workspace-content > .gs2mesh-card > .gs2mesh-heading,
 .plugin-workspace-content > .relighting-card > .relighting-heading {
   display: none;
 }
@@ -1508,22 +1651,20 @@ input:focus-visible {
 /* #WDD-gpt  2026-08-16 - 刷选拖动期间用半透明宽笔迹保留已覆盖区域，释放指针后由运行时清空。 */
 .gaussian-selection-brush-trail-overlay {
   position: absolute;
-  inset: 0;
   z-index: 5;
   display: none;
-  width: 100%;
-  height: 100%;
   overflow: visible;
   pointer-events: none;
 }
 
 .gaussian-selection-brush-trail {
   fill: none;
-  stroke: rgba(42, 208, 157, 0.22);
+  stroke: rgba(42, 208, 157, 0.24);
   stroke-linecap: round;
   stroke-linejoin: round;
-  vector-effect: non-scaling-stroke;
 }
+
+/* #WDD-gpt 2026-08-17 - 禁止使用 non-scaling-stroke；高 DPI 下它会把笔迹宽度按设备像素解释，125% DPI 时视觉宽度错误缩为 80%。 */
 
 .gaussian-selection-polygon-overlay {
   position: absolute;
@@ -2689,6 +2830,44 @@ select.ui-select optgroup {
   background: rgba(36, 201, 151, 0.1);
 }
 
+/* #WDD-gpt 2026-08-17 - 高风险原点烘焙使用独立说明卡，不与普通数值重置按钮混淆。 */
+.transform-origin-card {
+  display: grid;
+  gap: 8px;
+  margin-top: 9px;
+  padding: 9px;
+  border: 1px solid rgba(72, 207, 168, 0.16);
+  border-radius: 9px;
+  background: linear-gradient(145deg, rgba(38, 158, 123, 0.065), rgba(255, 255, 255, 0.018));
+}
+
+.transform-origin-card > div {
+  display: grid;
+  gap: 4px;
+}
+
+.transform-origin-card strong {
+  color: #bde9da;
+  font-size: 11px;
+}
+
+.transform-origin-card p {
+  margin: 0;
+  color: #798780;
+  font-size: 9px;
+  line-height: 1.55;
+}
+
+.transform-origin-card > button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: 100%;
+  min-height: 30px;
+  color: #9fdcca;
+}
+
 /* #WDD-gpt 2026-08-16 - 未删除点外包络使用独立卡片式开关，不与等比缩放的状态混在一起。 */
 .gaussian-envelope-toggle-row {
   margin: 9px 0 0;
@@ -2933,6 +3112,20 @@ select.ui-select optgroup {
 .model-health-panel { display: grid; gap: 12px; color: #9199a5; font-size: 11px; line-height: 1.55; }
 .model-health-panel p { margin: 0; }
 .model-health-panel code { color: #8af0d0; font-family: "SFMono-Regular", Consolas, monospace; }
+.model-health-all-legend {
+  display: grid;
+  gap: 5px;
+  padding: 9px 10px;
+  border: 1px solid rgba(102, 150, 255, .18);
+  border-radius: 8px;
+  background: rgba(62, 103, 190, .07);
+}
+.model-health-all-legend > strong { color: #cbd8ff; font-size: 10px; }
+.model-health-all-legend > span { display: flex; align-items: center; gap: 6px; color: #96a2b8; font-size: 9px; }
+.model-health-all-legend > small { color: #6f7b91; font-size: 9px; }
+.model-health-all-legend i { width: 7px; height: 7px; flex: 0 0 auto; border-radius: 50%; box-shadow: 0 0 6px currentColor; }
+.model-health-all-legend i.valid { color: #35ee93; background: currentColor; }
+.model-health-all-legend i.invalid { color: #ff4840; background: currentColor; }
 .model-health-proof {
   display: grid;
   min-width: 0;
@@ -3821,6 +4014,7 @@ select.ui-select optgroup {
   background: rgba(36, 201, 151, 0.07);
 }
 
+/* #WDD-gpt 2026-08-17 - 左下角状态与高斯统计提升字号、行高和对比度，避免 6px 标签无法辨认。 */
 .statusbar {
   display: flex;
   align-items: center;
@@ -3828,7 +4022,7 @@ select.ui-select optgroup {
   min-width: 0;
   padding: 0 8px 2px 9px;
   color: #fff;
-  font-size: 6px;
+  font-size: 11px;
   font-weight: 720;
 }
 
@@ -3839,9 +4033,13 @@ select.ui-select optgroup {
   white-space: nowrap;
 }
 
+.statusbar > span:first-child {
+  font-size: 12px;
+}
+
 .statusbar i {
-  width: 4px;
-  height: 4px;
+  width: 6px;
+  height: 6px;
   border-radius: 50%;
   background: #626874;
 }
@@ -3865,24 +4063,24 @@ select.ui-select optgroup {
   display: flex;
   align-items: center;
   gap: 4px;
-  height: 16px;
-  padding: 0 6px;
+  height: 24px;
+  padding: 0 8px;
   border: 1px solid rgba(255, 255, 255, 0.055);
   border-radius: 5px;
   background: rgba(255, 255, 255, 0.018);
 }
 
 .gaussian-status-summary dt {
-  color: #777f8b;
-  font-size: 6px;
-  font-weight: 590;
+  color: #9aa49f;
+  font-size: 11px;
+  font-weight: 650;
 }
 
 .gaussian-status-summary dd {
   margin: 0;
-  color: #d9e4e0;
-  font-size: 7px;
-  font-weight: 740;
+  color: #edf7f3;
+  font-size: 12px;
+  font-weight: 780;
 }
 
 .gaussian-status-summary > div:first-child dd {

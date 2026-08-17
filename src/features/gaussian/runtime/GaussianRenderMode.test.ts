@@ -62,8 +62,12 @@ describe('GaussianRenderMode', () => {
     expect(material.shaderChunks.glsl.get('gsplatModifyPS')).toContain('ellipseInnerEdge');
     expect(material.shaderChunks.glsl.get('gsplatModifyVS')).toContain('0.0175');
     expect(material.shaderChunks.glsl.get('gsplatModifyVS')).toContain('validPoint ? vec3(0.12, 1.0, 0.34)');
+    expect(material.shaderChunks.glsl.get('gsplatModifyVS')).toContain('bool validPoint = finiteCenter && finiteColor;');
+    expect(material.shaderChunks.glsl.get('gsplatModifyVS')).not.toContain('color.a >= 0.0039215686');
     expect(material.shaderChunks.glsl.get('gsplatModifyVS')).toContain('|| dongRenderMode > 2.5');
     expect(material.shaderChunks.wgsl.get('gsplatModifyVS')).toContain('diagnosticColor');
+    expect(material.shaderChunks.wgsl.get('gsplatModifyVS')).toContain('let validPoint = finiteCenter && finiteColor;');
+    expect(material.shaderChunks.wgsl.get('gsplatModifyVS')).not.toContain('currentColor.a >= 0.0039215686');
     expect(material.shaderChunks.glsl.get('gsplatModifyPS')).toContain('color.a = pointEdge');
     expect(material.shaderChunks.glsl.get('gsplatModifyPS')).toContain('centerDot');
     expect(material.shaderChunks.glsl.get('gsplatModifyPS')).toContain('color.a = 1.0 - smoothstep(0.70, 0.96, radialDistance)');
