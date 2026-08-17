@@ -679,28 +679,6 @@ input:focus-visible {
   justify-self: end;
 }
 
-/* #WDD-gpt 2026-08-16 - 在导出按钮旁持续显示大文件 Worker 进度/结果，避免浏览器拦截下载或弹窗后用户没有反馈。 */
-.export-notice {
-  position: absolute;
-  right: 0;
-  top: calc(100% + 8px);
-  z-index: 40;
-  width: max-content;
-  max-width: min(520px, 70vw);
-  padding: 8px 12px;
-  border: 1px solid rgba(77, 232, 201, 0.34);
-  border-radius: 8px;
-  background: rgba(6, 18, 24, 0.94);
-  color: var(--text-primary);
-  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.38);
-  font-size: 12px;
-  line-height: 1.4;
-  white-space: normal;
-}
-
-.export-notice.success { border-color: rgba(77, 232, 201, 0.58); }
-.export-notice.error { border-color: rgba(255, 92, 112, 0.62); color: #ffb3bd; }
-
 /* #WDD-gpt 2026-08-16 - 大文件压缩使用独立监督对话框，持续展示线程、阶段、耗时、码率与最近事件。 */
 .export-monitor-backdrop {
   position: fixed;

@@ -426,7 +426,6 @@ export function App() {
   const [sceneTransform, setSceneTransform] = useState<ViewportTransform>(createInitialTransform);
   const [uniformScale, setUniformScale] = useState(true);
   const [exportProgress, setExportProgress] = useState<number | null>(null);
-  const [exportNotice, setExportNotice] = useState<{ readonly kind: 'progress' | 'success' | 'error'; readonly message: string } | null>(null);
   const [exportMonitor, setExportMonitor] = useState<ExportMonitorState | null>(null);
   const [exportElapsedMs, setExportElapsedMs] = useState(0);
   const [viewportRuntime, setViewportRuntime] = useState<ViewportRuntime | null>(null);
@@ -793,7 +792,6 @@ export function App() {
       exportStartedAtRef.current = performance.now();
       setExportElapsedMs(0);
       setExportProgress(0);
-      setExportNotice({ kind: 'progress', message: `正在快照内存并编码当前 ${sourceFiles.length} 个 RAW4D…` });
       setExportMonitor({
         kind: 'fourcgs',
         phase: 'running',
@@ -809,7 +807,6 @@ export function App() {
         const memorySnapshots = viewportRuntime.snapshotRaw4DExportMemory(sourceFiles);
         const result = await encodeRaw4DMemoryAsFourCgs(memorySnapshots, (progress) => {
           setExportProgress(progress.ratio);
-          setExportNotice({ kind: 'progress', message: progress.message });
           setExportMonitor((current) => {
             if (!current || current.phase !== 'running') return current;
             const elapsedMs = performance.now() - exportStartedAtRef.current;
@@ -837,10 +834,6 @@ export function App() {
         if (controller.signal.aborted) throw new DOMException('4CGS 保存已取消。', 'AbortError');
         setExportProgress(1);
         downloadBlob(blob, result.filename);
-        setExportNotice({
-          kind: 'success',
-          message: `已去掉 ${result.deletedPointCount.toLocaleString()} 个删除点并生成 ${result.filename} · ${(blob.size / 1_000_000).toFixed(3)}M · ${result.compressionRatio.toFixed(2)}×`,
-        });
         setExportElapsedMs(performance.now() - exportStartedAtRef.current);
         setExportMonitor((current) => current ? {
           ...current,
@@ -859,7 +852,6 @@ export function App() {
         const cancelled = error instanceof DOMException && error.name === 'AbortError';
         const message = cancelled ? '4CGS 保存已取消。' : error instanceof Error ? error.message : String(error);
         // #WDD-gpt 2026-08-16 - 大文件编码错误和取消原因保留在监督框，避免弹窗被浏览器策略吞掉。
-        setExportNotice({ kind: 'error', message: cancelled ? message : `4CGS 导出失败：${message}` });
         setExportElapsedMs(performance.now() - exportStartedAtRef.current);
         setExportMonitor((current) => current ? {
           ...current,
@@ -882,61 +874,28 @@ export function App() {
         window.alert('4CGS V2.4 前端当前采用只读压缩载荷。请撤销高斯删除后再无损另存；不会静默丢弃编辑。');
         return;
       }
-      // #WDD-gpt  2026-08-17 - 4CGS 无损另存也走右上角导出通知，不再静默下载；错误改用通知呈现，避免弹窗被浏览器策略吞掉。
-      exportStartedAtRef.current = performance.now();
-      setExportElapsedMs(0);
       setExportProgress(0.05);
-      setExportNotice({ kind: 'progress', message: '正在写入场景变换并导出 4CGS 文件…' });
       try {
         const blob = await writeFourCgsFile(sourceFile, sceneTransform);
         setExportProgress(1);
         const stem = (sceneName ?? status.objectName ?? 'dong-editor-3').replace(/\.4cgs$/i, '');
-        const filename = `${stem}.4cgs`;
-        downloadBlob(blob, filename);
-        const elapsedMs = performance.now() - exportStartedAtRef.current;
-        setExportElapsedMs(elapsedMs);
-        setExportNotice({
-          kind: 'success',
-          message: `已无损另存 ${filename} · ${(blob.size / 1_000_000).toFixed(3)}M · ${(elapsedMs / 1000).toFixed(1)}s`,
-        });
+        downloadBlob(blob, `${stem}.4cgs`);
       } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        setExportElapsedMs(performance.now() - exportStartedAtRef.current);
-        setExportNotice({ kind: 'error', message: `4CGS 另存失败：${message}` });
+        window.alert(error instanceof Error ? error.message : String(error));
       } finally {
         setExportProgress(null);
       }
       return;
     }
     if (status.format && status.format !== 'Procedural' && viewportRuntime) {
-      // #WDD-gpt  2026-08-17 - PLY4/SOG/PLY 压实导出接入右上角导出通知，进度带点位计数，完成后显示文件大小与耗时。
-      exportStartedAtRef.current = performance.now();
-      setExportElapsedMs(0);
       setExportProgress(0);
-      setExportNotice({ kind: 'progress', message: '正在压实导出 RAW4D 载荷…' });
       try {
-        const blob = await viewportRuntime.exportCompactedRaw4D((progress) => {
-          setExportProgress(progress.ratio);
-          setExportNotice({
-            kind: 'progress',
-            message: `正在压实导出 RAW4D · ${progress.writtenPoints.toLocaleString()}/${progress.totalPoints.toLocaleString()} 点 · ${Math.round(progress.ratio * 100)}%`,
-          });
-        });
+        const blob = await viewportRuntime.exportCompactedRaw4D((progress) => setExportProgress(progress.ratio));
         const preservePly4Extension = sourceFiles.length === 1 && /\.ply4$/i.test(sourceFiles[0].name);
         const stem = (sceneName ?? status.objectName ?? 'dong-editor-3').replace(/\.(?:raw4d|ply4)$/i, '');
-        const filename = `${stem}.${preservePly4Extension ? 'ply4' : 'raw4d'}`;
-        setExportProgress(1);
-        downloadBlob(blob, filename);
-        const elapsedMs = performance.now() - exportStartedAtRef.current;
-        setExportElapsedMs(elapsedMs);
-        setExportNotice({
-          kind: 'success',
-          message: `已导出 ${filename} · ${(blob.size / 1_000_000).toFixed(3)}M · ${(elapsedMs / 1000).toFixed(1)}s`,
-        });
+        downloadBlob(blob, `${stem}.${preservePly4Extension ? 'ply4' : 'raw4d'}`);
       } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        setExportElapsedMs(performance.now() - exportStartedAtRef.current);
-        setExportNotice({ kind: 'error', message: `RAW4D 导出失败：${message}` });
+        window.alert(error instanceof Error ? error.message : String(error));
       } finally {
         setExportProgress(null);
       }
@@ -965,10 +924,6 @@ export function App() {
     };
     const workspaceBlob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
     downloadBlob(workspaceBlob, 'dong-editor-3-workspace.json');
-    setExportNotice({
-      kind: 'success',
-      message: `已导出工作区快照 dong-editor-3-workspace.json · ${(workspaceBlob.size / 1_000_000).toFixed(3)}M`,
-    });
   };
 
   // #WDD-gpt 2026-08-17 - 文件菜单导出子菜单的 .ply 序列：选择本地目录后逐帧直写，不再打包 ZIP。
@@ -1005,7 +960,6 @@ export function App() {
     exportStartedAtRef.current = performance.now();
     setExportElapsedMs(0);
     setExportProgress(0);
-    setExportNotice({ kind: 'progress', message: '正在快照内存并准备写入目录…' });
     setExportMonitor({
       kind: 'ply-sequence',
       phase: 'running',
@@ -1020,7 +974,6 @@ export function App() {
       const sources = viewportRuntime.snapshotResidentSequenceExportMemory();
       const result = await exportRaw4DSequenceAsPlyDirectory(sources, directory, (progress) => {
         setExportProgress(progress.ratio);
-        setExportNotice({ kind: 'progress', message: progress.message });
         setExportMonitor((current) => {
           if (!current || current.phase !== 'running' || current.kind !== 'ply-sequence') return current;
           const elapsedMs = performance.now() - exportStartedAtRef.current;
@@ -1044,10 +997,6 @@ export function App() {
         });
       }, controller.signal);
       setExportProgress(1);
-      setExportNotice({
-        kind: 'success',
-        message: `已导出 ${result.stats.frameCount} 帧 .ply 到 ${result.directoryName}/ · 去掉 ${result.stats.deletedPointCount.toLocaleString()} 个删除点 · ${(result.stats.outputBytes / 1_000_000).toFixed(3)}M`,
-      });
       setExportElapsedMs(performance.now() - exportStartedAtRef.current);
       setExportMonitor((current) => current ? {
         ...current,
@@ -1068,7 +1017,6 @@ export function App() {
       const cancelled = error instanceof DOMException && error.name === 'AbortError';
       const message = error instanceof Error ? error.message : String(error);
       // #WDD-gpt 2026-08-17 - 取消会终止 Worker，目录中可能保留已写入的部分帧文件。
-      setExportNotice({ kind: 'error', message: cancelled ? message : `PLY 序列导出失败：${message}` });
       setExportElapsedMs(performance.now() - exportStartedAtRef.current);
       setExportMonitor((current) => current ? {
         ...current,
@@ -1398,11 +1346,6 @@ export function App() {
           <button className="primary-button has-tip" data-tip={copy.exportTip} disabled={exportProgress !== null} onClick={() => void exportWorkspace()} type="button">
             <Icon name="export" />{exportProgress === null ? copy.export : `${copy.savingRaw4D} ${Math.round(exportProgress * 100)}%`}
           </button>
-          {exportNotice && (
-            <span className={`export-notice ${exportNotice.kind}`} role={exportNotice.kind === 'error' ? 'alert' : 'status'}>
-              {exportNotice.message}
-            </span>
-          )}
         </div>
       </header>
 
