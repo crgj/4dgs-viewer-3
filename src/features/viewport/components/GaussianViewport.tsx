@@ -42,6 +42,8 @@ interface GaussianViewportProps {
   renderMode: GaussianRenderMode;
   shLevel: number;
   showAxes: boolean;
+  showHeightRuler: boolean;
+  showGaussianEnvelope: boolean;
   showGrid: boolean;
   showGuides: boolean;
   sourceFiles: readonly File[];
@@ -103,6 +105,8 @@ export function GaussianViewport({
   renderMode,
   shLevel,
   showAxes,
+  showHeightRuler,
+  showGaussianEnvelope,
   showGrid,
   showGuides,
   sourceFiles,
@@ -347,6 +351,14 @@ export function GaussianViewport({
   useEffect(() => {
     runtimeRef.current?.setAxesVisible(showAxes);
   }, [runtimeReady, showAxes]);
+
+  useEffect(() => {
+    runtimeRef.current?.setHeightRulerVisible(showHeightRuler);
+  }, [runtimeReady, showHeightRuler]);
+
+  useEffect(() => {
+    runtimeRef.current?.setGaussianEnvelopeVisible(showGaussianEnvelope);
+  }, [runtimeReady, showGaussianEnvelope]);
 
   useEffect(() => {
     runtimeRef.current?.setMemoryPolicy(memoryPolicy);

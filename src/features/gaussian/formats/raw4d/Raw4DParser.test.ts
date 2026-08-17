@@ -5,8 +5,10 @@ import { canImportRaw4D, parseRaw4D, readRaw4DHeader } from './Raw4DParser';
 import { readRaw4DScalar } from './Raw4DValues';
 
 const properties = [
-  'lifetime_mu', 'lifetime_w',
+  'x', 'y', 'z', 'nx', 'ny', 'nz',
+  'f_dc_0', 'f_dc_1', 'f_dc_2',
   'f_rest_0', 'f_rest_1', 'f_rest_2', 'f_rest_3', 'f_rest_4', 'f_rest_5', 'f_rest_6', 'f_rest_7', 'f_rest_8',
+  'opacity', 'scale_0', 'scale_1', 'scale_2', 'lifetime_mu', 'lifetime_w',
   'xyz_bank_0_x', 'xyz_bank_0_y', 'xyz_bank_0_z',
   'xyz_bank_1_x', 'xyz_bank_1_y', 'xyz_bank_1_z',
   'rot_bank_0_w', 'rot_bank_0_x', 'rot_bank_0_y', 'rot_bank_0_z',
@@ -37,7 +39,7 @@ function encodeFloat16(value: number): number {
 
 function syntheticRaw4D(encoding: 'float32' | 'float16' = 'float32'): Blob {
   const fp16Comments = encoding === 'float16'
-    ? ['comment fp16_quantized 1', ...properties.map((name) => `comment fp16_property ${name}`)]
+    ? ['comment fp16_quantized 1']
     : [];
   const header = [
     'ply',
@@ -58,6 +60,9 @@ function syntheticRaw4D(encoding: 'float32' | 'float16' = 'float32'): Blob {
   const rows: Array<Record<string, number>> = [
     {
       lifetime_mu: 1, lifetime_w: 100,
+      x: 0, y: 1, z: 2,
+      f_dc_0: 0, f_dc_1: 1, f_dc_2: 2,
+      opacity: 0, scale_0: 0, scale_1: 0, scale_2: 0,
       xyz_bank_0_x: 0, xyz_bank_0_y: 1, xyz_bank_0_z: 2,
       xyz_bank_1_x: 10, xyz_bank_1_y: 3, xyz_bank_1_z: 4,
       rot_bank_0_w: 2, rot_bank_1_z: 2,
@@ -70,6 +75,8 @@ function syntheticRaw4D(encoding: 'float32' | 'float16' = 'float32'): Blob {
     },
     {
       lifetime_mu: 1, lifetime_w: 100,
+      x: -2, y: -3, z: -4,
+      opacity: 0, scale_0: 0, scale_1: 0, scale_2: 0,
       xyz_bank_0_x: -2, xyz_bank_0_y: -3, xyz_bank_0_z: -4,
       xyz_bank_1_x: 2, xyz_bank_1_y: 3, xyz_bank_1_z: 4,
       rot_bank_0_w: 1, rot_bank_1_w: -1,
@@ -92,6 +99,34 @@ function syntheticRaw4D(encoding: 'float32' | 'float16' = 'float32'): Blob {
     });
   });
   return new Blob([headerBytes, body]);
+}
+
+function legacyOptionalBankRaw4D(): Blob {
+  const names = [
+    'x', 'y', 'z', 'nx', 'ny', 'nz',
+    'f_dc_0', 'f_dc_1', 'f_dc_2', 'opacity', 'scale_0', 'scale_1', 'scale_2',
+    'lifetime_mu', 'lifetime_w',
+    'rot_0', 'rot_1', 'rot_2', 'rot_3',
+    'xyz_bank_0_x', 'xyz_bank_0_y', 'xyz_bank_0_z',
+    'xyz_bank_1_x', 'xyz_bank_1_y', 'xyz_bank_1_z',
+  ];
+  const header = [
+    'ply', 'format binary_little_endian 1.0',
+    'comment total_frames 3', 'comment xyz_bank_keyframe_stride 2',
+    'comment rot_bank_keyframe_stride 2', 'comment features_dc_bank_keyframe_stride 2',
+    'element vertex 1', ...names.map((name) => `property float ${name}`), 'end_header', '',
+  ].join('\n');
+  const values = new Map<string, number>([
+    ['x', 1], ['y', 2], ['z', 3], ['f_dc_0', .1], ['f_dc_1', .2], ['f_dc_2', .3],
+    ['opacity', -2], ['scale_0', -3], ['scale_1', -4], ['scale_2', -5],
+    ['lifetime_mu', 1], ['lifetime_w', 1], ['rot_0', 1],
+    ['xyz_bank_0_x', 1], ['xyz_bank_0_y', 2], ['xyz_bank_0_z', 3],
+    ['xyz_bank_1_x', 4], ['xyz_bank_1_y', 5], ['xyz_bank_1_z', 6],
+  ]);
+  const body = new ArrayBuffer(names.length * 4);
+  const view = new DataView(body);
+  names.forEach((name, index) => view.setFloat32(index * 4, values.get(name) ?? 0, true));
+  return new Blob([new TextEncoder().encode(header), body]);
 }
 
 describe('RAW4D parser', () => {
@@ -134,6 +169,20 @@ describe('RAW4D parser', () => {
     await expect(canImportRaw4D(source)).resolves.toBe(true);
   });
 
+  it('uses canonical base properties when legacy files omit optional DC, scale, opacity and rotation banks', async () => {
+    const asset = await parseRaw4D(legacyOptionalBankRaw4D());
+
+    expect(asset.position.keyframes).toEqual([0, 2]);
+    expect(asset.rotation.keyframes).toEqual([0]);
+    expect(asset.colorDc.keyframes).toEqual([0]);
+    expect(asset.scale.keyframes).toEqual([0]);
+    expect(asset.opacity.keyframes).toEqual([0]);
+    expect(asset.rotation.values.map((value) => value[0])).toEqual([1, 0, 0, 0]);
+    expect(asset.colorDc.values.map((value) => value[0])).toEqual([
+      expect.closeTo(.1), expect.closeTo(.2), expect.closeTo(.3),
+    ]);
+  });
+
   it('samples interpolated transform, SH DC, log-scale, opacity and quaternion values', async () => {
     const asset = await parseRaw4D(syntheticRaw4D());
     const sampler = new Raw4DFrameSampler(asset);
@@ -154,6 +203,29 @@ describe('RAW4D parser', () => {
     const source = syntheticRaw4D();
     const truncated = source.slice(0, source.size - 8);
     await expect(parseRaw4D(truncated)).rejects.toThrow(/truncated/);
+  });
+
+  it('rejects zero rotation quaternions', async () => {
+    const source = syntheticRaw4D();
+    const header = await readRaw4DHeader(source);
+    const bytes = new Uint8Array(await source.arrayBuffer());
+    const rotation = header.propertyNames.indexOf('rot_bank_0_w');
+    const view = new DataView(bytes.buffer);
+    for (let component = 0; component < 4; component += 1) {
+      view.setFloat32(header.dataOffset + (rotation + component) * 4, 0, true);
+    }
+    await expect(parseRaw4D(new Blob([bytes]))).rejects.toThrow(/quaternion/);
+  });
+
+  it('keeps negative-infinity transparency but rejects positive-infinity opacity', async () => {
+    expect((await parseRaw4D(syntheticRaw4D())).opacity.values[1][1]).toBe(-Infinity);
+    const source = syntheticRaw4D();
+    const header = await readRaw4DHeader(source);
+    const bytes = new Uint8Array(await source.arrayBuffer());
+    const opacity = header.propertyNames.indexOf('opacity_bank_1');
+    const secondRow = header.dataOffset + header.recordBytes;
+    new DataView(bytes.buffer).setFloat32(secondRow + opacity * 4, Infinity, true);
+    await expect(parseRaw4D(new Blob([bytes]))).rejects.toThrow(/opacity logit/);
   });
 
   it('decodes through WASM directly into shared TypedArray storage', async () => {

@@ -38,6 +38,13 @@ export interface Raw4DAsset {
   readonly bounds: Raw4DBounds;
 }
 
+// #WDD-gpt 2026-08-16 - 4CGS 保存冻结 Canonical RAM 与删除位集，不再回读最初拖入的 File 作为属性真值。
+export interface Raw4DMemorySnapshot {
+  readonly name: string;
+  readonly asset: Raw4DAsset;
+  readonly deletionWords: Uint32Array;
+}
+
 export interface Raw4DParseProgress {
   readonly ratio: number;
   readonly stage: 'header' | 'data' | 'finalizing';

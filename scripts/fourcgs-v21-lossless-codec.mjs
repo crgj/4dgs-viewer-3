@@ -119,6 +119,11 @@ class PredictiveRiceSignedReader {
   }
 }
 
+class EmptySignedReader {
+  sint() { throw new Error('Unexpected read from an empty predictive Rice stream.'); }
+  done() {}
+}
+
 function decodeUnsignedVarints(bytes) {
   const reader = new ByteReader(bytes, 'unsigned-varint stream');
   const values = [];
@@ -378,7 +383,10 @@ function packDirectoryRans(directoryBuffer, rawStreams, magic) {
 }
 
 function positionContexts(raw, manifest) {
-  const [main, exceptions] = unpackEntropyPair(raw, 'P3DPR001');
+  // #WDD-gpt 2026-08-16 - 浏览器编码器可直接交付原始 Position 对，省去一次完整 rANS 编码、解码和中间 Buffer。
+  const [main, exceptions] = raw?.mainRaw && raw?.exceptionRaw
+    ? [raw.mainRaw, raw.exceptionRaw]
+    : unpackEntropyPair(raw, 'P3DPR001');
   const reader = new ByteReader(main, 'Position main stream');
   const metadata = new ByteWriter();
   const dictionaryCodes = new ByteWriter();
@@ -415,7 +423,7 @@ function positionContexts(raw, manifest) {
   ];
 }
 
-function restorePosition(parts, manifest) {
+function restorePositionRaw(parts, manifest) {
   const metadata = new ByteReader(parts.get('metadata'), 'Position metadata');
   const dictionaryCodes = new ByteReader(parts.get('dictionary_codes'), 'Position dictionary codes');
   const escape = [0, 1, 2].map((axis) => new ByteReader(parts.get(`escape_${axis}`), `Position escape ${axis}`));
@@ -446,7 +454,12 @@ function restorePosition(parts, manifest) {
   dictionaryCodes.done();
   for (const reader of escape) reader.done();
   if (decodedLayers !== layerCount) throw new Error('Reconstructed Position layer mismatch.');
-  return packEntropyPair(writer.finish(), parts.get('exceptions'), 'P3DPR001');
+  return { mainRaw: writer.finish(), exceptionRaw: parts.get('exceptions') };
+}
+
+function restorePosition(parts, manifest) {
+  const raw = restorePositionRaw(parts, manifest);
+  return packEntropyPair(raw.mainRaw, raw.exceptionRaw, 'P3DPR001');
 }
 
 function shuffleScaleBirth(raw) {
@@ -588,6 +601,28 @@ async function xzCompress(bytes, lzma2) {
   }
 }
 
+let brotliRuntimePromise;
+
+// #WDD-gpt 2026-08-16 - Node ESM 与浏览器 Worker 必须分别选择 brotli-wasm 的 Node/Web 入口，避免 CLI 对 file:// WASM 执行 fetch。
+async function brotliRuntime() {
+  brotliRuntimePromise ??= (async () => {
+    if (typeof process !== 'undefined' && process.versions?.node) {
+      const { createRequire } = await import('node:module');
+      const required = createRequire(import.meta.url)('brotli-wasm');
+      return required.default ?? required;
+    }
+    const imported = await import('brotli-wasm');
+    return imported.default;
+  })();
+  return brotliRuntimePromise;
+}
+
+async function structuredCompress(bytes, lzma2, options) {
+  if (options?.blockCompression !== 'brotli') return xzCompress(bytes, lzma2);
+  const brotli = await brotliRuntime();
+  return Buffer.from(brotli.compress(bytes, { quality: options.brotliQuality ?? 9 }));
+}
+
 // #WDD-gpt 2026-08-16 - xzwasm 会复用 WASM 内存视图，必须在读取下一块前复制当前块，避免大流静默损坏。
 export async function decodeXzBrowser(encoded) {
   if (globalThis.self === undefined) globalThis.self = globalThis;
@@ -608,12 +643,18 @@ export async function decodeXzBrowser(encoded) {
   return Buffer.concat(chunks, length);
 }
 
+async function decodeStructuredBlock(metadata, encoded) {
+  if (metadata.blockCompression !== 'brotli') return decodeXzBrowser(encoded);
+  const brotli = await brotliRuntime();
+  return Buffer.from(brotli.decompress(encoded));
+}
+
 export function isV21StructuredStream(encoded) {
   return encoded.length >= 12 && ENVELOPE_MAGICS.has(encoded.subarray(0, 8).toString('ascii'));
 }
 
 // #WDD-gpt 2026-08-16 - V2.1 只做可逆上下文重排、Rice 和 XZ；还原后必须与 V2 内层流逐字节一致。
-export async function encodeV21StructuredStream(name, raw, manifest) {
+export async function encodeV21StructuredStream(name, raw, manifest, options = {}) {
   if (!TARGET_STREAMS.has(name)) throw new Error(`Unsupported V2.1 target ${name}.`);
   let magic;
   let transform;
@@ -624,8 +665,15 @@ export async function encodeV21StructuredStream(name, raw, manifest) {
     magic = 'V21PCTX1';
     transform = 'position-context-split';
     parts = positionContexts(raw, manifest);
-    blocks = [];
-    for (const part of parts) blocks.push({ name: part.name, rawBytes: part.bytes.length, bytes: await xzCompress(part.bytes, 'preset=9e,dict=4KiB,lc=1,lp=0,pb=0') });
+    if (options.compressPositionParts) {
+      // #WDD-gpt 2026-08-16 - 浏览器端把六条独立 Position 上下文交给专用 Worker 池；块顺序和 Brotli quality 均保持不变。
+      const compressed = await options.compressPositionParts(parts.map((part) => part.bytes), options.brotliQuality ?? 9);
+      if (compressed.length !== parts.length) throw new Error(`Position parallel block count mismatch ${compressed.length} != ${parts.length}.`);
+      blocks = parts.map((part, index) => ({ name: part.name, rawBytes: part.bytes.length, bytes: Buffer.from(compressed[index]) }));
+    } else {
+      blocks = [];
+      for (const part of parts) blocks.push({ name: part.name, rawBytes: part.bytes.length, bytes: await structuredCompress(part.bytes, 'preset=9e,dict=4KiB,lc=1,lp=0,pb=0', options) });
+    }
   } else {
     const originalMagic = name === 'so3_rotation' ? 'SO3TR001' : 'TATTR001';
     const unpacked = unpackDirectoryRans(raw, originalMagic);
@@ -637,7 +685,7 @@ export async function encodeV21StructuredStream(name, raw, manifest) {
         name: entry.name,
         bytes: entry.name === 'birth' ? shuffleScaleBirth(unpacked.streams.get(entry.name)) : riceEncode(unpacked.streams.get(entry.name), 256),
       }));
-      blocks = [{ name: 'payload', rawBytes: parts.reduce((sum, part) => sum + part.bytes.length, 0), bytes: await xzCompress(Buffer.concat(parts.map((part) => part.bytes)), 'preset=9e,dict=4KiB,lc=0,lp=0,pb=0') }];
+      blocks = [{ name: 'payload', rawBytes: parts.reduce((sum, part) => sum + part.bytes.length, 0), bytes: await structuredCompress(Buffer.concat(parts.map((part) => part.bytes)), 'preset=9e,dict=4KiB,lc=0,lp=0,pb=0', options) }];
     } else if (name === 'so3_rotation') {
       magic = 'V21ROT01';
       transform = 'so3-residual-rice256';
@@ -645,31 +693,40 @@ export async function encodeV21StructuredStream(name, raw, manifest) {
         name: entry.name,
         bytes: entry.name.startsWith('boundary:') || entry.name.startsWith('endpoint:') ? riceEncode(unpacked.streams.get(entry.name), 256) : unpacked.streams.get(entry.name),
       }));
-      blocks = [{ name: 'payload', rawBytes: parts.reduce((sum, part) => sum + part.bytes.length, 0), bytes: await xzCompress(Buffer.concat(parts.map((part) => part.bytes))) }];
+      blocks = [{ name: 'payload', rawBytes: parts.reduce((sum, part) => sum + part.bytes.length, 0), bytes: await structuredCompress(Buffer.concat(parts.map((part) => part.bytes)), undefined, options) }];
     } else {
       magic = 'V21DC001';
       transform = 'dc-ycocg-r';
       const dc = transformDc(unpacked.streams);
       transformMetadata.birthPlaneBytes = dc.birthPlaneBytes;
       parts = unpacked.metadata.streams.map((entry) => ({ name: entry.name, bytes: dc.transformed.get(entry.name) }));
-      blocks = [{ name: 'payload', rawBytes: parts.reduce((sum, part) => sum + part.bytes.length, 0), bytes: await xzCompress(Buffer.concat(parts.map((part) => part.bytes)), 'preset=9e,dict=4KiB,lc=1,lp=0,pb=0') }];
+      blocks = [{ name: 'payload', rawBytes: parts.reduce((sum, part) => sum + part.bytes.length, 0), bytes: await structuredCompress(Buffer.concat(parts.map((part) => part.bytes)), 'preset=9e,dict=4KiB,lc=1,lp=0,pb=0', options) }];
     }
   }
+  const rawPositionPair = name === 'prs_position' && raw?.mainRaw && raw?.exceptionRaw ? raw : undefined;
+  const sourceBytes = rawPositionPair
+    ? rawPositionPair.mainRaw.length + rawPositionPair.exceptionRaw.length
+    : raw.length;
   const encoded = packEnvelope(magic, {
     version: 1,
+    blockCompression: options.blockCompression,
     streamName: name,
     transform,
-    sourceBytes: raw.length,
-    sourceSha256: sha256(raw),
+    sourceBytes,
+    sourceSha256: rawPositionPair ? undefined : sha256(raw),
+    sourceEncoding: rawPositionPair ? 'position-raw-pair' : 'legacy-rans',
+    sourceMainBytes: rawPositionPair?.mainRaw.length,
+    sourceMainSha256: rawPositionPair ? sha256(rawPositionPair.mainRaw) : undefined,
+    sourceExceptionSha256: rawPositionPair ? sha256(rawPositionPair.exceptionRaw) : undefined,
     parts: parts.map((part) => ({ name: part.name, bytes: part.bytes.length })),
     ...transformMetadata,
   }, blocks);
-  return { encoded, metrics: { name, transform, sourceBytes: raw.length, storedBytes: encoded.length, ratio: raw.length / encoded.length } };
+  return { encoded, metrics: { name, transform, sourceBytes, storedBytes: encoded.length, ratio: sourceBytes / encoded.length } };
 }
 
 // #WDD-gpt 2026-08-16 - V2.2 仅替换 Rotation/DC/Scale 的无损内层编码，Position、SH、生命周期和外层语义保持 V2.1 不变。
-export async function encodeV22StructuredStream(name, raw) {
-  if (!['so3_rotation', 'tattr_scale', 'tattr_dc'].includes(name)) throw new Error(`Unsupported V2.2 target ${name}.`);
+export async function encodeV22StructuredStream(name, raw, options = {}) {
+  if (name !== 'so3_rotation' && name !== 'tattr_dc' && !name.startsWith('tattr_scale')) throw new Error(`Unsupported V2.2 target ${name}.`);
   const originalMagic = name === 'so3_rotation' ? 'SO3TR001' : 'TATTR001';
   const unpacked = unpackDirectoryRans(raw, originalMagic);
   const directoryBase64 = unpacked.directoryBuffer.toString('base64');
@@ -691,7 +748,7 @@ export async function encodeV22StructuredStream(name, raw) {
     }));
     parts = splitRiceContextParts(logicalParts, isResidual);
     lzma2 = 'preset=9e,dict=1MiB,lc=2,lp=0,pb=0';
-  } else if (name === 'tattr_scale') {
+  } else if (name.startsWith('tattr_scale')) {
     // #WDD-gpt 2026-08-16 - V2.3 量化 Scale 的 birth 也是有符号残差，使用独立魔数，禁止误按 FP16 byte-shuffle 解码。
     const exactHalf = Boolean(unpacked.metadata.exactHalf);
     magic = exactHalf ? 'V22SCL01' : 'V23SCL01';
@@ -727,9 +784,10 @@ export async function encodeV22StructuredStream(name, raw) {
     lzma2 = 'preset=9e,dict=16KiB,lc=1,lp=0,pb=0';
   }
   const payload = Buffer.concat(parts.map((part) => part.bytes));
-  const blocks = [{ name: 'payload', rawBytes: payload.length, bytes: await xzCompress(payload, lzma2) }];
+  const blocks = [{ name: 'payload', rawBytes: payload.length, bytes: await structuredCompress(payload, lzma2, options) }];
   const encoded = packEnvelope(magic, {
     version,
+    blockCompression: options.blockCompression,
     streamName: name,
     transform,
     sourceBytes: raw.length,
@@ -751,7 +809,7 @@ export async function decodeV22StructuredParts(name, encoded) {
   if (metadata.transform === 'position-context-split' || !metadata.directoryBase64) {
     throw new Error(`V2.4 direct stream does not support ${metadata.transform}.`);
   }
-  const payload = await decodeXzBrowser(blocks.get('payload'));
+  const payload = await decodeStructuredBlock(metadata, blocks.get('payload'));
   const names = compactV22PartNames(metadata);
   if (names.length !== metadata.partBytes?.length) throw new Error(`V2.4 ${name} compact part count mismatch.`);
   const parts = new Map();
@@ -783,12 +841,12 @@ export async function decodeV22StructuredParts(name, encoded) {
 }
 
 // #WDD-gpt 2026-08-16 - V2.4 Scale 从 Rice bitstream 按需取整数，避免先生成 21.1M Varint 再二次解析。
-export async function decodeV22ScaleReaders(encoded) {
+export async function decodeV22ScaleReaders(encoded, streamName = 'tattr_scale') {
   const { metadata, blocks } = unpackEnvelope(encoded);
-  if (metadata.streamName !== 'tattr_scale' || metadata.transform !== 'scale-quantized-predictive-rice64-contexts') {
+  if (metadata.streamName !== streamName || metadata.transform !== 'scale-quantized-predictive-rice64-contexts') {
     throw new Error('V2.4 direct Scale reader requires the quantized predictive Rice stream.');
   }
-  const payload = await decodeXzBrowser(blocks.get('payload'));
+  const payload = await decodeStructuredBlock(metadata, blocks.get('payload'));
   const names = compactV22PartNames(metadata);
   if (names.length !== metadata.partBytes?.length) throw new Error('V2.4 Scale compact part count mismatch.');
   const parts = new Map();
@@ -802,12 +860,13 @@ export async function decodeV22ScaleReaders(encoded) {
   const streamMetadata = JSON.parse(Buffer.from(metadata.directoryBase64, 'base64').toString('utf8'));
   const readers = new Map();
   for (const entry of streamMetadata.streams) {
-    if (metadata.emptyResidualNames?.includes(entry.name)) throw new Error(`V2.4 Scale unexpectedly contains empty stream ${entry.name}.`);
-    readers.set(entry.name, new PredictiveRiceSignedReader(
-      parts.get(`${entry.name}$header`),
-      parts.get(`${entry.name}$parameters`),
-      parts.get(`${entry.name}$bits`),
-    ));
+    readers.set(entry.name, metadata.emptyResidualNames?.includes(entry.name)
+      ? new EmptySignedReader()
+      : new PredictiveRiceSignedReader(
+        parts.get(`${entry.name}$header`),
+        parts.get(`${entry.name}$parameters`),
+        parts.get(`${entry.name}$bits`),
+      ));
   }
   return { metadata: streamMetadata, readers, envelopeMetadata: metadata };
 }
@@ -820,7 +879,7 @@ export async function decodeV21PositionContexts(encoded) {
   }
   const contexts = new Map();
   for (const part of metadata.parts) {
-    const decoded = await decodeXzBrowser(blocks.get(part.name));
+    const decoded = await decodeStructuredBlock(metadata, blocks.get(part.name));
     if (decoded.length !== part.bytes) throw new Error(`V2.4 Position ${part.name} length mismatch.`);
     contexts.set(part.name, decoded);
   }
@@ -833,12 +892,12 @@ export async function decodeV21StructuredStream(name, encoded, manifest) {
   const parts = new Map();
   if (metadata.transform === 'position-context-split') {
     for (const part of metadata.parts) {
-      const decoded = await decodeXzBrowser(blocks.get(part.name));
+      const decoded = await decodeStructuredBlock(metadata, blocks.get(part.name));
       if (decoded.length !== part.bytes) throw new Error(`${part.name} decoded length mismatch.`);
       parts.set(part.name, decoded);
     }
   } else {
-    const payload = await decodeXzBrowser(blocks.get('payload'));
+    const payload = await decodeStructuredBlock(metadata, blocks.get('payload'));
     const partDirectory = metadata.parts ?? (() => {
       const names = compactV22PartNames(metadata);
       if (names.length !== metadata.partBytes?.length) throw new Error(`V2.2 ${name} compact part count mismatch.`);
@@ -852,7 +911,13 @@ export async function decodeV21StructuredStream(name, encoded, manifest) {
     if (offset !== payload.length) throw new Error(`Structured ${name} payload length mismatch.`);
   }
   let raw;
-  if (metadata.transform === 'position-context-split') raw = restorePosition(parts, manifest);
+  let validationSource;
+  let positionRaw;
+  if (metadata.transform === 'position-context-split') {
+    positionRaw = restorePositionRaw(parts, manifest);
+    raw = packEntropyPair(positionRaw.mainRaw, positionRaw.exceptionRaw, 'P3DPR001');
+    if (metadata.sourceEncoding !== 'position-raw-pair') validationSource = raw;
+  }
   else {
     const directoryBuffer = Buffer.from(metadata.directoryBase64, 'base64');
     let streams;
@@ -877,6 +942,16 @@ export async function decodeV21StructuredStream(name, encoded, manifest) {
     }
     raw = packDirectoryRans(directoryBuffer, streams, name === 'so3_rotation' ? 'SO3TR001' : 'TATTR001');
   }
-  if (raw.length !== metadata.sourceBytes || sha256(raw) !== metadata.sourceSha256) throw new Error(`Structured ${name} lossless reconstruction failed.`);
+  if (metadata.sourceEncoding === 'position-raw-pair') {
+    const valid = positionRaw
+      && positionRaw.mainRaw.length === metadata.sourceMainBytes
+      && positionRaw.mainRaw.length + positionRaw.exceptionRaw.length === metadata.sourceBytes
+      && sha256(positionRaw.mainRaw) === metadata.sourceMainSha256
+      && sha256(positionRaw.exceptionRaw) === metadata.sourceExceptionSha256;
+    if (!valid) throw new Error(`Structured ${name} raw-context reconstruction failed.`);
+  } else {
+    validationSource ??= raw;
+    if (validationSource.length !== metadata.sourceBytes || sha256(validationSource) !== metadata.sourceSha256) throw new Error(`Structured ${name} lossless reconstruction failed.`);
+  }
   return raw;
 }

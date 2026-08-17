@@ -58,6 +58,7 @@ function extracted(
 describe('RAW4D multi-part sequence', () => {
   it('sorts explicit frame ranges and removes duplicate boundary frames', () => {
     expect(raw4DSequenceFrameRangeFromName('segment_180_210.raw4d')).toEqual({ firstFrame: 180, lastFrame: 210 });
+    expect(raw4DSequenceFrameRangeFromName('segment_180_210.ply4')).toEqual({ firstFrame: 180, lastFrame: 210 });
     const segments = buildRaw4DSequenceSegments([
       { fileIndex: 0, name: 'segment_210_240.raw4d', header: header(31, 4) },
       { fileIndex: 1, name: 'segment_180_210.raw4d', header: header(31, 3) },
@@ -65,6 +66,7 @@ describe('RAW4D multi-part sequence', () => {
     ]);
     expect(segments.map((segment) => segment.fileIndex)).toEqual([1, 0, 2]);
     expect(locateRaw4DSequenceFrame(segments, 29)).toMatchObject({ segmentIndex: 0, localFrame: 29, sourceFrame: 209 });
+    expect(locateRaw4DSequenceFrame(segments, 29.5)).toMatchObject({ segmentIndex: 0, localFrame: 29.5, sourceFrame: 209.5 });
     expect(locateRaw4DSequenceFrame(segments, 30)).toMatchObject({ segmentIndex: 1, localFrame: 0, sourceFrame: 210 });
     expect(locateRaw4DSequenceFrame(segments, 79)).toMatchObject({ segmentIndex: 2, localFrame: 19, sourceFrame: 259 });
   });

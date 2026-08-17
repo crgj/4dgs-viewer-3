@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { SCENE_AXIS_BARS, SCENE_AXIS_COLORS, SCENE_AXIS_SEGMENTS } from './SceneGuides';
+import {
+  SCENE_AXIS_BARS,
+  SCENE_AXIS_COLORS,
+  SCENE_AXIS_SEGMENTS,
+  SCENE_HEIGHT_RULER,
+  SCENE_HEIGHT_RULER_TICKS,
+} from './SceneGuides';
 
 describe('SCENE_AXIS_COLORS', () => {
   it('uses distinct red X, green Y and blue Z colors', () => {
@@ -11,12 +17,25 @@ describe('SCENE_AXIS_COLORS', () => {
     expect([x[3], y[3], z[3]]).toEqual([255, 255, 255]);
   });
 
-  it('draws the up Y axis exactly 1.5 meters high from the origin', () => {
+  it('keeps the three direction axes at one meter', () => {
     expect(SCENE_AXIS_SEGMENTS.y.start).toEqual([0, 0, 0]);
-    expect(SCENE_AXIS_SEGMENTS.y.end).toEqual([0, 1.5, 0]);
-    expect(SCENE_AXIS_BARS.y.position).toEqual([0, 0.75, 0]);
-    expect(SCENE_AXIS_BARS.y.scale).toEqual([0.015, 1.5, 0.015]);
+    expect(SCENE_AXIS_SEGMENTS.y.end).toEqual([0, 1, 0]);
+    expect(SCENE_AXIS_BARS.y.position).toEqual([0, 0.5, 0]);
+    expect(SCENE_AXIS_BARS.y.scale).toEqual([0.015, 1, 0.015]);
     expect(SCENE_AXIS_BARS.x.scale[0]).toBe(1);
     expect(SCENE_AXIS_BARS.z.scale[2]).toBe(1);
+  });
+
+  it('builds a separate two-meter ruler with centimeter ticks and decimeter labels', () => {
+    expect(SCENE_HEIGHT_RULER.height).toBe(2);
+    expect(SCENE_HEIGHT_RULER_TICKS).toHaveLength(201);
+    expect(SCENE_HEIGHT_RULER_TICKS[0].height).toBe(0);
+    expect(SCENE_HEIGHT_RULER_TICKS.at(-1)?.height).toBe(2);
+    expect(SCENE_HEIGHT_RULER_TICKS.filter((tick) => tick.label !== null).map((tick) => tick.label))
+      .toEqual(Array.from({ length: 21 }, (_, index) => index * 10));
+    expect(SCENE_HEIGHT_RULER_TICKS.find((tick) => tick.centimeters === 100)?.length)
+      .toBeGreaterThan(SCENE_HEIGHT_RULER_TICKS.find((tick) => tick.centimeters === 10)?.length ?? 0);
+    expect(SCENE_HEIGHT_RULER_TICKS.find((tick) => tick.centimeters === 10)?.length)
+      .toBeGreaterThan(SCENE_HEIGHT_RULER_TICKS.find((tick) => tick.centimeters === 1)?.length ?? 0);
   });
 });

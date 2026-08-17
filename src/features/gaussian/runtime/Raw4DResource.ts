@@ -26,6 +26,13 @@ interface Raw4DResourceMetadata {
   calcAabb(result: BoundingBox): boolean;
 }
 
+// #WDD-gpt 2026-08-16 - SH 打包范围必须覆盖首项为负数的情况，避免 f_rest_0 被错误裁剪。
+export function raw4DShPackingMaximum(values: readonly number[]): number {
+  let maximum = 0;
+  for (const value of values) maximum = Math.max(maximum, Math.abs(value));
+  return maximum;
+}
+
 export class Raw4DResource extends GSplatResourceBase {
   readonly shBands: number;
   readonly gpuByteSize: number;
@@ -166,10 +173,7 @@ export class Raw4DResource extends GSplatResourceBase {
           this.asset.shRest[coefficient + coefficientCount * 2], index, this.asset.sourceEncoding,
         );
       }
-      let maximum = values[0];
-      for (let value = 1; value < values.length; value += 1) {
-        maximum = Math.max(maximum, Math.abs(values[value]));
-      }
+      const maximum = raw4DShPackingMaximum(values);
       if (maximum === 0) continue;
       for (let coefficient = 0; coefficient < coefficientCount; coefficient += 1) {
         const offset = coefficient * 3;

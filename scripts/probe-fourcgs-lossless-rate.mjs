@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { join, resolve } from 'node:path';
 import { matchFourCgsBoundary } from '../src/features/gaussian/formats/fourcgs/FourCgsBoundaryMatcher.ts';
 
-const SEGMENT_PATTERN = /^segment_(\d+)_(\d+)\.raw4d$/;
+const SEGMENT_PATTERN = /^segment_(\d+)_(\d+)\.(?:raw4d|ply4)$/i;
 export const SAFE_LIMITS = {
   cellSize: 0.008,
   maxPositionDistance: 0.016,
@@ -63,10 +63,26 @@ export async function readSegment(path) {
       headerSize *= 2;
     }
     if (!header || dataOffset < 0) throw new Error(`Invalid RAW4D header: ${path}`);
+    if (!/^format binary_little_endian 1\.0$/m.test(header)) throw new Error(`RAW4D must be binary little-endian PLY: ${path}`);
+    const elements = [...header.matchAll(/^element\s+(\S+)\s+(\d+)$/gm)];
+    if (elements.length !== 1 || elements[0][1] !== 'vertex') {
+      throw new Error(`RAW4D must contain exactly one vertex element and no face element: ${path}`);
+    }
     const count = Number(/^element vertex (\d+)$/m.exec(header)?.[1]);
-    const propertyNames = [...header.matchAll(/^property \S+ (\S+)$/gm)].map((match) => match[1]);
+    const propertyDeclarations = [...header.matchAll(/^property (\S+) (\S+)$/gm)];
+    const propertyNames = propertyDeclarations.map((match) => match[2]);
     const propertyIndex = new Map(propertyNames.map((name, index) => [name, index]));
+    const comments = new Map([...header.matchAll(/^comment\s+(\S+)\s+(.+)$/gm)].map((match) => [match[1], match[2].trim()]));
+    // #WDD-gpt 2026-08-16 - 压缩器操作的是 FP16 位流；明确拒绝 canonical float32，避免按 2 字节记录静默错位读取。
+    if (comments.get('fp16_quantized') !== '1'
+      || propertyDeclarations.some((match) => !['ushort', 'uint16'].includes(match[1]))) {
+      throw new Error(`4CGS encoder requires an fp16_quantized RAW4D/PLY4 source: ${path}`);
+    }
+    if (!Number.isSafeInteger(count) || count <= 0 || propertyNames.length === 0 || propertyIndex.size !== propertyNames.length) {
+      throw new Error(`Invalid RAW4D vertex layout: ${path}`);
+    }
     const byteLength = count * propertyNames.length * 2;
+    if ((await handle.stat()).size !== dataOffset + byteLength) throw new Error(`RAW4D payload size mismatch: ${path}`);
     const payload = Buffer.allocUnsafe(byteLength);
     let offset = 0;
     while (offset < byteLength) {
@@ -79,6 +95,7 @@ export async function readSegment(path) {
       count,
       propertyNames,
       propertyIndex,
+      comments,
       rows: new Uint16Array(payload.buffer, payload.byteOffset, payload.byteLength / 2),
     };
   } finally {

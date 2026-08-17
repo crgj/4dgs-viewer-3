@@ -1,6 +1,12 @@
-import type { Application } from 'playcanvas';
+import {
+  SHADERLANGUAGE_GLSL,
+  SHADERLANGUAGE_WGSL,
+  ShaderChunks,
+  type Application,
+} from 'playcanvas';
 
 export type GaussianRenderMode = 'gaussian' | 'point' | 'ellipse' | 'all';
+export type GaussianRasterKernel = 'playcanvas' | 'gsplat';
 
 export const gaussianRenderModeValues: Record<GaussianRenderMode, number> = {
   gaussian: 0,
@@ -16,6 +22,212 @@ interface GaussianRenderThresholds {
 
 const renderThresholds = new WeakMap<Application, GaussianRenderThresholds>();
 const relightingEnabled = new WeakMap<Application, boolean>();
+const GSPLAT_KERNEL_EXTENT = 3.33;
+const GSPLAT_KERNEL_EXPONENT = 0.5 * GSPLAT_KERNEL_EXTENT * GSPLAT_KERNEL_EXTENT;
+
+function replaceRequired(source: string, search: string, replacement: string, chunk: string): string {
+  if (!source.includes(search)) throw new Error(`PlayCanvas ${chunk} changed; gsplat compatibility profile must be updated.`);
+  return source.replace(search, replacement);
+}
+
+function gsplatProjectionChunks(app: Application, language: typeof SHADERLANGUAGE_GLSL | typeof SHADERLANGUAGE_WGSL): {
+  corner: string;
+  common: string;
+  vertex: string;
+} {
+  const chunks = ShaderChunks.get(app.graphicsDevice, language);
+  const isWgsl = language === SHADERLANGUAGE_WGSL;
+  let corner = chunks.get('gsplatCornerVS');
+  let common = chunks.get('gsplatCommonVS');
+  let vertex = chunks.get('gsplatVS');
+  corner = replaceRequired(
+    corner,
+    '2.0 * min(sqrt(2.0 * lambda1), vmin)',
+    `${GSPLAT_KERNEL_EXTENT} * min(sqrt(lambda1), vmin)`,
+    'gsplatCornerVS',
+  );
+  corner = replaceRequired(
+    corner,
+    '2.0 * min(sqrt(2.0 * lambda2), vmin)',
+    `${GSPLAT_KERNEL_EXTENT} * min(sqrt(lambda2), vmin)`,
+    'gsplatCornerVS',
+  );
+  common = replaceRequired(
+    common,
+    isWgsl ? '* half(0.5)' : '* 0.5',
+    isWgsl ? `/ sqrt(half(${GSPLAT_KERNEL_EXPONENT}))` : `/ sqrt(${GSPLAT_KERNEL_EXPONENT})`,
+    'gsplatCommonVS',
+  );
+  if (isWgsl) {
+    vertex = replaceRequired(vertex, 'varying gaussianUV: half2;', 'varying gaussianUV: vec2f;', 'gsplatVS');
+    vertex = replaceRequired(vertex, 'varying gaussianColor: half4;', 'varying gaussianColor: vec4f;', 'gsplatVS');
+    vertex = replaceRequired(vertex, 'output.gaussianUV = corner.uv;', 'output.gaussianUV = vec2f(corner.uv);', 'gsplatVS');
+    vertex = replaceRequired(
+      vertex,
+      'output.gaussianColor = half4(half3(rampColor), clr.a);',
+      'output.gaussianColor = vec4f(rampColor, f32(clr.a));',
+      'gsplatVS',
+    );
+    vertex = replaceRequired(
+      vertex,
+      'output.gaussianColor = half4(half3(prepareOutputFromGamma(max(vec3f(clr.xyz), vec3f(0.0)), -center.view.z)), clr.w);',
+      'output.gaussianColor = vec4f(prepareOutputFromGamma(max(vec3f(clr.xyz), vec3f(0.0)), -center.view.z), f32(clr.w));',
+      'gsplatVS',
+    );
+  } else {
+    vertex = replaceRequired(vertex, 'varying mediump vec2 gaussianUV;', 'varying highp vec2 gaussianUV;', 'gsplatVS');
+    vertex = replaceRequired(vertex, 'varying mediump vec4 gaussianColor;', 'varying highp vec4 gaussianColor;', 'gsplatVS');
+  }
+  return { corner, common, vertex };
+}
+
+// #WDD-gpt 2026-08-16 - Python gsplat直接计算 opacity*exp(-sigma)，不使用PlayCanvas在核边缘归零的归一化指数。
+const gsplatFragmentGLSL = `
+uniform float dongGsplatKernelExponent;
+#ifndef DITHER_NONE
+    #include "bayerPS"
+    #include "opacityDitherPS"
+    varying float id;
+#endif
+
+#if defined(SHADOW_PASS) || defined(PICK_PASS) || defined(PREPASS_PASS)
+    uniform float alphaClip;
+#endif
+
+#ifdef PREPASS_PASS
+    varying float vLinearDepth;
+    #include "floatAsUintPS"
+#endif
+
+#if !defined(SHADOW_PASS) && !defined(PICK_PASS) && !defined(PREPASS_PASS)
+    uniform float alphaClipForward;
+#endif
+
+varying highp vec2 gaussianUV;
+varying highp vec4 gaussianColor;
+
+#if defined(GSPLAT_UNIFIED_ID) && defined(PICK_PASS)
+    flat varying uint vPickId;
+#endif
+
+#ifdef PICK_PASS
+    #include "pickPS"
+#endif
+
+#ifdef GSPLAT_USER_VARYINGS
+    #include "gsplatUserVaryingsPS"
+#endif
+#include "gsplatModifyPS"
+
+void main(void) {
+    highp float A = dot(gaussianUV, gaussianUV);
+    if (A > 1.0) discard;
+
+    highp float alpha = min(0.999, exp(-dongGsplatKernelExponent * A) * gaussianColor.a);
+
+    #if defined(SHADOW_PASS) || defined(PICK_PASS) || defined(PREPASS_PASS)
+        if (alpha < alphaClip) discard;
+    #endif
+
+    #ifdef PICK_PASS
+        #ifdef GSPLAT_UNIFIED_ID
+            pcFragColor0 = encodePickOutput(vPickId);
+        #else
+            pcFragColor0 = getPickOutput();
+        #endif
+        #ifdef DEPTH_PICK_PASS
+            pcFragColor1 = getPickDepth();
+        #endif
+    #elif SHADOW_PASS
+        gl_FragColor = vec4(gl_FragCoord.z, 0.0, 0.0, 1.0);
+    #elif PREPASS_PASS
+        gl_FragColor = float2vec4(vLinearDepth);
+    #else
+        if (alpha < alphaClipForward) discard;
+        #ifndef DITHER_NONE
+            opacityDither(alpha, id * 0.013);
+        #endif
+        vec4 fragColor = vec4(gaussianColor.xyz, alpha);
+        modifySplatColor(gaussianUV, fragColor);
+        gl_FragColor = vec4(fragColor.xyz * fragColor.a, fragColor.a);
+    #endif
+}
+`;
+
+const gsplatFragmentWGSL = `
+uniform dongGsplatKernelExponent: f32;
+#ifndef DITHER_NONE
+    #include "bayerPS"
+    #include "opacityDitherPS"
+    varying id: f32;
+#endif
+
+#if defined(SHADOW_PASS) || defined(PICK_PASS) || defined(PREPASS_PASS)
+    uniform alphaClip: f32;
+#endif
+
+#ifdef PREPASS_PASS
+    varying vLinearDepth: f32;
+    #include "floatAsUintPS"
+#endif
+
+#if !defined(SHADOW_PASS) && !defined(PICK_PASS) && !defined(PREPASS_PASS)
+    uniform alphaClipForward: f32;
+#endif
+
+varying gaussianUV: vec2f;
+varying gaussianColor: vec4f;
+
+#if defined(GSPLAT_UNIFIED_ID) && defined(PICK_PASS)
+    varying @interpolate(flat) vPickId: u32;
+#endif
+
+#ifdef PICK_PASS
+    #include "pickPS"
+#endif
+
+#ifdef GSPLAT_USER_VARYINGS
+    #include "gsplatUserVaryingsPS"
+#endif
+#include "gsplatModifyPS"
+
+@fragment
+fn fragmentMain(input: FragmentInput) -> FragmentOutput {
+    var output: FragmentOutput;
+    let A = dot(gaussianUV, gaussianUV);
+    if (A > 1.0) { discard; }
+
+    let alpha = min(0.999, exp(-uniform.dongGsplatKernelExponent * A) * gaussianColor.a);
+
+    #if defined(SHADOW_PASS) || defined(PICK_PASS) || defined(PREPASS_PASS)
+        if (alpha < uniform.alphaClip) { discard; return output; }
+    #endif
+
+    #ifdef PICK_PASS
+        #ifdef GSPLAT_UNIFIED_ID
+            output.color = encodePickOutput(vPickId);
+        #else
+            output.color = getPickOutput();
+        #endif
+        #ifdef DEPTH_PICK_PASS
+            output.color1 = getPickDepth();
+        #endif
+    #elif SHADOW_PASS
+        output.color = vec4f(input.position.z, 0.0, 0.0, 1.0);
+    #elif PREPASS_PASS
+        output.color = float2vec4(vLinearDepth);
+    #else
+        if (alpha < uniform.alphaClipForward) { discard; }
+        #ifndef DITHER_NONE
+            opacityDither(alpha, id * 0.013);
+        #endif
+        var fragColor = vec4f(gaussianColor.xyz, alpha);
+        modifySplatColor(gaussianUV, &fragColor);
+        output.color = vec4f(fragColor.xyz * fragColor.a, fragColor.a);
+    #endif
+    return output;
+}
+`;
 
 const modifyVertexGLSL = `
 uniform float dongRenderMode;
@@ -156,8 +368,8 @@ void modifySplatColor(vec2 gaussianUV, inout vec4 color) {
     if (dongRenderMode > 2.5) return;
     vec4 lit = textureLod(uRelightMap, gl_FragCoord.xy * uScreenSize.zw, 0.0);
     vec3 hdrLighting = max(lit.rgb * uRelightBrightness, vec3(0.0));
-    vec3 compressedLighting = 2.0 * hdrLighting / (vec3(1.0) + hdrLighting);
-    vec3 factor = mix(vec3(uRelightBackground), compressedLighting, lit.a);
+    vec3 displayLighting = log2(vec3(1.0) + hdrLighting);
+    vec3 factor = mix(vec3(uRelightBackground), displayLighting, lit.a);
     // #WDD-gpt 2026-08-16 - Apply the light factor as bounded display exposure: factor 1 is unchanged, shadows darken, and highlights approach white without clipping all source channels.
     vec3 boundedBaseColor = clamp(color.rgb, vec3(0.0), vec3(0.999999));
     vec3 boundedRelitColor = vec3(1.0) - pow(max(vec3(1.0) - boundedBaseColor, vec3(0.000001)), max(factor, vec3(0.0)));
@@ -201,8 +413,8 @@ fn modifySplatColor(gaussianUV: vec2f, color: ptr<function, vec4f>) {
     if (uniform.dongRenderMode > 2.5) { return; }
     let lit = textureSampleLevel(uRelightMap, uRelightMapSampler, pcPosition.xy * uniform.uScreenSize.zw, 0.0);
     let hdrLighting = max(lit.rgb * uniform.uRelightBrightness, vec3f(0.0));
-    let compressedLighting = 2.0 * hdrLighting / (vec3f(1.0) + hdrLighting);
-    let factor = mix(vec3f(uniform.uRelightBackground), compressedLighting, lit.a);
+    let displayLighting = log2(vec3f(1.0) + hdrLighting);
+    let factor = mix(vec3f(uniform.uRelightBackground), displayLighting, lit.a);
     // #WDD-gpt 2026-08-16 - Match the bounded GLSL exposure transfer so WebGPU preserves the captured Gaussian color under strong lights.
     let boundedBaseColor = clamp((*color).rgb, vec3f(0.0), vec3f(0.999999));
     let boundedRelitColor = vec3f(1.0) - pow(max(vec3f(1.0) - boundedBaseColor, vec3f(0.000001)), max(factor, vec3f(0.0)));
@@ -231,6 +443,8 @@ export function installGaussianRenderModes(app: Application, initialMode: Gaussi
   material.shaderChunks.glsl.set('gsplatModifyVS', modifyVertexGLSL);
   material.shaderChunks.wgsl.set('gsplatModifyVS', modifyVertexWGSL);
   installFragmentChunk(app);
+  // #WDD-gpt 2026-08-16 - 默认采用与Python gsplat一致的指数核、0.999 alpha上限和3.33σ覆盖范围。
+  setGaussianRasterKernel(app, 'gsplat');
   setGaussianRenderMode(app, initialMode);
 }
 
@@ -239,6 +453,33 @@ export function setGaussianRelightingShader(app: Application, enabled: boolean):
   relightingEnabled.set(app, enabled);
   installFragmentChunk(app);
   app.scene.gsplat.material.update();
+}
+
+export function setGaussianRasterKernel(app: Application, kernel: GaussianRasterKernel): void {
+  const material = app.scene.gsplat.material;
+  if (kernel === 'gsplat') {
+    const glslProjection = gsplatProjectionChunks(app, SHADERLANGUAGE_GLSL);
+    const wgslProjection = gsplatProjectionChunks(app, SHADERLANGUAGE_WGSL);
+    material.shaderChunks.glsl.set('gsplatPS', gsplatFragmentGLSL);
+    material.shaderChunks.wgsl.set('gsplatPS', gsplatFragmentWGSL);
+    material.shaderChunks.glsl.set('gsplatCornerVS', glslProjection.corner);
+    material.shaderChunks.wgsl.set('gsplatCornerVS', wgslProjection.corner);
+    material.shaderChunks.glsl.set('gsplatCommonVS', glslProjection.common);
+    material.shaderChunks.wgsl.set('gsplatCommonVS', wgslProjection.common);
+    material.shaderChunks.glsl.set('gsplatVS', glslProjection.vertex);
+    material.shaderChunks.wgsl.set('gsplatVS', wgslProjection.vertex);
+    material.setParameter('dongGsplatKernelExponent', GSPLAT_KERNEL_EXPONENT);
+  } else {
+    material.shaderChunks.glsl.delete('gsplatPS');
+    material.shaderChunks.wgsl.delete('gsplatPS');
+    material.shaderChunks.glsl.delete('gsplatCornerVS');
+    material.shaderChunks.wgsl.delete('gsplatCornerVS');
+    material.shaderChunks.glsl.delete('gsplatCommonVS');
+    material.shaderChunks.wgsl.delete('gsplatCommonVS');
+    material.shaderChunks.glsl.delete('gsplatVS');
+    material.shaderChunks.wgsl.delete('gsplatVS');
+  }
+  material.update();
 }
 
 export function setGaussianRenderMode(app: Application, mode: GaussianRenderMode): void {

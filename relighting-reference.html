@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Gaussian Relighting Reference</title>
+    <style>
+      :root { color: #e8edf6; background: #080b10; font: 14px/1.5 ui-monospace, monospace; }
+      body { display: grid; min-height: 100vh; margin: 0; place-items: center; }
+      main { display: grid; width: min(92vw, 760px); gap: 14px; padding: 20px; border: 1px solid #273142; border-radius: 14px; background: #10151e; }
+      h1, p, pre { margin: 0; }
+      h1 { font-size: 16px; }
+      p { color: #94a0b3; }
+      canvas { width: min(70vw, 512px); height: min(70vw, 512px); justify-self: center; border: 1px solid #303a49; background: #000; }
+      #gpu { display: none; }
+      pre { overflow: auto; padding: 12px; border-radius: 8px; color: #b8c7db; background: #090c12; }
+      body[data-status="pass"] pre { color: #76e5ad; }
+      body[data-status="fail"] pre { color: #ff8d98; }
+    </style>
+  </head>
+  <body data-status="running">
+    <main>
+      <h1>GS2Mesh 点光参考渲染</h1>
+      <p>独立 PlayCanvas 场景：验证左右光源方向和 range 的真实像素变化，不加载正式编辑器。</p>
+      <canvas height="384" id="preview" width="384"></canvas>
+      <canvas height="384" id="gpu" width="384"></canvas>
+      <pre id="result">running…</pre>
+    </main>
+    <script type="module" src="/src/plugins/relighting/reference/main.ts"></script>
+  </body>
+</html>

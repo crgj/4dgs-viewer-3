@@ -74,6 +74,11 @@ export class GaussianSequenceEditStore {
     return this.entries.reduce((total, entry) => total + entry.edits.deletionCount, 0);
   }
 
+  activeUndeletedCount(): number {
+    const active = this.editsForActiveSegment();
+    return active ? Math.max(0, active.pointCount - active.deletionCount) : 0;
+  }
+
   clearSelection(scope: 'visible' | 'global'): void {
     for (const entry of this.entriesForScope(scope)) entry.edits.select([], 'replace');
   }

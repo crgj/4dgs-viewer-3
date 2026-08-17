@@ -7,6 +7,8 @@ import {
   SH_COEFFICIENTS_BY_BAND,
   staticTrack,
 } from './GaussianImportUtils';
+import { RAW4D_FLOAT16_DECODE_TABLE } from '../raw4d/Raw4DFloat16';
+import { raw4DCanonicalKeyframes } from '../raw4d/Raw4DSchema';
 
 // #WDD-gpt 2026-08-16 - PLY 与 PLY4 直接解码为共享 canonical 轨道，不创建格式专属渲染资源。
 
@@ -113,7 +115,32 @@ function commentNumber(comments: readonly string[], key: string, fallback: numbe
 }
 
 function inferShBands(restCount: number): 0 | 1 | 2 | 3 {
-  return restCount >= 45 ? 3 : restCount >= 24 ? 2 : restCount >= 9 ? 1 : 0;
+  if (restCount === 45) return 3;
+  if (restCount === 24) return 2;
+  if (restCount === 9) return 1;
+  if (restCount === 0) return 0;
+  throw new Error(`PLY4 has an unsupported SH coefficient count: ${restCount}.`);
+}
+
+function trackBounds(track: Raw4DTrack): Raw4DAsset['bounds'] {
+  let result = calculateBounds(
+    track.values[0] as Float32Array,
+    track.values[1] as Float32Array,
+    track.values[2] as Float32Array,
+  );
+  for (let key = 1; key < track.keyframes.length; key += 1) {
+    const offset = key * 3;
+    const current = calculateBounds(
+      track.values[offset] as Float32Array,
+      track.values[offset + 1] as Float32Array,
+      track.values[offset + 2] as Float32Array,
+    );
+    result = {
+      min: result.min.map((value, axis) => Math.min(value, current.min[axis])) as unknown as [number, number, number],
+      max: result.max.map((value, axis) => Math.max(value, current.max[axis])) as unknown as [number, number, number],
+    };
+  }
+  return result;
 }
 
 function propertyBanks(
@@ -121,14 +148,17 @@ function propertyBanks(
 ): PlyPropertyBank[] {
   const names = new Set(properties.map((property) => property.name));
   const escapedPrefix = prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const pattern = new RegExp(`^${escapedPrefix}_bank_(\\d+)_`);
+  const pattern = new RegExp(`^${escapedPrefix}_bank_(\\d+)(?:_|$)`);
   const indices = new Set<number>();
   for (const name of names) {
     const match = name.match(pattern);
     if (match) indices.add(Number(match[1]));
   }
-  return [...indices].sort((left, right) => left - right).map((index) => {
-    const bankNames = components.map((component) => `${prefix}_bank_${index}_${component}`);
+  return [...indices].sort((left, right) => left - right).map((index, order) => {
+    if (index !== order) throw new Error(`PLY4 bank ${prefix} indices must be continuous from 0; found ${index}.`);
+    const bankNames = components.map((component) => (
+      component ? `${prefix}_bank_${index}_${component}` : `${prefix}_bank_${index}`
+    ));
     const missing = bankNames.filter((name) => !names.has(name));
     if (missing.length > 0) {
       throw new Error(`PLY4 bank ${prefix}[${index}] is incomplete; missing ${missing.join(', ')}.`);
@@ -142,6 +172,7 @@ function makeTrack(
   banks: readonly PlyPropertyBank[],
   baseNames: readonly string[],
   stride: number,
+  totalFrames: number,
   fallback?: readonly number[],
 ): Raw4DTrack {
   const groups = banks.length > 0 ? banks.map((bank) => bank.names) : [baseNames];
@@ -158,7 +189,7 @@ function makeTrack(
   return {
     encoding: 'float32',
     components: baseNames.length,
-    keyframes: banks.length > 0 ? banks.map((bank) => bank.index * stride) : [0],
+    keyframes: banks.length > 1 ? raw4DCanonicalKeyframes(totalFrames, stride, banks.length) : [0],
     values: groups.flatMap((names) => names.map((name) => map.get(name)!)),
   };
 }
@@ -187,6 +218,10 @@ export async function decodePlyGaussian(
   abortIfRequested(options.signal);
   const bytes = new Uint8Array(buffer);
   const header = parseHeader(bytes);
+  const fp16Quantized = commentValue(header.comments, 'fp16_quantized') === '1';
+  if (fp16Quantized && header.properties.some((property) => property.type !== 'ushort')) {
+    throw new Error('PLY4 fp16_quantized 1 requires every vertex property to use ushort FP16 bit patterns.');
+  }
   const estimatedBytes = header.vertexCount * Math.max(14, header.properties.length) * 4;
   if (estimatedBytes > options.cpuBudgetBytes) {
     throw new Error(`PLY 解码预计需要 ${(estimatedBytes / 1e9).toFixed(2)} GB，超过统一内存预算。`);
@@ -200,7 +235,9 @@ export async function decodePlyGaussian(
     if (tokens.length < expected) throw new Error('ASCII PLY vertex data is truncated.');
     for (let row = 0; row < header.vertexCount; row += 1) {
       for (let column = 0; column < header.properties.length; column += 1) {
-        values.get(header.properties[column].name)![row] = Number(tokens[row * header.properties.length + column]);
+        const property = header.properties[column];
+        const scalar = Number(tokens[row * header.properties.length + column]);
+        values.get(property.name)![row] = fp16Quantized ? RAW4D_FLOAT16_DECODE_TABLE[scalar & 0xffff] : scalar;
       }
       if ((row & 0x3fff) === 0) abortIfRequested(options.signal);
     }
@@ -212,7 +249,8 @@ export async function decodePlyGaussian(
     for (let row = 0; row < header.vertexCount; row += 1) {
       const base = header.dataOffset + row * header.recordBytes;
       for (const property of header.properties) {
-        values.get(property.name)![row] = readBinaryScalar(view, base + property.offset, property.type, littleEndian);
+        const scalar = readBinaryScalar(view, base + property.offset, property.type, littleEndian);
+        values.get(property.name)![row] = fp16Quantized ? RAW4D_FLOAT16_DECODE_TABLE[scalar & 0xffff] : scalar;
       }
       if ((row & 0x3fff) === 0) abortIfRequested(options.signal);
     }
@@ -222,8 +260,10 @@ export async function decodePlyGaussian(
   const positionBanks = propertyBanks(header.properties, 'xyz', ['x', 'y', 'z']);
   const rotationBanks = propertyBanks(header.properties, 'rot', ['w', 'x', 'y', 'z']);
   const dcBanks = propertyBanks(header.properties, 'f_dc', ['0', '1', '2']);
+  const scaleBanks = propertyBanks(header.properties, 'scale', ['0', '1', '2']);
+  const opacityBanks = propertyBanks(header.properties, 'opacity', ['']);
   const totalFrames = Math.max(1, Math.round(commentNumber(header.comments, 'total_frames', 1)));
-  const position = makeTrack(values, positionBanks, ['x', 'y', 'z'], commentNumber(header.comments, 'xyz_bank_keyframe_stride', 1));
+  const position = makeTrack(values, positionBanks, ['x', 'y', 'z'], commentNumber(header.comments, 'xyz_bank_keyframe_stride', 1), totalFrames);
   const rotationBase = propertyNames.includes('rot_0')
     ? ['rot_0', 'rot_1', 'rot_2', 'rot_3']
     : ['qw', 'qx', 'qy', 'qz'];
@@ -234,14 +274,19 @@ export async function decodePlyGaussian(
       rotationBanks,
       rotationBase,
       commentNumber(header.comments, 'rot_bank_keyframe_stride', 1),
+      totalFrames,
       [1, 0, 0, 0],
     ),
     commentValue(header.comments, 'rot_bank_component_order'),
   );
-  const colorDc = makeTrack(values, dcBanks, ['f_dc_0', 'f_dc_1', 'f_dc_2'], commentNumber(header.comments, 'features_dc_bank_keyframe_stride', 1));
-  const scale = makeTrack(values, [], ['scale_0', 'scale_1', 'scale_2'], 1);
-  const opacity = makeTrack(values, [], ['opacity'], 1);
+  const dcStride = commentNumber(header.comments, 'features_dc_bank_keyframe_stride', 1);
+  const colorDc = makeTrack(values, dcBanks, ['f_dc_0', 'f_dc_1', 'f_dc_2'], dcStride, totalFrames);
+  const scale = makeTrack(values, scaleBanks, ['scale_0', 'scale_1', 'scale_2'], commentNumber(header.comments, 'scaling_bank_keyframe_stride', dcStride), totalFrames);
+  const opacity = makeTrack(values, opacityBanks, ['opacity'], commentNumber(header.comments, 'opacity_bank_keyframe_stride', dcStride), totalFrames);
   const restNames = propertyNames.filter((name) => /^f_rest_\d+$/.test(name)).sort((a, b) => Number(a.slice(7)) - Number(b.slice(7)));
+  restNames.forEach((name, index) => {
+    if (name !== `f_rest_${index}`) throw new Error(`PLY4 SH properties must be continuous; found ${name}.`);
+  });
   const shBands = inferShBands(restNames.length);
   const shRest = restNames.slice(0, SH_COEFFICIENTS_BY_BAND[shBands] * 3).map((name) => values.get(name)!);
   const lifetimeMu = values.get('lifetime_mu') ?? new Float32Array(header.vertexCount).fill((totalFrames - 1) / 2);
@@ -260,7 +305,7 @@ export async function decodePlyGaussian(
     shRest,
     lifetimeMu,
     lifetimeW,
-    bounds: calculateBounds(position.values[0], position.values[1], position.values[2]),
+    bounds: trackBounds(position),
   };
   const format = /\.ply4$/i.test(file.name) || positionBanks.length > 1 || totalFrames > 1 ? 'PLY4' : 'PLY';
   options.onProgress?.({ ratio: 1, stage: 'finalizing', message: `${format} 解码完成` });

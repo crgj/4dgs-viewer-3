@@ -1,4 +1,7 @@
-export type Gaussian4DMemoryMode = 'auto' | 'compatible' | 'balanced' | 'performance' | 'custom';
+export type Gaussian4DMemoryMode = 'auto' | 'compatible' | 'balanced' | 'performance' | 'local-maximum' | 'custom';
+
+// #WDD-gpt 2026-08-16 - 工作站版本默认直接启用高 RAM/VRAM 预算；用户仍可在性能面板切换到较低预设。
+export const DEFAULT_GAUSSIAN_4D_MEMORY_MODE: Gaussian4DMemoryMode = 'local-maximum';
 
 export interface Gaussian4DMemoryPolicy {
   readonly mode: Gaussian4DMemoryMode;
@@ -45,6 +48,14 @@ export const GAUSSIAN_4D_MEMORY_POLICIES: Readonly<
     mode: 'performance',
     cpuBudgetBytes: 12 * GIB,
     gpuBudgetBytes: 6 * GIB,
+    gpuChunkBytes: 256 * MIB,
+    preloadAllKeyframes: true,
+  },
+  // #WDD-gpt 2026-08-16 - 面向 64GB RAM / 16GB VRAM 工作站提供默认高驻留预设，切回该模式时仍保留风险确认。
+  'local-maximum': {
+    mode: 'local-maximum',
+    cpuBudgetBytes: 32 * GIB,
+    gpuBudgetBytes: 12 * GIB,
     gpuChunkBytes: 256 * MIB,
     preloadAllKeyframes: true,
   },

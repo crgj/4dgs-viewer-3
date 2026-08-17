@@ -6,6 +6,8 @@ export interface FourCgsBankCounts {
   readonly opacity: number;
 }
 
+export type FourCgsKeyframeStrides = FourCgsBankCounts;
+
 export interface FourCgsSegment {
   readonly name: string;
   readonly firstFrame: number;
@@ -13,11 +15,12 @@ export interface FourCgsSegment {
   readonly gaussianCount: number;
   readonly totalFrames: number;
   readonly bankCounts: FourCgsBankCounts;
+  readonly keyframeStrides?: FourCgsKeyframeStrides;
 }
 
 export interface FourCgsStreamEntry {
   readonly name: string;
-  readonly compression: 'raw' | 'deflate' | 'brotli' | 'brotli-shuffle16';
+  readonly compression: 'raw' | 'deflate' | 'deflate-shuffle16' | 'brotli' | 'brotli-shuffle16';
   readonly rawBytes: number;
   readonly storedBytes: number;
   readonly rawSha256: string;
@@ -37,6 +40,18 @@ export interface FourCgsSceneTransform {
 
 export interface FourCgsMetadata {
   readonly sceneTransform?: FourCgsSceneTransform;
+  readonly raw4dBundle?: {
+    readonly version: 1;
+    readonly chunkBytes: number;
+    readonly segmentChunkCounts: readonly number[];
+    readonly sourceNames: readonly string[];
+    readonly sourceByteLengths: readonly number[];
+    readonly sourceSha256: readonly string[];
+    readonly exactSourceBytes: true;
+    readonly originalPointCount?: number;
+    readonly encodedPointCount?: number;
+    readonly deletedPointCount?: number;
+  };
   readonly [key: string]: unknown;
 }
 
@@ -81,6 +96,7 @@ export interface FourCgsDescriptor {
 
 export interface FourCgsDecodeTimings {
   readonly streamReadMs: number;
+  readonly streamWorkerCount?: number;
   readonly attributeDecodeMs: number;
   readonly totalMs: number;
   readonly workerCount: number;
@@ -91,6 +107,12 @@ export interface FourCgsDecodeTimings {
 export interface FourCgsProgress {
   readonly ratio: number;
   readonly message: string;
+  readonly stage?: string;
+  readonly stageRatio?: number;
+  readonly workerCount?: number;
+  readonly completedTasks?: number;
+  readonly totalTasks?: number;
+  readonly elapsedMs?: number;
 }
 
 export interface FourCgsFrameLocation {

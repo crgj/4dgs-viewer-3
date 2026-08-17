@@ -1,6 +1,7 @@
 import type { Raw4DAsset, Raw4DScalarArray, Raw4DTrack } from './Raw4DTypes';
 import type { Raw4DSource } from './Raw4DTypes';
 import { readRaw4DHeader } from './Raw4DParser';
+import { raw4DCanonicalKeyframes } from './Raw4DSchema';
 
 export interface Raw4DExportProgress {
   readonly ratio: number;
@@ -32,9 +33,7 @@ function isDeleted(words: Uint32Array, stableId: number): boolean {
 
 function keyframeStride(track: Raw4DTrack, totalFrames: number): number {
   const stride = track.keyframes.length > 1 ? track.keyframes[1] - track.keyframes[0] : Math.max(1, totalFrames);
-  const expected: number[] = [];
-  for (let frame = 0; frame < totalFrames; frame += stride) expected.push(frame);
-  if (expected.at(-1) !== totalFrames - 1) expected.push(totalFrames - 1);
+  const expected = raw4DCanonicalKeyframes(totalFrames, stride);
   if (expected.length !== track.keyframes.length
     || expected.some((frame, index) => frame !== track.keyframes[index])) {
     throw new Error('RAW4D export requires uniformly strided keyframe banks.');
@@ -60,14 +59,30 @@ function appendTrackColumns(
 }
 
 function createExportColumns(asset: Raw4DAsset): Raw4DExportColumn[] {
+  const zero = asset.sourceEncoding === 'float16'
+    ? new Uint16Array(asset.splatCount)
+    : new Float32Array(asset.splatCount);
   const columns: Raw4DExportColumn[] = [
+    { name: 'x', values: asset.position.values[0] },
+    { name: 'y', values: asset.position.values[1] },
+    { name: 'z', values: asset.position.values[2] },
+    { name: 'nx', values: zero },
+    { name: 'ny', values: zero },
+    { name: 'nz', values: zero },
+    { name: 'f_dc_0', values: asset.colorDc.values[0] },
+    { name: 'f_dc_1', values: asset.colorDc.values[1] },
+    { name: 'f_dc_2', values: asset.colorDc.values[2] },
+    ...asset.shRest.map((values, index) => ({ name: `f_rest_${index}`, values })),
+    { name: 'opacity', values: asset.opacity.values[0] },
+    { name: 'scale_0', values: asset.scale.values[0] },
+    { name: 'scale_1', values: asset.scale.values[1] },
+    { name: 'scale_2', values: asset.scale.values[2] },
     { name: 'lifetime_mu', values: asset.lifetimeMu },
     { name: 'lifetime_w', values: asset.lifetimeW },
   ];
   for (const [key, prefix, components] of TRACK_LAYOUTS) {
     appendTrackColumns(columns, asset[key], prefix, components);
   }
-  asset.shRest.forEach((values, index) => columns.push({ name: `f_rest_${index}`, values }));
   return columns;
 }
 

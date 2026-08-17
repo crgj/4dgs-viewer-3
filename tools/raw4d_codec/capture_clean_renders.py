@@ -122,7 +122,9 @@ def set_evaluation_camera(cdp: CdpClient, camera: dict) -> None:
         "position": camera["position"],
         "rotation": camera["rotation"],
         "fx": camera["fx"],
+        "fy": camera["fy"],
         "sourceWidth": camera["width"],
+        "sourceHeight": camera["height"],
     }
     deadline = time.monotonic() + 15
     last_error: RuntimeError | None = None

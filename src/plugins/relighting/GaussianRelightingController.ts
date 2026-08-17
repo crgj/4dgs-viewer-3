@@ -4,6 +4,7 @@ import {
   Color,
   Entity,
   Gizmo,
+  LIGHTFALLOFF_LINEAR,
   type Layer,
   SHADOWUPDATE_REALTIME,
   SHADOWUPDATE_THISFRAME,
@@ -271,6 +272,8 @@ export class GaussianRelightingController {
     entity.light.color = colorFromHex(spec.color);
     entity.light.intensity = spec.intensity;
     entity.light.range = spec.range;
+    // #WDD-gpt 2026-08-16 - Pin the attenuation model so the range field is a deterministic zero-light boundary on both WebGL2 and WebGPU.
+    entity.light.falloffMode = LIGHTFALLOFF_LINEAR;
     entity.light.castShadows = spec.castShadows;
     entity.light.shadowUpdateMode = SHADOWUPDATE_THISFRAME;
   }

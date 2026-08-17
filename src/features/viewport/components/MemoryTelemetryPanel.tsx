@@ -1,7 +1,13 @@
 import { useEffect, useMemo, useState } from 'react';
 import { UI_COPY, type UiLanguage } from '../../../app/i18n';
 import { formatBytes } from '../../../core/format/formatBytes';
+import type {
+  Gaussian4DMemoryMode,
+  Gaussian4DMemoryPolicy,
+} from '../../gaussian/memory/Gaussian4DMemoryPolicy';
+import type { BrowserMemoryPressureResult } from '../../gaussian/memory/BrowserMemoryPressureTest';
 import type { ViewportMemoryUsage } from '../runtime/ViewportRuntime';
+import { isRuntimeMemoryPolicyApplied, remainingMemoryBytes } from './MemoryTelemetryModel';
 
 const HISTORY_LENGTH = 60;
 
@@ -13,11 +19,12 @@ interface MemorySample {
 
 interface MemoryMeterProps {
   readonly budget: number | null;
-  readonly budgetLabel: string;
   readonly description: string;
   readonly label: string;
+  readonly limitLabel: string;
   readonly managedLabel: string;
   readonly managedBytes?: number;
+  readonly remainingLabel: string;
   readonly tone: 'js' | 'data' | 'gpu';
   readonly used: number | null;
 }
@@ -46,11 +53,12 @@ function chartPoints(history: readonly MemorySample[], key: keyof MemorySample):
 
 function MemoryMeter({
   budget,
-  budgetLabel,
   description,
   label,
+  limitLabel,
   managedBytes = 0,
   managedLabel,
+  remainingLabel,
   tone,
   used,
 }: MemoryMeterProps) {
@@ -58,6 +66,7 @@ function MemoryMeter({
   const managedRatio = Math.min(1, usageRatio(managedBytes, budget));
   const totalRatio = Math.min(1, ratio);
   const untrackedRatio = Math.max(0, totalRatio - managedRatio);
+  const remaining = remainingMemoryBytes(used, budget);
   return (
     <div className={`memory-meter ${ratio > 1 ? 'over-budget' : ''}`}>
       <div className="memory-meter-heading">
@@ -79,21 +88,50 @@ function MemoryMeter({
       </div>
       <small>
         {tone === 'gpu' && managedBytes > 0 ? `${managedLabel} ${formatBytes(managedBytes)} · ` : ''}
-        {budgetLabel} {formatBytes(budget)}
+        {limitLabel} {formatBytes(budget)} · {remainingLabel} {formatBytes(remaining)}
       </small>
     </div>
   );
 }
 
+type PageMemoryMeasurement = {
+  readonly status: 'measuring' | 'available' | 'unsupported' | 'not-isolated' | 'error';
+  readonly bytes: number | null;
+};
+
+interface PerformanceWithPageMemory extends Performance {
+  measureUserAgentSpecificMemory?: () => Promise<{ readonly bytes: number }>;
+}
+
+const memoryModeLabelKeys: Readonly<Record<Gaussian4DMemoryMode, keyof typeof UI_COPY.zh>> = {
+  auto: 'modeAuto',
+  compatible: 'modeCompatible',
+  balanced: 'modeBalanced',
+  performance: 'modePerformance',
+  'local-maximum': 'modeLocalMaximum',
+  custom: 'modeCustom',
+};
+
 export function MemoryTelemetryPanel({
   language,
+  lastPressureResult,
+  onOpenPressureTest,
+  policy,
   usage,
 }: {
   readonly language: UiLanguage;
+  readonly lastPressureResult: BrowserMemoryPressureResult | null;
+  readonly onOpenPressureTest: () => void;
+  readonly policy: Gaussian4DMemoryPolicy;
   readonly usage: ViewportMemoryUsage;
 }) {
   const copy = UI_COPY[language];
   const [history, setHistory] = useState<MemorySample[]>([]);
+  const [pageMemory, setPageMemory] = useState<PageMemoryMeasurement>({ status: 'measuring', bytes: null });
+  const runtimePolicyApplied = isRuntimeMemoryPolicyApplied(usage, policy);
+  const modeLabel = copy[memoryModeLabelKeys[policy.mode]];
+  const jsHeapRemaining = remainingMemoryBytes(usage.jsHeapBytes, usage.jsHeapLimitBytes);
+  const dataBudgetRemaining = remainingMemoryBytes(usage.managedCpuBytes, usage.cpuBudgetBytes);
   const current = useMemo<MemorySample>(() => ({
     js: usageRatio(usage.jsHeapBytes, usage.jsHeapLimitBytes),
     data: usageRatio(usage.managedCpuBytes, usage.cpuBudgetBytes),
@@ -112,34 +150,111 @@ export function MemoryTelemetryPanel({
     setHistory((previous) => [...previous.slice(-(HISTORY_LENGTH - 1)), current]);
   }, [current]);
 
+  useEffect(() => {
+    let disposed = false;
+    let timer: number | null = null;
+    const performanceWithMemory = performance as PerformanceWithPageMemory;
+
+    if (!globalThis.crossOriginIsolated) {
+      setPageMemory({ status: 'not-isolated', bytes: null });
+      return;
+    }
+    if (!performanceWithMemory.measureUserAgentSpecificMemory) {
+      setPageMemory({ status: 'unsupported', bytes: null });
+      return;
+    }
+
+    const measure = async () => {
+      try {
+        const result = await performanceWithMemory.measureUserAgentSpecificMemory!();
+        if (!disposed) setPageMemory({ status: 'available', bytes: result.bytes });
+      } catch {
+        if (!disposed) setPageMemory({ status: 'error', bytes: null });
+      } finally {
+        // #WDD-gpt 2026-08-16 - 全页面内存测量会汇总 Worker，使用一分钟低频刷新避免测量本身干扰播放。
+        if (!disposed) timer = window.setTimeout(measure, 60_000);
+      }
+    };
+    void measure();
+    return () => {
+      disposed = true;
+      if (timer !== null) window.clearTimeout(timer);
+    };
+  }, []);
+
+  const pageMemoryText = pageMemory.bytes !== null
+    ? formatBytes(pageMemory.bytes)
+    : pageMemory.status === 'not-isolated'
+      ? copy.memoryMeasurementNeedsIsolation
+      : pageMemory.status === 'unsupported'
+        ? copy.memoryMeasurementUnsupported
+        : pageMemory.status === 'error'
+          ? copy.memoryMeasurementFailed
+          : copy.memoryMeasuring;
+
   return (
     <section aria-label={copy.memoryPanelLabel} className="memory-telemetry">
+      <section className={`memory-policy-proof ${runtimePolicyApplied ? 'active' : 'pending'}`}>
+        <header>
+          <span><i />{copy.runtimeMemoryPolicy}</span>
+          <strong>{runtimePolicyApplied ? copy.runtimePolicyActive : copy.runtimePolicyPending}</strong>
+        </header>
+        <p>{modeLabel}</p>
+        <small>{runtimePolicyApplied ? copy.runtimePolicyVerified : copy.runtimePolicyWaiting}</small>
+      </section>
+
+      <section className="browser-memory-reality">
+        <header><strong>{copy.browserMemoryReality}</strong><span>{copy.browserReportedValues}</span></header>
+        <dl>
+          <div><dt>{copy.pageMemoryUsage}</dt><dd>{pageMemoryText}</dd></div>
+          <div><dt>{copy.jsHeapLimit}</dt><dd>{formatBytes(usage.jsHeapLimitBytes)}</dd></div>
+          <div><dt>{copy.jsHeapRemaining}</dt><dd>{formatBytes(jsHeapRemaining)}</dd></div>
+          <div><dt>{copy.dataBudgetRemaining}</dt><dd>{formatBytes(dataBudgetRemaining)}</dd></div>
+          <div><dt>{copy.deviceMemoryReported}</dt><dd>{formatBytes(usage.browserDeviceMemoryBytes)} {usage.browserDeviceMemoryBytes === null ? '' : <em>{copy.approximate}</em>}</dd></div>
+          <div><dt>{copy.systemMemoryAvailable}</dt><dd className="unavailable">{copy.browserNotExposed}</dd></div>
+          <div><dt>{copy.physicalVramAvailable}</dt><dd className="unavailable">{copy.browserNotExposed}</dd></div>
+        </dl>
+        <p>{copy.memoryRealityNote}</p>
+        <div className="memory-pressure-entry">
+          <div>
+            <strong>{copy.memoryPressureEntry}</strong>
+            <small>{lastPressureResult
+              ? `${copy.memoryPressureLastResult} ${copy.memoryPressureAtLeast} ${formatBytes(lastPressureResult.confirmedBytes)}`
+              : copy.memoryPressureNoResult}</small>
+          </div>
+          <button onClick={onOpenPressureTest} type="button">{copy.memoryPressureButton}</button>
+        </div>
+      </section>
+
       <div className="memory-meters">
         <MemoryMeter
           budget={usage.jsHeapLimitBytes}
-          budgetLabel={copy.budget}
           description={copy.jsHeapDescription}
           label={copy.jsHeapLabel}
+          limitLabel={copy.browserHeapLimit}
           managedLabel={copy.managed4DPool}
+          remainingLabel={copy.availableRemaining}
           tone="js"
           used={usage.jsHeapBytes}
         />
         <MemoryMeter
           budget={usage.cpuBudgetBytes}
-          budgetLabel={copy.budget}
           description={copy.dataMemoryDescription}
           label={copy.dataMemoryLabel}
+          limitLabel={copy.applicationBudget}
           managedLabel={copy.managed4DPool}
+          remainingLabel={copy.budgetRemaining}
           tone="data"
           used={usage.managedCpuBytes}
         />
         <MemoryMeter
           budget={usage.gpuBudgetBytes}
-          budgetLabel={copy.budget}
           description={copy.gpuVramDescription}
           label={copy.gpuVramLabel}
+          limitLabel={copy.applicationBudget}
           managedBytes={usage.managedGpuBytes}
           managedLabel={copy.managed4DPool}
+          remainingLabel={copy.budgetRemaining}
           tone="gpu"
           used={usage.gpuBytes}
         />

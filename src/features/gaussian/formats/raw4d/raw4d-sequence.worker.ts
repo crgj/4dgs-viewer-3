@@ -46,12 +46,12 @@ function propertyIndices(header: Raw4DHeader, fileName: string): SegmentProperty
   const index = new Map(header.propertyNames.map((name, property) => [name, property]));
   const lastPositionBank = bankCount(header.propertyNames, 'xyz_bank') - 1;
   const lastDcBank = bankCount(header.propertyNames, 'f_dc_bank') - 1;
-  if (lastPositionBank < 0 || lastDcBank < 0) throw new Error(`${fileName} 缺少 Position 或 DC 关键帧。`);
+  if (lastPositionBank < 0) throw new Error(`${fileName} 缺少 Position 关键帧。`);
   const position = (bank: number) => ['x', 'y', 'z'].map((component) => (
     requireProperty(index, `xyz_bank_${bank}_${component}`, fileName)
   )) as unknown as readonly [number, number, number];
   const colorDc = (bank: number) => ['0', '1', '2'].map((component) => (
-    requireProperty(index, `f_dc_bank_${bank}_${component}`, fileName)
+    requireProperty(index, bank < 0 ? `f_dc_${component}` : `f_dc_bank_${bank}_${component}`, fileName)
   )) as unknown as readonly [number, number, number];
   const sh = header.propertyNames
     .map((name, property) => ({ match: /^f_rest_(\d+)$/.exec(name), property }))
@@ -64,7 +64,7 @@ function propertyIndices(header: Raw4DHeader, fileName: string): SegmentProperty
   return {
     firstPosition: position(0),
     lastPosition: position(lastPositionBank),
-    firstColorDc: colorDc(0),
+    firstColorDc: colorDc(lastDcBank < 0 ? -1 : 0),
     lastColorDc: colorDc(lastDcBank),
     sh,
   };
@@ -132,8 +132,8 @@ async function openSequence(request: Extract<Raw4DSequenceWorkerRequest, { type:
     type: 'progress', requestId: request.requestId, progress: { ratio, message },
   });
   try {
-    if (request.files.length < 2 || request.files.some((file) => !file.name.toLowerCase().endsWith('.raw4d'))) {
-      throw new Error('多文件拖入只支持两个或更多 RAW4D 文件。');
+    if (request.files.length < 2 || request.files.some((file) => !/\.(?:raw4d|ply4)$/i.test(file.name))) {
+      throw new Error('多文件拖入只支持两个或更多 RAW4D / PLY4 文件。');
     }
     progress(0, `正在读取 ${request.files.length} 个 RAW4D 文件头`);
     const headers = await Promise.all(request.files.map((file) => readRaw4DHeader(file, controller.signal)));
@@ -184,7 +184,7 @@ async function openSequence(request: Extract<Raw4DSequenceWorkerRequest, { type:
     const sourceShBytes = sourceStateCount * coefficientCount * bytesPerScalar;
     const extractedShBytes = extractedStateCount * coefficientCount * bytesPerScalar;
     const descriptor: Raw4DSequenceDescriptor = {
-      sourceName: `${segments[0].name.replace(/\.raw4d$/i, '')}…${segments.at(-1)!.name.replace(/\.raw4d$/i, '')}`,
+      sourceName: `${segments[0].name.replace(/\.(?:raw4d|ply4)$/i, '')}…${segments.at(-1)!.name.replace(/\.(?:raw4d|ply4)$/i, '')}`,
       sourceBytes,
       firstFrame: segments[0].firstFrame,
       lastFrame: segments.at(-1)!.lastFrame,

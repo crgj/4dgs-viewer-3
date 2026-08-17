@@ -8,6 +8,16 @@ import type {
   Raw4DTrack,
 } from './Raw4DTypes';
 import { RAW4D_FLOAT16_DECODE_TABLE } from './Raw4DFloat16';
+import {
+  RAW4D_TRACK_DEFINITIONS,
+  raw4DBankCount,
+  raw4DCanonicalKeyframes,
+  raw4DShPropertyNames,
+  raw4DTrackPropertyName,
+  raw4DTrackStride,
+  validateRaw4DCanonicalStructure,
+  type Raw4DTrackDefinition,
+} from './Raw4DSchema';
 
 const MAX_HEADER_BYTES = 1024 * 1024;
 const DEFAULT_CHUNK_ROWS = 8192;
@@ -15,40 +25,6 @@ const DEFAULT_CHUNK_ROWS = 8192;
 const SCALAR_BYTES: Record<Raw4DScalarEncoding, number> = {
   float32: Float32Array.BYTES_PER_ELEMENT,
   float16: Uint16Array.BYTES_PER_ELEMENT,
-};
-
-interface TrackDefinition {
-  prefix: string;
-  components: readonly string[];
-  strideComment: string;
-}
-
-const TRACK_DEFINITIONS: Record<'position' | 'rotation' | 'colorDc' | 'scale' | 'opacity', TrackDefinition> = {
-  position: {
-    prefix: 'xyz_bank',
-    components: ['x', 'y', 'z'],
-    strideComment: 'xyz_bank_keyframe_stride',
-  },
-  rotation: {
-    prefix: 'rot_bank',
-    components: ['w', 'x', 'y', 'z'],
-    strideComment: 'rot_bank_keyframe_stride',
-  },
-  colorDc: {
-    prefix: 'f_dc_bank',
-    components: ['0', '1', '2'],
-    strideComment: 'features_dc_bank_keyframe_stride',
-  },
-  scale: {
-    prefix: 'scale_bank',
-    components: ['0', '1', '2'],
-    strideComment: 'scaling_bank_keyframe_stride',
-  },
-  opacity: {
-    prefix: 'opacity_bank',
-    components: [''],
-    strideComment: 'opacity_bank_keyframe_stride',
-  },
 };
 
 function throwIfAborted(signal?: AbortSignal): void {
@@ -65,51 +41,29 @@ function parsePositiveInteger(value: string | undefined, label: string): number 
   return parsed;
 }
 
-function propertyName(definition: TrackDefinition, bank: number, component: string): string {
-  return component ? `${definition.prefix}_${bank}_${component}` : `${definition.prefix}_${bank}`;
-}
-
-function findBankCount(propertyNames: readonly string[], definition: TrackDefinition): number {
-  let maximum = -1;
-  const expression = new RegExp(`^${definition.prefix}_(\\d+)(?:_|$)`);
-  for (const name of propertyNames) {
-    const match = expression.exec(name);
-    if (match) {
-      maximum = Math.max(maximum, Number(match[1]));
-    }
-  }
-  return maximum + 1;
-}
-
-function createKeyframes(totalFrames: number, stride: number, count: number): number[] {
-  const result: number[] = [];
-  for (let frame = 0; frame < totalFrames; frame += stride) {
-    result.push(frame);
-  }
-  if (result.at(-1) !== totalFrames - 1) {
-    result.push(totalFrames - 1);
-  }
-  if (result.length !== count) {
-    throw new Error(`RAW4D keyframe bank count mismatch: expected ${result.length}, found ${count}.`);
-  }
-  return result;
-}
-
 function createTrack(
   header: Raw4DHeader,
   storages: ReadonlyMap<string, Raw4DScalarArray>,
-  definition: TrackDefinition,
+  definition: Raw4DTrackDefinition,
 ): Raw4DTrack {
-  const bankCount = findBankCount(header.propertyNames, definition);
+  const bankCount = raw4DBankCount(header.propertyNames, definition);
   if (bankCount === 0) {
-    throw new Error(`RAW4D is missing ${definition.prefix} properties.`);
+    const values = definition.baseProperties.map((name) => {
+      const storage = storages.get(name);
+      if (!storage) throw new Error(`RAW4D is missing fallback property ${name}.`);
+      return storage;
+    });
+    return { encoding: header.scalarEncoding, components: definition.components.length, keyframes: [0], values };
   }
-  const stride = parsePositiveInteger(header.comments.get(definition.strideComment), definition.strideComment);
-  const keyframes = createKeyframes(header.totalFrames, stride, bankCount);
+  const keyframes = raw4DCanonicalKeyframes(
+    header.totalFrames,
+    raw4DTrackStride(header.comments, definition),
+    bankCount,
+  );
   const values: Raw4DScalarArray[] = [];
   for (let bank = 0; bank < bankCount; bank += 1) {
     for (const component of definition.components) {
-      const name = propertyName(definition, bank, component);
+      const name = raw4DTrackPropertyName(definition, bank, component);
       const storage = storages.get(name);
       if (!storage) {
         throw new Error(`RAW4D is missing property ${name}.`);
@@ -166,20 +120,124 @@ function shBandsFromCount(count: number): number {
 
 function requiredPropertyNames(header: Raw4DHeader): string[] {
   const names = new Set<string>(['lifetime_mu', 'lifetime_w']);
-  for (const definition of Object.values(TRACK_DEFINITIONS)) {
-    const bankCount = findBankCount(header.propertyNames, definition);
-    for (let bank = 0; bank < bankCount; bank += 1) {
-      for (const component of definition.components) {
-        names.add(propertyName(definition, bank, component));
+  for (const definition of Object.values(RAW4D_TRACK_DEFINITIONS)) {
+    const bankCount = raw4DBankCount(header.propertyNames, definition);
+    if (bankCount === 0) {
+      definition.baseProperties.forEach((name) => names.add(name));
+    } else {
+      for (let bank = 0; bank < bankCount; bank += 1) {
+        for (const component of definition.components) {
+          names.add(raw4DTrackPropertyName(definition, bank, component));
+        }
       }
     }
   }
-  for (const name of header.propertyNames) {
-    if (/^f_rest_\d+$/.test(name)) {
-      names.add(name);
+  raw4DShPropertyNames(header.propertyNames).forEach((name) => names.add(name));
+  return [...names];
+}
+
+interface Raw4DCanonicalValidationPlan {
+  readonly aliases: readonly (readonly [number, number, string])[];
+  readonly normals: readonly number[];
+  readonly rotations: readonly (readonly number[])[];
+  readonly opacity: readonly number[];
+  readonly lifetimeMu: number;
+  readonly lifetimeW: number;
+}
+
+function canonicalValidationPlan(header: Raw4DHeader): Raw4DCanonicalValidationPlan {
+  const indices = new Map(header.propertyNames.map((name, index) => [name, index]));
+  const requireIndex = (name: string): number => {
+    const value = indices.get(name);
+    if (value === undefined) throw new Error(`RAW4D is missing canonical property ${name}.`);
+    return value;
+  };
+  const aliases: Array<readonly [number, number, string]> = [];
+  for (const definition of [
+    RAW4D_TRACK_DEFINITIONS.position,
+    RAW4D_TRACK_DEFINITIONS.colorDc,
+    RAW4D_TRACK_DEFINITIONS.scale,
+    RAW4D_TRACK_DEFINITIONS.opacity,
+  ]) {
+    if (raw4DBankCount(header.propertyNames, definition) === 0) continue;
+    for (let component = 0; component < definition.components.length; component += 1) {
+      const baseName = definition.baseProperties[component];
+      const bankName = raw4DTrackPropertyName(definition, 0, definition.components[component]);
+      aliases.push([requireIndex(baseName), requireIndex(bankName), `${baseName} == ${bankName}`]);
     }
   }
-  return [...names];
+  const rotation = RAW4D_TRACK_DEFINITIONS.rotation;
+  const rotationBankCount = raw4DBankCount(header.propertyNames, rotation);
+  const rotations = rotationBankCount > 0
+    ? Array.from({ length: rotationBankCount }, (_, bank) => (
+      rotation.components.map((component) => requireIndex(raw4DTrackPropertyName(rotation, bank, component)))
+    ))
+    : [rotation.baseProperties.map(requireIndex)];
+  const opacity = RAW4D_TRACK_DEFINITIONS.opacity;
+  const opacityBankCount = raw4DBankCount(header.propertyNames, opacity);
+  return {
+    aliases,
+    normals: ['nx', 'ny', 'nz'].map(requireIndex),
+    rotations,
+    opacity: opacityBankCount > 0
+      ? Array.from({ length: opacityBankCount }, (_, bank) => requireIndex(raw4DTrackPropertyName(opacity, bank, '')))
+      : [requireIndex('opacity')],
+    lifetimeMu: requireIndex('lifetime_mu'),
+    lifetimeW: requireIndex('lifetime_w'),
+  };
+}
+
+function validateCanonicalChunk(
+  chunk: Float32Array | Uint16Array,
+  header: Raw4DHeader,
+  firstRow: number,
+  rowCount: number,
+  plan: Raw4DCanonicalValidationPlan,
+): void {
+  const encoded = header.scalarEncoding === 'float16'
+    ? chunk as Uint16Array
+    : new Uint32Array(chunk.buffer, chunk.byteOffset, chunk.byteLength / 4);
+  const signMask = header.scalarEncoding === 'float16' ? 0x7fff : 0x7fffffff;
+  for (let row = 0; row < rowCount; row += 1) {
+    const offset = row * header.propertyNames.length;
+    for (const [base, bank, label] of plan.aliases) {
+      const baseValue = headerlessValue(chunk, offset + base, header.scalarEncoding);
+      const bankValue = headerlessValue(chunk, offset + bank, header.scalarEncoding);
+      const toleranceScale = Math.max(1, Math.abs(baseValue), Math.abs(bankValue));
+      const tolerance = toleranceScale * (header.scalarEncoding === 'float16' ? 1e-3 : 1e-6);
+      if (baseValue !== bankValue && Math.abs(baseValue - bankValue) > tolerance) {
+        throw new Error(`RAW4D canonical snapshot mismatch at row ${firstRow + row}: ${label}.`);
+      }
+    }
+    for (const normal of plan.normals) {
+      if ((encoded[offset + normal] & signMask) !== 0) {
+        throw new Error(`RAW4D normal placeholders must be zero at row ${firstRow + row}.`);
+      }
+    }
+    for (const rotation of plan.rotations) {
+      let normSquared = 0;
+      for (const property of rotation) {
+        const value = headerlessValue(chunk, offset + property, header.scalarEncoding);
+        normSquared += value * value;
+      }
+      // #WDD-gpt 2026-08-16 - 旋转可非单位长度并在采样时归一化，但不能是零或非有限四元数。
+      if (!Number.isFinite(normSquared) || normSquared <= 0) {
+        throw new Error(`RAW4D rotation quaternion must be finite and non-zero at row ${firstRow + row}.`);
+      }
+    }
+    for (const opacity of plan.opacity) {
+      const value = headerlessValue(chunk, offset + opacity, header.scalarEncoding);
+      // #WDD-gpt 2026-08-16 - 六段实数数据用 -Infinity 表示严格透明；只兼容该 logit，拒绝会传播到渲染器的 NaN/+Infinity。
+      if (Number.isNaN(value) || value === Infinity) {
+        throw new Error(`RAW4D opacity logit must be finite or -Infinity at row ${firstRow + row}.`);
+      }
+    }
+    const lifetimeMu = headerlessValue(chunk, offset + plan.lifetimeMu, header.scalarEncoding);
+    const lifetimeW = headerlessValue(chunk, offset + plan.lifetimeW, header.scalarEncoding);
+    if (!Number.isFinite(lifetimeMu) || !Number.isFinite(lifetimeW) || lifetimeW < 0) {
+      throw new Error(`RAW4D lifetime must be finite with non-negative lifetime_w at row ${firstRow + row}.`);
+    }
+  }
 }
 
 async function yieldToHost(): Promise<void> {
@@ -220,6 +278,8 @@ export async function readRaw4DHeader(source: Raw4DSource, signal?: AbortSignal)
   const propertyNames: string[] = [];
   const propertyEncodings: Raw4DScalarEncoding[] = [];
   let vertexCount = 0;
+  let vertexElementCount = 0;
+  const otherElements: string[] = [];
   let inVertexElement = false;
   for (const line of lines.slice(2)) {
     const comment = /^comment\s+(\S+)\s+(.+)$/.exec(line);
@@ -232,7 +292,10 @@ export async function readRaw4DHeader(source: Raw4DSource, signal?: AbortSignal)
     if (element) {
       inVertexElement = element[1] === 'vertex';
       if (inVertexElement) {
+        vertexElementCount += 1;
         vertexCount = Number(element[2]);
+      } else {
+        otherElements.push(element[1]);
       }
       continue;
     }
@@ -249,8 +312,11 @@ export async function readRaw4DHeader(source: Raw4DSource, signal?: AbortSignal)
     }
   }
 
-  if (!Number.isInteger(vertexCount) || vertexCount <= 0 || propertyNames.length === 0) {
+  if (vertexElementCount !== 1 || !Number.isInteger(vertexCount) || vertexCount <= 0 || propertyNames.length === 0) {
     throw new Error('RAW4D header does not contain a valid vertex element.');
+  }
+  if (otherElements.length > 0) {
+    throw new Error(`RAW4D canonical PLY must contain only the vertex element; found ${otherElements[0]}.`);
   }
   const scalarEncoding = propertyEncodings[0];
   if (propertyEncodings.some((encoding) => encoding !== scalarEncoding)) {
@@ -260,17 +326,20 @@ export async function readRaw4DHeader(source: Raw4DSource, signal?: AbortSignal)
     if (comments.get('fp16_quantized') !== '1') {
       throw new Error('RAW4D ushort properties require comment fp16_quantized 1.');
     }
-    const unmarkedProperty = propertyNames.find((name) => !fp16PropertyNames.has(name));
-    if (unmarkedProperty) {
-      throw new Error(`RAW4D ushort property ${unmarkedProperty} is not marked as fp16_property.`);
+    const unknownMarker = [...fp16PropertyNames].find((name) => !propertyNames.includes(name));
+    if (unknownMarker) {
+      throw new Error(`RAW4D fp16_property marker references unknown property ${unknownMarker}.`);
     }
   }
+
+  const totalFrames = parsePositiveInteger(comments.get('total_frames'), 'total_frames');
+  validateRaw4DCanonicalStructure(propertyNames, totalFrames, comments);
 
   return {
     dataOffset,
     recordBytes: propertyNames.length * SCALAR_BYTES[scalarEncoding],
     vertexCount,
-    totalFrames: parsePositiveInteger(comments.get('total_frames'), 'total_frames'),
+    totalFrames,
     scalarEncoding,
     propertyNames,
     comments,
@@ -286,8 +355,12 @@ export async function parseRaw4D(source: Raw4DSource, options: Raw4DParseOptions
   if (source.size < requiredBytes) {
     throw new Error(`RAW4D data is truncated: expected ${requiredBytes} bytes, found ${source.size}.`);
   }
+  if (source.size > requiredBytes) {
+    throw new Error(`RAW4D canonical PLY has ${source.size - requiredBytes} unexpected trailing bytes.`);
+  }
 
   const propertyIndices = new Map(header.propertyNames.map((name, index) => [name, index]));
+  const validationPlan = canonicalValidationPlan(header);
   const requiredNames = requiredPropertyNames(header);
   const scalarLength = header.vertexCount * requiredNames.length;
   // #WDD-gpt 2026-08-16 - 所有 Canonical 属性共享一个 backing store，并按源位宽建立 SoA 视图，减少碎片且让 Worker 只移交一次所有权。
@@ -326,6 +399,7 @@ export async function parseRaw4D(source: Raw4DSource, options: Raw4DParseOptions
     const chunk = header.scalarEncoding === 'float16'
       ? new Uint16Array(chunkBuffer)
       : new Float32Array(chunkBuffer);
+    validateCanonicalChunk(chunk, header, firstRow, rowCount, validationPlan);
     if (options.extractChunk) {
       await options.extractChunk({
         chunk,
@@ -354,15 +428,12 @@ export async function parseRaw4D(source: Raw4DSource, options: Raw4DParseOptions
   }
 
   options.onProgress?.({ ratio: 0.98, stage: 'finalizing', message: '正在建立 4D 关键帧轨迹' });
-  const position = createTrack(header, storages, TRACK_DEFINITIONS.position);
-  const rotation = createTrack(header, storages, TRACK_DEFINITIONS.rotation);
-  const colorDc = createTrack(header, storages, TRACK_DEFINITIONS.colorDc);
-  const scale = createTrack(header, storages, TRACK_DEFINITIONS.scale);
-  const opacity = createTrack(header, storages, TRACK_DEFINITIONS.opacity);
-  const shRest = header.propertyNames
-    .filter((name) => /^f_rest_\d+$/.test(name))
-    .sort((a, b) => Number(a.slice(7)) - Number(b.slice(7)))
-    .map((name) => storages.get(name)!);
+  const position = createTrack(header, storages, RAW4D_TRACK_DEFINITIONS.position);
+  const rotation = createTrack(header, storages, RAW4D_TRACK_DEFINITIONS.rotation);
+  const colorDc = createTrack(header, storages, RAW4D_TRACK_DEFINITIONS.colorDc);
+  const scale = createTrack(header, storages, RAW4D_TRACK_DEFINITIONS.scale);
+  const opacity = createTrack(header, storages, RAW4D_TRACK_DEFINITIONS.opacity);
+  const shRest = raw4DShPropertyNames(header.propertyNames).map((name) => storages.get(name)!);
 
   const asset: Raw4DAsset = {
     sourceName: options.sourceName ?? 'Untitled.raw4d',
@@ -387,7 +458,7 @@ export async function parseRaw4D(source: Raw4DSource, options: Raw4DParseOptions
 export async function canImportRaw4D(source: Raw4DSource): Promise<boolean> {
   try {
     const header = await readRaw4DHeader(source);
-    return header.comments.has('total_frames') && findBankCount(header.propertyNames, TRACK_DEFINITIONS.position) > 0;
+    return header.comments.has('total_frames') && raw4DBankCount(header.propertyNames, RAW4D_TRACK_DEFINITIONS.position) > 0;
   } catch {
     return false;
   }

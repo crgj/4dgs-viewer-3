@@ -21,9 +21,12 @@ import type { Raw4DFrameSampler } from './Raw4DFrameSampler';
 import { createRaw4DGpuMemoryPlan } from './Raw4DGpuMemoryPlan';
 
 const TEXTURE_WIDTH = 4096;
-// #WDD-gpt 2026-08-14 - GPU 负责逐帧插值，WebGL2 只低频刷新 CPU 排序中心。
-const CPU_SORT_FRAME_INTERVAL = 6;
 const UPLOAD_BATCH_POINTS = 16_384;
+
+// #WDD-gpt 2026-08-16 - WebGL2排序中心必须跟随每次时间变化；低频刷新会让同一帧因跳转历史不同而使用旧帧深度序。
+export function raw4DSortCentersNeedRefresh(frame: number, lastFrame: number): boolean {
+  return Math.abs(frame - lastFrame) > 1e-6;
+}
 
 const modifierGLSL = `
 uniform highp sampler2D dongRaw4dPositionTex;
@@ -77,7 +80,21 @@ float dongLoadOpacity(int keyCount, int key) {
 }
 
 float dongSigmoid(float value) {
+    if (floatBitsToUint(value) == 0xff800000u) return 0.0;
     return 1.0 / (1.0 + exp(-clamp(value, -20.0, 20.0)));
+}
+
+bool dongIsNegativeInfinity(float value) {
+    return floatBitsToUint(value) == 0xff800000u;
+}
+
+float dongInterpolateExtended(float left, float right, float alpha) {
+    if (alpha <= 0.0 || left == right) return left;
+    if (alpha >= 1.0) return right;
+    if (dongIsNegativeInfinity(left) || dongIsNegativeInfinity(right)) {
+        return uintBitsToFloat(0xff800000u);
+    }
+    return mix(left, right, alpha);
 }
 
 vec4 dongQuaternionMultiply(vec4 a, vec4 b) {
@@ -145,7 +162,7 @@ void modifySplatColor(vec3 center, inout vec4 color) {
 
     DongTrackSpan opacitySpan = dongTrackSpan(dongRaw4dOpacityTrack.x, dongRaw4dOpacityTrack.y);
     int opacityKeys = int(dongRaw4dOpacityTrack.x + 0.5);
-    float opacityLogit = mix(
+    float opacityLogit = dongInterpolateExtended(
         dongLoadOpacity(opacityKeys, opacitySpan.left),
         dongLoadOpacity(opacityKeys, opacitySpan.right),
         opacitySpan.alpha
@@ -229,7 +246,21 @@ fn dongLoadOpacity(keyCount: i32, key: i32) -> f32 {
 }
 
 fn dongSigmoid(value: f32) -> f32 {
+    if (bitcast<u32>(value) == 0xff800000u) { return 0.0; }
     return 1.0 / (1.0 + exp(-clamp(value, -20.0, 20.0)));
+}
+
+fn dongIsNegativeInfinity(value: f32) -> bool {
+    return bitcast<u32>(value) == 0xff800000u;
+}
+
+fn dongInterpolateExtended(left: f32, right: f32, alpha: f32) -> f32 {
+    if (alpha <= 0.0 || left == right) { return left; }
+    if (alpha >= 1.0) { return right; }
+    if (dongIsNegativeInfinity(left) || dongIsNegativeInfinity(right)) {
+        return bitcast<f32>(0xff800000u);
+    }
+    return mix(left, right, alpha);
 }
 
 fn dongQuaternionMultiply(a: vec4f, b: vec4f) -> vec4f {
@@ -287,7 +318,11 @@ fn modifySplatColor(center: vec3f, color: ptr<function, vec4f>) {
 
     let opacitySpan = dongTrackSpan(uniform.dongRaw4dOpacityTrack.x, uniform.dongRaw4dOpacityTrack.y);
     let opacityKeys = i32(uniform.dongRaw4dOpacityTrack.x + 0.5);
-    let opacityLogit = mix(dongLoadOpacity(opacityKeys, opacitySpan.left), dongLoadOpacity(opacityKeys, opacitySpan.right), opacitySpan.alpha);
+    let opacityLogit = dongInterpolateExtended(
+        dongLoadOpacity(opacityKeys, opacitySpan.left),
+        dongLoadOpacity(opacityKeys, opacitySpan.right),
+        opacitySpan.alpha
+    );
     let lifetime = textureLoad(dongRaw4dLifetimeTex, dongTextureUv(splat.index), 0).xy;
     let frame = clamp(uniform.dongRaw4dFrame, 0.0, uniform.dongRaw4dTotalFrames - 1.0);
     let gate = dongSigmoid(10.0 * (frame - (lifetime.x - lifetime.y)))
@@ -438,8 +473,8 @@ function createTexture(device: GraphicsDevice, name: string, texelCount: number,
 }
 
 function writeValue(destination: Float32Array | Uint16Array, index: number, value: number, half: boolean): void {
-  const safeValue = value === -Infinity ? -20 : value === Infinity ? 20 : value;
-  destination[index] = half ? FloatPacking.float2Half(safeValue) : safeValue;
+  // #WDD-gpt 2026-08-16 - 保留 opacity 的 IEEE -Infinity，交由 shader 按 Python 扩展插值语义处理，不能提前近似成 -20。
+  destination[index] = half ? FloatPacking.float2Half(value) : value;
 }
 
 function createTrackTexture(
@@ -497,15 +532,12 @@ function createLifetimeTexture(device: GraphicsDevice, asset: Raw4DAsset, width:
 }
 
 
-function safeStorageFloat(value: number): number {
-  return value === -Infinity ? -20 : value === Infinity ? 20 : value;
-}
-
 function safeHalfBits(track: Raw4DTrack, valueIndex: number, pointIndex: number): number {
-  const value = readRaw4DTrack(track, valueIndex, pointIndex);
-  return Number.isFinite(value)
-    ? raw4DScalarBits(track.values[valueIndex], pointIndex, track.encoding)
-    : FloatPacking.float2Half(safeStorageFloat(value));
+  // #WDD-gpt 2026-08-16 - FP16 StorageBuffer 直接保留源位模式，包括合法的 opacity -Infinity。
+  if (track.encoding === 'float16') {
+    return raw4DScalarBits(track.values[valueIndex], pointIndex, track.encoding);
+  }
+  return FloatPacking.float2Half(readRaw4DTrack(track, valueIndex, pointIndex));
 }
 
 function uploadVectorSlot(
@@ -547,11 +579,11 @@ function uploadVectorSlot(
     staging.fill(0, 0, pointCount * 4);
     for (let point = 0; point < pointCount; point += 1) {
       for (let component = 0; component < componentOrder.length; component += 1) {
-        staging[point * 4 + component] = safeStorageFloat(readRaw4DTrack(
+        staging[point * 4 + component] = readRaw4DTrack(
           track,
           key * track.components + componentOrder[component],
           firstPoint + point,
-        ));
+        );
       }
     }
     buffer.write((destinationVectorOffset + firstPoint) * 16, staging, 0, pointCount * 4);
@@ -578,7 +610,7 @@ function uploadScalarSlot(
   for (let firstPoint = 0; firstPoint < count; firstPoint += maximumBatchPoints) {
     const pointCount = Math.min(maximumBatchPoints, count - firstPoint);
     for (let point = 0; point < pointCount; point += 1) {
-      staging[point] = safeStorageFloat(readRaw4DTrack(track, key, firstPoint + point));
+      staging[point] = readRaw4DTrack(track, key, firstPoint + point);
     }
     buffer.write((destinationScalarOffset + firstPoint) * 4, staging, 0, pointCount);
   }
@@ -595,10 +627,9 @@ function uploadScalarArray(
   if (half) {
     const staging = new Uint16Array(scalarStride);
     for (let point = 0; point < asset.splatCount; point += 1) {
-      const value = readRaw4DScalar(values, point, asset.sourceEncoding);
-      staging[point] = Number.isFinite(value)
+      staging[point] = asset.sourceEncoding === 'float16'
         ? raw4DScalarBits(values, point, asset.sourceEncoding)
-        : FloatPacking.float2Half(safeStorageFloat(value));
+        : FloatPacking.float2Half(readRaw4DScalar(values, point, asset.sourceEncoding));
     }
     buffer.write(destinationScalarOffset * 2, staging, 0, staging.length);
     return;
@@ -608,7 +639,7 @@ function uploadScalarArray(
   for (let firstPoint = 0; firstPoint < asset.splatCount; firstPoint += maximumBatchPoints) {
     const pointCount = Math.min(maximumBatchPoints, asset.splatCount - firstPoint);
     for (let point = 0; point < pointCount; point += 1) {
-      staging[point] = safeStorageFloat(readRaw4DScalar(values, firstPoint + point, asset.sourceEncoding));
+      staging[point] = readRaw4DScalar(values, firstPoint + point, asset.sourceEncoding);
     }
     buffer.write((destinationScalarOffset + firstPoint) * 4, staging, 0, pointCount);
   }
@@ -964,11 +995,7 @@ export class Raw4DGpuPlayback {
     const component = this.entity.gsplat!;
     component.setParameter('dongRaw4dFrame', frame);
     component.workBufferUpdate = WORKBUFFER_UPDATE_ONCE;
-    if (this.resource.centers && this.sampler && (
-      Math.abs(frame - this.lastCenterFrame) >= CPU_SORT_FRAME_INTERVAL
-      || frame === 0
-      || frame === this.asset.totalFrames - 1
-    )) {
+    if (this.resource.centers && this.sampler && raw4DSortCentersNeedRefresh(frame, this.lastCenterFrame)) {
       this.sampler.samplePosition(frame);
       const { x, y, z } = this.sampler.properties;
       for (let index = 0; index < this.asset.splatCount; index += 1) {
@@ -988,6 +1015,7 @@ export class Raw4DGpuPlayback {
     component.setParameter('dongRaw4dAllMode', enabled ? 1 : 0);
     component.workBufferUpdate = WORKBUFFER_UPDATE_ONCE;
   }
+
 
   destroy(): void {
     if (this.disposed) return;

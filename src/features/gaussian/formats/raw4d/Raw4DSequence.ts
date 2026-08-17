@@ -1,4 +1,11 @@
 import type { Raw4DHeader } from './Raw4DTypes';
+import {
+  RAW4D_TRACK_DEFINITIONS,
+  raw4DBankCount,
+  raw4DCanonicalKeyframes,
+  raw4DTrackStride,
+  type Raw4DTrackDefinition,
+} from './Raw4DSchema';
 import type {
   Raw4DSequenceBoundaryMatchWork,
   Raw4DSequenceExtractedSegment,
@@ -24,7 +31,7 @@ function shBandsFromCount(count: number): number {
 }
 
 export function raw4DSequenceFrameRangeFromName(name: string): ExplicitFrameRange | null {
-  const stem = name.replace(/\.raw4d$/i, '');
+  const stem = name.replace(/\.(?:raw4d|ply4)$/i, '');
   const matches = [...stem.matchAll(/(?:^|[^0-9])(\d+)[_-](\d+)(?=$|[^0-9])/g)];
   const match = matches.at(-1);
   if (!match) return null;
@@ -48,25 +55,10 @@ function shCoefficientCount(header: Raw4DHeader): number {
   return indices.length;
 }
 
-function trackKeyframes(header: Raw4DHeader, prefix: string, strideComment: string): number[] {
-  const expression = new RegExp(`^${prefix}_(\\d+)(?:_|$)`);
-  let maximumBank = -1;
-  for (const name of header.propertyNames) {
-    const match = expression.exec(name);
-    if (match) maximumBank = Math.max(maximumBank, Number(match[1]));
-  }
-  const bankCount = maximumBank + 1;
-  const stride = Number(header.comments.get(strideComment));
-  if (bankCount <= 0 || !Number.isSafeInteger(stride) || stride <= 0) {
-    throw new Error(`RAW4D ${prefix} 的关键帧声明无效。`);
-  }
-  const frames: number[] = [];
-  for (let frame = 0; frame < header.totalFrames; frame += stride) frames.push(frame);
-  if (frames.at(-1) !== header.totalFrames - 1) frames.push(header.totalFrames - 1);
-  if (frames.length !== bankCount) {
-    throw new Error(`RAW4D ${prefix} 关键帧数量不一致：声明 ${bankCount}，计算 ${frames.length}。`);
-  }
-  return frames;
+function trackKeyframes(header: Raw4DHeader, definition: Raw4DTrackDefinition): number[] {
+  const bankCount = raw4DBankCount(header.propertyNames, definition);
+  if (bankCount === 0) return [0];
+  return raw4DCanonicalKeyframes(header.totalFrames, raw4DTrackStride(header.comments, definition), bankCount);
 }
 
 // #WDD-gpt 2026-08-16 - 多段 RAW4D 优先使用文件名源帧范围；无范围时才按拖入顺序建立共享边界时间轴。
@@ -100,11 +92,11 @@ export function buildRaw4DSequenceSegments(sources: readonly Raw4DSequenceSource
       shBands: shBandsFromCount(coefficientCount),
       shCoefficientCount: coefficientCount,
       keyframes: {
-        position: trackKeyframes(source.header, 'xyz_bank', 'xyz_bank_keyframe_stride'),
-        rotation: trackKeyframes(source.header, 'rot_bank', 'rot_bank_keyframe_stride'),
-        colorDc: trackKeyframes(source.header, 'f_dc_bank', 'features_dc_bank_keyframe_stride'),
-        scale: trackKeyframes(source.header, 'scale_bank', 'scaling_bank_keyframe_stride'),
-        opacity: trackKeyframes(source.header, 'opacity_bank', 'opacity_bank_keyframe_stride'),
+        position: trackKeyframes(source.header, RAW4D_TRACK_DEFINITIONS.position),
+        rotation: trackKeyframes(source.header, RAW4D_TRACK_DEFINITIONS.rotation),
+        colorDc: trackKeyframes(source.header, RAW4D_TRACK_DEFINITIONS.colorDc),
+        scale: trackKeyframes(source.header, RAW4D_TRACK_DEFINITIONS.scale),
+        opacity: trackKeyframes(source.header, RAW4D_TRACK_DEFINITIONS.opacity),
       },
     });
   }
@@ -129,7 +121,8 @@ export function locateRaw4DSequenceFrame(
   if (segments.length === 0) throw new Error('RAW4D 序列没有时间段。');
   const firstFrame = segments[0].firstFrame;
   const lastFrame = segments.at(-1)!.lastFrame;
-  const sourceFrame = Math.max(firstFrame, Math.min(lastFrame, firstFrame + Math.round(globalFrame)));
+  // #WDD-gpt 2026-08-16 - Master PLY4 时间是浮点帧索引；多段定位不再先四舍五入破坏段内插值。
+  const sourceFrame = Math.max(firstFrame, Math.min(lastFrame, firstFrame + globalFrame));
   let segmentIndex = 0;
   for (let index = 1; index < segments.length; index += 1) {
     if (segments[index].firstFrame <= sourceFrame) segmentIndex = index;

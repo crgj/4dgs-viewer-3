@@ -13,12 +13,12 @@ function unorderedHalf(code) {
   return code & 0x8000 ? (code ^ 0x8000) : (~code & 0xffff);
 }
 
-function encodeResiduals(sourceBits, baseBits, observationCount) {
-  const raw = Buffer.allocUnsafe(observationCount * 3 * 2);
+function encodeResiduals(sourceBits, baseBits, observationCount, dimensions) {
+  const raw = Buffer.allocUnsafe(observationCount * (dimensions - 1) * 2);
   for (let observation = 0; observation < observationCount; observation += 1) {
-    const sourceOffset = observation * 4;
+    const sourceOffset = observation * dimensions;
     let previous = orderedHalf(baseBits[observation]);
-    for (let dimension = 1; dimension < 4; dimension += 1) {
+    for (let dimension = 1; dimension < dimensions; dimension += 1) {
       const value = orderedHalf(sourceBits[sourceOffset + dimension]);
       const coded = (value - previous) & 0xffff;
       const plane = (dimension - 1) * observationCount * 2;
@@ -30,17 +30,17 @@ function encodeResiduals(sourceBits, baseBits, observationCount) {
   return raw;
 }
 
-function reconstruct(baseBits, residuals, observationCount) {
-  if (residuals.length !== observationCount * 3 * 2) throw new Error('Opacity hybrid residual length mismatch.');
-  const bits = new Uint16Array(observationCount * 4);
+function reconstruct(baseBits, residuals, observationCount, dimensions) {
+  if (residuals.length !== observationCount * (dimensions - 1) * 2) throw new Error('Opacity hybrid residual length mismatch.');
+  const bits = new Uint16Array(observationCount * dimensions);
   for (let observation = 0; observation < observationCount; observation += 1) {
-    bits[observation * 4] = baseBits[observation];
+    bits[observation * dimensions] = baseBits[observation];
     let previous = orderedHalf(baseBits[observation]);
-    for (let dimension = 1; dimension < 4; dimension += 1) {
+    for (let dimension = 1; dimension < dimensions; dimension += 1) {
       const plane = (dimension - 1) * observationCount * 2;
       const coded = residuals[plane + observation] | (residuals[plane + observationCount + observation] << 8);
       const value = (previous + coded) & 0xffff;
-      bits[observation * 4 + dimension] = unorderedHalf(value);
+      bits[observation * dimensions + dimension] = unorderedHalf(value);
       previous = value;
     }
   }
@@ -49,9 +49,10 @@ function reconstruct(baseBits, residuals, observationCount) {
 
 // #WDD-gpt 2026-08-16 - V2.5 仅有界量化 Opacity 基值，三个时间 bank 以可逆 FP16 链式残差保存，避免快速运动累计重影。
 export function encodeOpacityHybrid(sourceBits, observationCount, options = {}) {
-  if (sourceBits.length !== observationCount * 4) throw new Error('Opacity hybrid expects four banks per observation.');
+  const dimensions = observationCount > 0 ? sourceBits.length / observationCount : 0;
+  if (!Number.isInteger(dimensions) || dimensions < 1 || dimensions > 65535) throw new Error('Opacity hybrid bank layout is invalid.');
   const bank0 = new Uint16Array(observationCount);
-  for (let observation = 0; observation < observationCount; observation += 1) bank0[observation] = sourceBits[observation * 4];
+  for (let observation = 0; observation < observationCount; observation += 1) bank0[observation] = sourceBits[observation * dimensions];
   const baseExact = Boolean(options.baseExact);
   let baseEncoded;
   let decodedBaseBits;
@@ -76,14 +77,14 @@ export function encodeOpacityHybrid(sourceBits, observationCount, options = {}) 
     decodedBaseBits = base.decodedBits;
     baseMetrics = base.metrics;
   }
-  const rawResiduals = encodeResiduals(sourceBits, decodedBaseBits, observationCount);
+  const rawResiduals = encodeResiduals(sourceBits, decodedBaseBits, observationCount, dimensions);
   const residualCompression = options.residualCompression ?? 'zlib';
   if (!['zlib', 'none'].includes(residualCompression)) throw new Error(`Unsupported Opacity hybrid residual compression ${residualCompression}.`);
   const storedResiduals = residualCompression === 'zlib' ? zlibSync(rawResiduals, { level: 9 }) : rawResiduals;
   const header = Buffer.alloc(HEADER_BYTES);
   header.write(MAGIC, 0, 'ascii');
   header.writeUInt32LE(observationCount, 8);
-  header.writeUInt16LE(4, 12);
+  header.writeUInt16LE(dimensions, 12);
   header.writeUInt8(residualCompression === 'zlib' ? 1 : 2, 14);
   header.writeUInt8(baseExact ? 2 : 1, 15);
   header.writeUInt32LE(baseEncoded.length, 16);
@@ -93,12 +94,12 @@ export function encodeOpacityHybrid(sourceBits, observationCount, options = {}) 
   const encoded = Buffer.concat([header, baseEncoded, storedResiduals]);
   return {
     encoded,
-    decodedBits: reconstruct(decodedBaseBits, rawResiduals, observationCount),
+    decodedBits: reconstruct(decodedBaseBits, rawResiduals, observationCount, dimensions),
     metrics: {
       observationCount,
-      dimensions: 4,
+      dimensions,
       base: baseMetrics,
-      exactTemporalDimensions: [1, 2, 3],
+      exactTemporalDimensions: Array.from({ length: dimensions - 1 }, (_, index) => index + 1),
       residualTransform: `ordered-fp16-chain-delta-byte-plane-${residualCompression}`,
       residualCompression,
       residualRawBytes: rawResiduals.length,
@@ -117,7 +118,7 @@ export function decodeOpacityHybrid(encoded) {
   const baseBytes = encoded.readUInt32LE(16);
   const residualBytes = encoded.readUInt32LE(20);
   const residualRawBytes = encoded.readUInt32LE(24);
-  if (dimensions !== 4 || ![1, 2].includes(codec) || ![1, 2].includes(baseCodec) || HEADER_BYTES + baseBytes + residualBytes !== encoded.length) {
+  if (dimensions < 1 || ![1, 2].includes(codec) || ![1, 2].includes(baseCodec) || HEADER_BYTES + baseBytes + residualBytes !== encoded.length) {
     throw new Error('Invalid Opacity hybrid metadata.');
   }
   let baseBits;
@@ -139,12 +140,12 @@ export function decodeOpacityHybrid(encoded) {
   const residuals = codec === 1 ? unzlibSync(storedResiduals) : storedResiduals;
   if (residuals.length !== residualRawBytes) throw new Error('Opacity hybrid residual payload mismatch.');
   return {
-    bits: reconstruct(baseBits, residuals, observationCount),
+    bits: reconstruct(baseBits, residuals, observationCount, dimensions),
     metrics: {
       observationCount,
       dimensions,
       base: baseMetrics,
-      exactTemporalDimensions: [1, 2, 3],
+      exactTemporalDimensions: Array.from({ length: dimensions - 1 }, (_, index) => index + 1),
       residualTransform: `ordered-fp16-chain-delta-byte-plane-${codec === 1 ? 'zlib' : 'none'}`,
       residualCompression: codec === 1 ? 'zlib' : 'none',
       residualRawBytes,

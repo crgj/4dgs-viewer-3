@@ -6,7 +6,7 @@ const RANS_TOTAL = 1 << RANS_SCALE_BITS;
 const RANS_LOW = 1 << 23;
 const floatView = new DataView(new ArrayBuffer(4));
 
-export function halfToFloat(bits) {
+function decodeHalfBits(bits) {
   const sign = (bits & 0x8000) << 16;
   let exponent = (bits >>> 10) & 0x1f;
   let mantissa = bits & 0x03ff;
@@ -28,6 +28,14 @@ export function halfToFloat(bits) {
   exponent += 127 - 15;
   floatView.setUint32(0, sign | (exponent << 23) | (mantissa << 13), true);
   return floatView.getFloat32(0, true);
+}
+
+// #WDD-gpt 2026-08-16 - Position/Crop/SH 会重复读取数千万个 FP16；64K 查表消除 DataView 热循环且保持逐 bit 解码语义。
+const halfToFloatTable = new Float32Array(1 << 16);
+for (let bits = 0; bits < halfToFloatTable.length; bits += 1) halfToFloatTable[bits] = decodeHalfBits(bits);
+
+export function halfToFloat(bits) {
+  return halfToFloatTable[bits & 0xffff];
 }
 
 export function floatToHalf(value) {
@@ -263,18 +271,22 @@ function createTripleDictionary(radius) {
     const bMaximum = Math.max(Math.abs(b[0]), Math.abs(b[1]), Math.abs(b[2]));
     return aL1 - bL1 || aMaximum - bMaximum || a[0] - b[0] || a[1] - b[1] || a[2] - b[2];
   });
-  return {
-    entries,
-    indices: new Map(entries.map((entry, index) => [entry.join(','), index])),
-  };
+  const side = radius * 2 + 1;
+  const denseIndices = new Uint16Array(side * side * side);
+  for (let index = 0; index < entries.length; index += 1) {
+    const [x, y, z] = entries[index];
+    denseIndices[(x + radius) * side * side + (y + radius) * side + z + radius] = index + 1;
+  }
+  return { entries, radius, side, denseIndices };
 }
 
 const tripleDictionary = createTripleDictionary(7);
 
 function writeTriple(writer, x, y, z) {
-  const index = tripleDictionary.indices.get(`${x},${y},${z}`);
-  if (index !== undefined) {
-    writer.uint(index + 1);
+  const radius = tripleDictionary.radius;
+  if (x >= -radius && x <= radius && y >= -radius && y <= radius && z >= -radius && z <= radius) {
+    const side = tripleDictionary.side;
+    writer.uint(tripleDictionary.denseIndices[(x + radius) * side * side + (y + radius) * side + z + radius]);
   } else {
     writer.uint(0);
     writer.sint(x);
@@ -305,9 +317,11 @@ function spreadMorton10(value) {
 }
 
 function mortonCode(position, center, halfExtent) {
-  const minimum = center.map((value) => value - halfExtent);
-  const quantized = position.map((value, axis) => Math.max(0, Math.min(1023, Math.round((value - minimum[axis]) * 1023 / (halfExtent * 2)))));
-  return spreadMorton10(quantized[0]) | (spreadMorton10(quantized[1]) << 1) | (spreadMorton10(quantized[2]) << 2);
+  const scale = 1023 / (halfExtent * 2);
+  const x = Math.max(0, Math.min(1023, Math.round((position[0] - (center[0] - halfExtent)) * scale)));
+  const y = Math.max(0, Math.min(1023, Math.round((position[1] - (center[1] - halfExtent)) * scale)));
+  const z = Math.max(0, Math.min(1023, Math.round((position[2] - (center[2] - halfExtent)) * scale)));
+  return spreadMorton10(x) | (spreadMorton10(y) << 1) | (spreadMorton10(z) << 2);
 }
 
 function insideCube(position, center, halfExtent) {
@@ -315,7 +329,7 @@ function insideCube(position, center, halfExtent) {
 }
 
 // #WDD-gpt 2026-08-15 - 只保留所有位置关键帧均在中心立方体内的轨迹，并按首次出现位置的 Morton 码生成永久 Track ID。
-export function buildCroppedMortonLayout(segments, permanent, center, halfExtent) {
+export function buildCroppedMortonLayout(segments, permanent, center, halfExtent, options = {}) {
   const kept = new Uint8Array(permanent.slotCount);
   kept.fill(1);
   const firstPositions = Array.from({ length: permanent.slotCount });
@@ -331,8 +345,10 @@ export function buildCroppedMortonLayout(segments, permanent, center, halfExtent
         firstPositions[oldTrack] = positionAt(segment, local, 0);
         birthSegments[oldTrack] = segmentIndex;
       }
-      for (let bank = 0; bank < positionBanks; bank += 1) {
-        if (!insideCube(positionAt(segment, local, bank), center, halfExtent)) kept[oldTrack] = 0;
+      if (!options.positionsAlreadyInside) {
+        for (let bank = 0; bank < positionBanks; bank += 1) {
+          if (!insideCube(positionAt(segment, local, bank), center, halfExtent)) kept[oldTrack] = 0;
+        }
       }
     }
   }
@@ -419,14 +435,16 @@ function decodedPosition(quantized, origin, step) {
   return quantized.map((value, axis) => halfToFloat(floatToHalf(origin[axis] + value * step)));
 }
 
-// #WDD-gpt 2026-08-15 - Position 采用 Morton birth 集合、两级块运动预测、整数可逆时域残差、三维字典及超限原值例外。
-export function encodePositions(segments, layout, bankCounts, options) {
+// #WDD-gpt 2026-08-16 - 暴露 Position 原始上下文，浏览器封装可跳过随后立即被解开的临时 rANS 层。
+export function encodePositionRaw(segments, layout, bankCounts, options) {
   const { center, halfExtent, step, maximumError, cellSize } = options;
   const origin = center.map((value) => value - halfExtent);
   const cellQuant = Math.max(1, Math.round(cellSize / step));
   const indices = propertyIndexSets(segments, 'xyz_bank', ['x', 'y', 'z'], bankCounts);
   const main = new ByteWriter();
-  const state = [new Int32Array(layout.slotCount), new Int32Array(layout.slotCount), new Int32Array(layout.slotCount)];
+  const stateX = new Int32Array(layout.slotCount);
+  const stateY = new Int32Array(layout.slotCount);
+  const stateZ = new Int32Array(layout.slotCount);
   const initialized = new Uint8Array(layout.slotCount);
   const exceptions = [];
   let ordinal = 0;
@@ -442,27 +460,53 @@ export function encodePositions(segments, layout, bankCounts, options) {
     for (let bank = 0; bank < bankCounts[segmentIndex]; bank += 1) {
       const current = new Int32Array(active.length * 3);
       let globalCount = 0;
-      const globalSum = [0, 0, 0];
+      let globalSumX = 0;
+      let globalSumY = 0;
+      let globalSumZ = 0;
+      const [indexX, indexY, indexZ] = indices[segmentIndex][bank];
       for (let row = 0; row < active.length; row += 1) {
         const slot = active[row];
         const local = inverse[slot];
         const sourceBase = local * stride;
-        const position = indices[segmentIndex][bank].map((index) => halfToFloat(segment.rows[sourceBase + index]));
-        const quantized = quantizedPosition(position, origin, step);
-        current.set(quantized, row * 3);
+        const sourceBitsX = segment.rows[sourceBase + indexX];
+        const sourceBitsY = segment.rows[sourceBase + indexY];
+        const sourceBitsZ = segment.rows[sourceBase + indexZ];
+        const sourceX = halfToFloat(sourceBitsX);
+        const sourceY = halfToFloat(sourceBitsY);
+        const sourceZ = halfToFloat(sourceBitsZ);
+        const quantizedX = Math.round((sourceX - origin[0]) / step);
+        const quantizedY = Math.round((sourceY - origin[1]) / step);
+        const quantizedZ = Math.round((sourceZ - origin[2]) / step);
+        const offset = row * 3;
+        current[offset] = quantizedX;
+        current[offset + 1] = quantizedY;
+        current[offset + 2] = quantizedZ;
         if (initialized[slot]) {
-          for (let axis = 0; axis < 3; axis += 1) globalSum[axis] += quantized[axis] - state[axis][slot];
+          globalSumX += quantizedX - stateX[slot];
+          globalSumY += quantizedY - stateY[slot];
+          globalSumZ += quantizedZ - stateZ[slot];
           globalCount += 1;
         }
+        const decodedX = halfToFloat(floatToHalf(origin[0] + quantizedX * step));
+        const decodedY = halfToFloat(floatToHalf(origin[1] + quantizedY * step));
+        const decodedZ = halfToFloat(floatToHalf(origin[2] + quantizedZ * step));
+        const error = Math.hypot(decodedX - sourceX, decodedY - sourceY, decodedZ - sourceZ);
+        squaredError += error * error;
+        maximumObservedError = Math.max(maximumObservedError, error);
+        if (!Number.isFinite(error) || error > maximumError) {
+          exceptions.push({ ordinal: ordinal + row, bits: [sourceBitsX, sourceBitsY, sourceBitsZ] });
+        }
       }
-      const global = globalSum.map((sum) => globalCount ? Math.round(sum / globalCount) : 0);
+      const globalX = globalCount ? Math.round(globalSumX / globalCount) : 0;
+      const globalY = globalCount ? Math.round(globalSumY / globalCount) : 0;
+      const globalZ = globalCount ? Math.round(globalSumZ / globalCount) : 0;
       const cells = new Map();
       for (let row = 0; row < active.length; row += 1) {
         const slot = active[row];
         if (!initialized[slot]) continue;
-        const cx = Math.floor(state[0][slot] / cellQuant);
-        const cy = Math.floor(state[1][slot] / cellQuant);
-        const cz = Math.floor(state[2][slot] / cellQuant);
+        const cx = Math.floor(stateX[slot] / cellQuant);
+        const cy = Math.floor(stateY[slot] / cellQuant);
+        const cz = Math.floor(stateZ[slot] / cellQuant);
         const key = cx + cy * 32 + cz * 1024;
         let cell = cells.get(key);
         if (!cell) {
@@ -470,14 +514,16 @@ export function encodePositions(segments, layout, bankCounts, options) {
           cells.set(key, cell);
         }
         const offset = row * 3;
-        for (let axis = 0; axis < 3; axis += 1) cell[axis] += current[offset + axis] - state[axis][slot] - global[axis];
+        cell[0] += current[offset] - stateX[slot] - globalX;
+        cell[1] += current[offset + 1] - stateY[slot] - globalY;
+        cell[2] += current[offset + 2] - stateZ[slot] - globalZ;
         cell[3] += 1;
       }
       const cellMotions = new Map();
       for (const [key, cell] of cells) cellMotions.set(key, cell.slice(0, 3).map((sum) => Math.round(sum / cell[3])));
-      main.sint(global[0]);
-      main.sint(global[1]);
-      main.sint(global[2]);
+      main.sint(globalX);
+      main.sint(globalY);
+      main.sint(globalZ);
       const cellEntries = [...cellMotions].sort((a, b) => a[0] - b[0]);
       main.uint(cellEntries.length);
       let previousKey = 0;
@@ -486,47 +532,51 @@ export function encodePositions(segments, layout, bankCounts, options) {
         writeTriple(main, motion[0], motion[1], motion[2]);
         previousKey = key;
       }
-      let birth = [0, 0, 0];
+      let birthX = 0;
+      let birthY = 0;
+      let birthZ = 0;
       let hasBirth = false;
       for (let row = 0; row < active.length; row += 1) {
         const slot = active[row];
         const offset = row * 3;
-        const quantized = [current[offset], current[offset + 1], current[offset + 2]];
-        let residual;
+        const quantizedX = current[offset];
+        const quantizedY = current[offset + 1];
+        const quantizedZ = current[offset + 2];
+        let residualX;
+        let residualY;
+        let residualZ;
         if (initialized[slot]) {
-          const key = Math.floor(state[0][slot] / cellQuant)
-            + Math.floor(state[1][slot] / cellQuant) * 32
-            + Math.floor(state[2][slot] / cellQuant) * 1024;
+          const key = Math.floor(stateX[slot] / cellQuant)
+            + Math.floor(stateY[slot] / cellQuant) * 32
+            + Math.floor(stateZ[slot] / cellQuant) * 1024;
           const cell = cellMotions.get(key) ?? [0, 0, 0];
-          residual = quantized.map((value, axis) => value - state[axis][slot] - global[axis] - cell[axis]);
+          residualX = quantizedX - stateX[slot] - globalX - cell[0];
+          residualY = quantizedY - stateY[slot] - globalY - cell[1];
+          residualZ = quantizedZ - stateZ[slot] - globalZ - cell[2];
         } else {
-          residual = quantized.map((value, axis) => value - (hasBirth ? birth[axis] : 0));
-          birth = quantized;
+          residualX = quantizedX - (hasBirth ? birthX : 0);
+          residualY = quantizedY - (hasBirth ? birthY : 0);
+          residualZ = quantizedZ - (hasBirth ? birthZ : 0);
+          birthX = quantizedX;
+          birthY = quantizedY;
+          birthZ = quantizedZ;
           hasBirth = true;
         }
-        writeTriple(main, residual[0], residual[1], residual[2]);
-        for (let axis = 0; axis < 3; axis += 1) state[axis][slot] = quantized[axis];
+        writeTriple(main, residualX, residualY, residualZ);
+        stateX[slot] = quantizedX;
+        stateY[slot] = quantizedY;
+        stateZ[slot] = quantizedZ;
         initialized[slot] = 1;
-        const local = inverse[slot];
-        const sourceBase = local * stride;
-        const source = indices[segmentIndex][bank].map((index) => halfToFloat(segment.rows[sourceBase + index]));
-        const decoded = decodedPosition(quantized, origin, step);
-        const error = Math.hypot(decoded[0] - source[0], decoded[1] - source[1], decoded[2] - source[2]);
-        squaredError += error * error;
-        maximumObservedError = Math.max(maximumObservedError, error);
-        if (!Number.isFinite(error) || error > maximumError) {
-          exceptions.push({ ordinal, bits: indices[segmentIndex][bank].map((index) => segment.rows[sourceBase + index]) });
-        }
-        ordinal += 1;
-        valueCount += 3;
       }
+      ordinal += active.length;
+      valueCount += active.length * 3;
     }
   }
   const mainRaw = main.finish();
   const exceptionRaw = finishExceptions(exceptions);
-  const encoded = entropyPair('P3DPR001', mainRaw, exceptionRaw);
   return {
-    encoded,
+    mainRaw,
+    exceptionRaw,
     metrics: {
       observationCount: ordinal,
       valueCount,
@@ -537,13 +587,19 @@ export function encodePositions(segments, layout, bankCounts, options) {
       exceptionCount: exceptions.length,
       mainRawBytes: mainRaw.length,
       exceptionRawBytes: exceptionRaw.length,
-      encodedBytes: encoded.length,
       cellSize,
       temporalTransform: 'reversible integer first-order lifting delta',
       residualDictionary: 'exact 3D radius-7 dictionary with signed-varint escape',
       entropyCodec: 'static byte rANS-12',
     },
   };
+}
+
+// #WDD-gpt 2026-08-16 - 保留旧 P3DPR001 API 供 CLI、回归测试和兼容链路使用；生产浏览器改走原始上下文入口。
+export function encodePositions(segments, layout, bankCounts, options) {
+  const raw = encodePositionRaw(segments, layout, bankCounts, options);
+  const encoded = entropyPair('P3DPR001', raw.mainRaw, raw.exceptionRaw);
+  return { encoded, metrics: { ...raw.metrics, encodedBytes: encoded.length } };
 }
 
 export function decodePositions(encoded, manifest, activeSlots, rows, indices) {

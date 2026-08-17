@@ -298,6 +298,17 @@ input:focus-visible {
   letter-spacing: 0.035em;
   line-height: 1;
   white-space: nowrap;
+  cursor: pointer;
+  transition: border-color 140ms ease, color 140ms ease, background 140ms ease, box-shadow 140ms ease;
+}
+
+.app-version-badge:hover,
+.app-version-badge:focus-visible {
+  border-color: rgba(101, 239, 198, 0.46);
+  color: #b8f4e2;
+  background: rgba(36, 201, 151, 0.15);
+  box-shadow: 0 0 0 2px rgba(55, 219, 170, 0.08);
+  outline: none;
 }
 
 .brand small {
@@ -428,6 +439,23 @@ input:focus-visible {
 
 .dropdown-menu b {
   color: var(--accent-bright);
+}
+
+/* #WDD-gpt 2026-08-17 - 文件菜单的导出项提供 .4cgs 文件与 .ply 序列二级子菜单，悬停展开。 */
+.submenu-anchor {
+  position: relative;
+}
+
+.submenu-anchor > .dropdown-menu {
+  top: -7px;
+  left: calc(100% - 4px);
+  display: none;
+  width: 150px;
+}
+
+.submenu-anchor:hover > .dropdown-menu,
+.submenu-anchor:focus-within > .dropdown-menu {
+  display: block;
 }
 
 /* #WDD-gpt  2026-08-15 - 插件菜单使用可扫描的 Card 项，集中展示功能说明与运行状态。 */
@@ -643,11 +671,516 @@ input:focus-visible {
 }
 
 .top-actions {
+  position: relative;
   display: flex;
   min-width: 0;
   align-items: center;
   gap: 6px;
   justify-self: end;
+}
+
+/* #WDD-gpt 2026-08-16 - 在导出按钮旁持续显示大文件 Worker 进度/结果，避免浏览器拦截下载或弹窗后用户没有反馈。 */
+.export-notice {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 8px);
+  z-index: 40;
+  width: max-content;
+  max-width: min(520px, 70vw);
+  padding: 8px 12px;
+  border: 1px solid rgba(77, 232, 201, 0.34);
+  border-radius: 8px;
+  background: rgba(6, 18, 24, 0.94);
+  color: var(--text-primary);
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.38);
+  font-size: 12px;
+  line-height: 1.4;
+  white-space: normal;
+}
+
+.export-notice.success { border-color: rgba(77, 232, 201, 0.58); }
+.export-notice.error { border-color: rgba(255, 92, 112, 0.62); color: #ffb3bd; }
+
+/* #WDD-gpt 2026-08-16 - 大文件压缩使用独立监督对话框，持续展示线程、阶段、耗时、码率与最近事件。 */
+.export-monitor-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 120;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(2, 5, 8, 0.66);
+  backdrop-filter: blur(10px) saturate(112%);
+}
+
+.export-monitor-dialog {
+  display: grid;
+  min-width: 0;
+  width: min(680px, calc(100vw - 40px));
+  max-width: 100%;
+  max-height: min(760px, calc(100vh - 40px));
+  gap: 14px;
+  padding: 18px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  border: 1px solid rgba(75, 225, 181, 0.26);
+  border-radius: 16px;
+  background: linear-gradient(150deg, rgba(19, 25, 29, 0.98), rgba(8, 12, 15, 0.98));
+  box-shadow: 0 32px 110px rgba(0, 0, 0, 0.68), inset 0 1px rgba(255, 255, 255, 0.06);
+  color: var(--text-primary);
+  scrollbar-color: rgba(113, 216, 184, 0.36) rgba(255, 255, 255, 0.025);
+  scrollbar-gutter: stable;
+  scrollbar-width: thin;
+}
+
+/* #WDD-gpt 2026-08-17 - 保存监督弹窗只允许纵向滚动，长内容自动换行，并与主检查器共用细绿色滚动条。 */
+.export-monitor-dialog > * { min-width: 0; }
+
+.export-monitor-dialog > header,
+.export-monitor-dialog > footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 16px;
+}
+
+.export-monitor-dialog > header > div {
+  display: grid;
+  gap: 4px;
+}
+
+.export-monitor-dialog > header span {
+  color: var(--accent-bright);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.14em;
+}
+
+.export-monitor-dialog > header strong { overflow-wrap: anywhere; font-size: 18px; }
+
+.export-monitor-state {
+  padding: 5px 9px;
+  border: 1px solid rgba(86, 226, 185, 0.28);
+  border-radius: 999px;
+  color: #71e9c4;
+  font-size: 11px;
+}
+
+.export-monitor-state.error,
+.export-monitor-state.cancelled { border-color: rgba(255, 104, 121, 0.34); color: #ff9baa; }
+.export-monitor-state.success { background: rgba(47, 209, 160, 0.11); }
+
+.export-monitor-stage {
+  display: grid;
+  gap: 8px;
+  padding: 13px;
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  border-radius: 11px;
+  background: rgba(255, 255, 255, 0.025);
+}
+
+.export-monitor-stage > div:first-child {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  color: #cfd8d5;
+  font-size: 12px;
+}
+.export-monitor-stage > div:first-child span {
+  min-width: 0;
+  flex: 1 1 240px;
+  overflow-wrap: anywhere;
+}
+.export-monitor-stage > div:first-child b { flex: 0 0 auto; }
+.export-monitor-stage p {
+  min-height: 18px;
+  margin: 0;
+  color: #929e9a;
+  font-size: 12px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.export-monitor-progress,
+.export-monitor-subprogress {
+  height: 6px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.export-monitor-subprogress { height: 2px; background: rgba(255, 255, 255, 0.05); }
+.export-monitor-progress i,
+.export-monitor-subprogress i {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #20b986, #6ce9c2);
+  box-shadow: 0 0 14px rgba(75, 230, 183, 0.34);
+  transition: width 140ms ease;
+}
+
+.export-monitor-stats {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 7px;
+  margin: 0;
+}
+
+.export-monitor-stats div {
+  display: grid;
+  gap: 4px;
+  padding: 9px;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 9px;
+  background: rgba(255, 255, 255, 0.018);
+}
+
+.export-monitor-stats dt { color: #76817e; font-size: 9px; }
+.export-monitor-stats dd {
+  min-width: 0;
+  margin: 0;
+  color: #dbe5e2;
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.export-monitor-timings {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(108px, 1fr));
+  gap: 6px;
+}
+
+.export-monitor-timings span {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+  padding: 7px 9px;
+  border-radius: 8px;
+  background: rgba(50, 201, 158, 0.06);
+  color: #8c9995;
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 9px;
+  overflow-wrap: anywhere;
+}
+
+.export-monitor-timings b { color: #cbd7d3; font-weight: 650; }
+
+.export-monitor-log {
+  display: grid;
+  min-height: 118px;
+  max-height: 210px;
+  gap: 5px;
+  margin: 0;
+  padding: 10px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  list-style: none;
+  border: 1px solid rgba(255, 255, 255, 0.055);
+  border-radius: 10px;
+  background: rgba(1, 5, 7, 0.42);
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 10px;
+  scrollbar-color: rgba(113, 216, 184, 0.36) rgba(255, 255, 255, 0.025);
+  scrollbar-gutter: stable;
+  scrollbar-width: thin;
+}
+
+.export-monitor-log li {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: 48px minmax(0, 1fr);
+  align-items: start;
+  gap: 8px;
+  color: #a8b2af;
+}
+.export-monitor-log li > span {
+  min-width: 0;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+.export-monitor-log time { color: #4ecba6; }
+.export-monitor-dialog > footer small {
+  min-width: 0;
+  max-width: 430px;
+  flex: 1 1 260px;
+  color: #6f7a77;
+  font-size: 10px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+.export-monitor-cancel { color: #ff9eab; }
+
+.export-monitor-dialog::-webkit-scrollbar,
+.export-monitor-log::-webkit-scrollbar {
+  width: 6px;
+}
+
+.export-monitor-dialog::-webkit-scrollbar-track,
+.export-monitor-log::-webkit-scrollbar-track {
+  background: rgba(255, 255, 255, 0.018);
+}
+
+.export-monitor-dialog::-webkit-scrollbar-thumb,
+.export-monitor-log::-webkit-scrollbar-thumb {
+  border: 1px solid rgba(19, 22, 26, 0.9);
+  border-radius: 6px;
+  background: rgba(113, 216, 184, 0.32);
+}
+
+.export-monitor-dialog::-webkit-scrollbar-thumb:hover,
+.export-monitor-log::-webkit-scrollbar-thumb:hover {
+  background: rgba(113, 216, 184, 0.52);
+}
+
+/* #WDD-gpt 2026-08-16 - 高驻留模式在网页内使用顶层确认对话框，明确展示 RAM/VRAM 预算与浏览器风险。 */
+.memory-confirm-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 40000;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(1, 4, 7, 0.7);
+  backdrop-filter: blur(14px) saturate(118%);
+}
+
+.memory-confirm-dialog {
+  display: grid;
+  width: min(460px, calc(100vw - 32px));
+  gap: 14px;
+  padding: 20px;
+  border: 1px solid rgba(78, 229, 187, 0.34);
+  border-radius: 16px;
+  background:
+    radial-gradient(circle at 92% 0%, rgba(61, 218, 172, 0.13), transparent 42%),
+    linear-gradient(150deg, rgba(19, 26, 30, 0.99), rgba(7, 11, 14, 0.99));
+  box-shadow: 0 36px 120px rgba(0, 0, 0, 0.72), inset 0 1px rgba(255, 255, 255, 0.07);
+}
+
+.memory-confirm-dialog > header {
+  display: grid;
+  gap: 6px;
+}
+
+.memory-confirm-dialog > header span {
+  color: var(--accent-bright);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.16em;
+}
+
+.memory-confirm-dialog > header strong {
+  color: #eef8f4;
+  font-size: 19px;
+}
+
+.memory-confirm-dialog > header p,
+.memory-confirm-warning {
+  margin: 0;
+  color: #8f9c98;
+  font-size: 11px;
+  line-height: 1.65;
+}
+
+.memory-confirm-dialog > dl {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 7px;
+  margin: 0;
+}
+
+.memory-confirm-dialog > dl div {
+  display: grid;
+  min-width: 0;
+  gap: 5px;
+  padding: 11px;
+  border: 1px solid rgba(255, 255, 255, 0.065);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.025);
+}
+
+.memory-confirm-dialog dt {
+  color: #74817d;
+  font-size: 9px;
+}
+
+.memory-confirm-dialog dd {
+  margin: 0;
+  color: #79e7c3;
+  font-size: 12px;
+  font-weight: 720;
+}
+
+.memory-confirm-warning {
+  padding: 10px 11px;
+  border: 1px solid rgba(255, 188, 94, 0.18);
+  border-radius: 9px;
+  color: #cfb98f;
+  background: rgba(255, 170, 52, 0.045);
+}
+
+.memory-confirm-dialog > footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+/* #WDD-gpt 2026-08-16 - 更新信息面板置于全局最高层并使用独立滚动区，避免长版本历史挤压主编辑界面。 */
+.release-notes-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 40000;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(1, 4, 7, 0.72);
+  backdrop-filter: blur(14px) saturate(118%);
+}
+
+.release-notes-dialog {
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
+  width: min(620px, calc(100vw - 32px));
+  max-height: min(760px, calc(100vh - 32px));
+  gap: 14px;
+  padding: 20px;
+  overflow: hidden;
+  border: 1px solid rgba(78, 229, 187, 0.28);
+  border-radius: 17px;
+  background:
+    radial-gradient(circle at 88% -8%, rgba(58, 226, 175, 0.14), transparent 38%),
+    linear-gradient(150deg, rgba(20, 27, 31, 0.995), rgba(7, 11, 14, 0.995));
+  box-shadow: 0 38px 130px rgba(0, 0, 0, 0.76), inset 0 1px rgba(255, 255, 255, 0.07);
+  color: var(--text-primary);
+}
+
+.release-notes-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 18px;
+}
+
+.release-notes-header > div { display: grid; gap: 5px; }
+.release-notes-header span {
+  color: var(--accent-bright);
+  font-size: 9px;
+  font-weight: 820;
+  letter-spacing: 0.17em;
+}
+.release-notes-header strong { color: #f1f8f6; font-size: 20px; }
+.release-notes-header p { margin: 0; color: #818d89; font-size: 11px; line-height: 1.5; }
+
+.release-notes-close {
+  display: grid;
+  flex: 0 0 auto;
+  width: 28px;
+  height: 28px;
+  place-items: center;
+  padding: 0;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  color: #7f8986;
+  background: rgba(255, 255, 255, 0.025);
+  font-size: 19px;
+  line-height: 1;
+  cursor: pointer;
+}
+.release-notes-close:hover { border-color: rgba(93, 231, 190, 0.25); color: #d9e7e3; background: rgba(73, 218, 176, 0.07); }
+
+.release-notes-current {
+  display: grid;
+  gap: 12px;
+  padding: 15px;
+  border: 1px solid rgba(77, 228, 184, 0.2);
+  border-radius: 12px;
+  background: linear-gradient(135deg, rgba(49, 210, 162, 0.09), rgba(49, 210, 162, 0.025));
+}
+.release-notes-current > header { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.release-notes-current > header div { display: flex; align-items: center; gap: 9px; }
+.release-notes-current > header span {
+  padding: 4px 7px;
+  border-radius: 999px;
+  color: #72e4c0;
+  background: rgba(44, 211, 160, 0.12);
+  font-size: 9px;
+  font-weight: 760;
+}
+.release-notes-current > header strong { color: #e4f9f2; font-family: "SFMono-Regular", Consolas, monospace; font-size: 14px; }
+.release-notes-current time,
+.release-notes-history time { color: #66716e; font-family: "SFMono-Regular", Consolas, monospace; font-size: 9px; }
+.release-notes-current ul,
+.release-notes-history ul {
+  display: grid;
+  gap: 7px;
+  margin: 0;
+  padding: 0 0 0 17px;
+  color: #aeb9b6;
+  font-size: 11px;
+  line-height: 1.6;
+}
+.release-notes-current li::marker { color: #4cdbb0; }
+
+.release-notes-history {
+  display: grid;
+  min-height: 0;
+  gap: 8px;
+  overflow: hidden;
+}
+.release-notes-history h3 { margin: 0; color: #77827f; font-size: 10px; font-weight: 680; }
+.release-notes-history > div {
+  min-height: 84px;
+  overflow: auto;
+  border: 1px solid rgba(255, 255, 255, 0.055);
+  border-radius: 10px;
+  background: rgba(1, 5, 7, 0.24);
+}
+.release-notes-history details + details { border-top: 1px solid rgba(255, 255, 255, 0.05); }
+.release-notes-history summary {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto 16px;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  color: #bac5c1;
+  cursor: pointer;
+  list-style: none;
+}
+.release-notes-history summary::-webkit-details-marker { display: none; }
+.release-notes-history summary:hover { background: rgba(255, 255, 255, 0.025); }
+.release-notes-history summary strong { font-family: "SFMono-Regular", Consolas, monospace; font-size: 10px; }
+.release-notes-history summary span { color: #65716d; text-align: center; transition: transform 140ms ease; }
+.release-notes-history details[open] summary span { transform: rotate(180deg); }
+.release-notes-history details ul { padding: 2px 30px 12px; color: #8f9b97; }
+.release-notes-empty { margin: 0; padding: 18px; color: #8b9692; text-align: center; }
+
+.release-notes-dialog > footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.release-notes-dialog > footer small { color: #5e6966; font-size: 9px; }
+
+@media (max-width: 560px) {
+  .release-notes-backdrop { padding: 8px; }
+  .release-notes-dialog { width: calc(100vw - 16px); max-height: calc(100vh - 16px); padding: 16px; }
+  .release-notes-current > header { align-items: flex-start; }
+}
+
+@media (max-width: 720px) {
+  .export-monitor-stats { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .export-monitor-timings { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .export-monitor-dialog > footer { align-items: flex-end; }
 }
 
 .language-switch {
@@ -878,6 +1411,86 @@ input:focus-visible {
   box-shadow: inset 0 0 90px rgba(0, 0, 0, 0.2);
   content: "";
   pointer-events: none;
+}
+
+/* #WDD-gpt 2026-08-16 - 身高尺数字采用独立投影层，保持厘米数值清晰且不拦截视口交互。 */
+.height-ruler-labels {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  overflow: hidden;
+  pointer-events: none;
+  user-select: none;
+}
+
+.height-ruler-label {
+  position: absolute;
+  top: 0;
+  left: 0;
+  min-width: 16px;
+  padding: 0 2px;
+  border: 0;
+  color: rgba(255, 210, 128, 0.74);
+  background: transparent;
+  text-shadow: 0 1px 2px #020304, 0 0 5px rgba(0, 0, 0, 0.85);
+  font-size: 8px;
+  font-variant-numeric: tabular-nums;
+  line-height: 10px;
+  text-align: center;
+  white-space: nowrap;
+}
+
+.height-ruler-label.meter {
+  padding: 1px 4px;
+  border: 1px solid rgba(255, 190, 82, 0.28);
+  border-radius: 5px;
+  color: #ffd58d;
+  background: rgba(12, 13, 15, 0.76);
+  box-shadow: 0 2px 9px rgba(0, 0, 0, 0.3);
+  font-weight: 700;
+  line-height: 12px;
+  backdrop-filter: blur(5px);
+}
+
+.height-ruler-handle {
+  position: absolute;
+  top: 0;
+  left: 0;
+  height: 20px;
+  padding: 0 8px;
+  border: 1px solid rgba(255, 190, 82, 0.34);
+  border-radius: 7px;
+  color: #ffcf79;
+  background: linear-gradient(180deg, rgba(49, 39, 22, 0.94), rgba(20, 18, 14, 0.92));
+  box-shadow: 0 5px 15px rgba(0, 0, 0, 0.36), inset 0 1px rgba(255, 255, 255, 0.08);
+  font: inherit;
+  font-size: 9px;
+  font-weight: 650;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  cursor: grab;
+  pointer-events: auto;
+  touch-action: none;
+  user-select: none;
+  backdrop-filter: blur(10px);
+}
+
+.height-ruler-handle:hover {
+  border-color: rgba(255, 207, 121, 0.62);
+  color: #ffe1a7;
+  transform-origin: left center;
+}
+
+.height-ruler-handle.dragging {
+  cursor: grabbing;
+  border-color: rgba(255, 215, 142, 0.78);
+  box-shadow: 0 3px 10px rgba(0, 0, 0, 0.42), 0 0 12px rgba(255, 184, 70, 0.14);
+}
+
+.height-ruler-labels[hidden],
+.height-ruler-label[hidden],
+.height-ruler-handle[hidden] {
+  display: none;
 }
 
 .viewport-canvas {
@@ -2098,6 +2711,43 @@ select.ui-select optgroup {
   background: rgba(36, 201, 151, 0.1);
 }
 
+/* #WDD-gpt 2026-08-16 - 未删除点外包络使用独立卡片式开关，不与等比缩放的状态混在一起。 */
+.gaussian-envelope-toggle-row {
+  margin: 9px 0 0;
+  padding: 7px;
+  border: 1px solid rgba(255, 166, 64, 0.14);
+  border-radius: 8px;
+  color: #b9a68d;
+  background: rgba(255, 145, 41, 0.035);
+}
+
+.gaussian-envelope-toggle-row .scale-link.active {
+  color: #ffc36b;
+  border-color: rgba(255, 166, 64, 0.28);
+  background: rgba(255, 145, 41, 0.12);
+}
+
+/* #WDD-gpt 2026-08-16 - Mesh 可见性使用独立的冷色卡片，与高斯外包络诊断开关明确区分。 */
+.mesh-visibility-toggle-row {
+  margin: 6px 0 0;
+  padding: 7px;
+  border: 1px solid rgba(78, 154, 255, 0.14);
+  border-radius: 8px;
+  color: #91a8c7;
+  background: rgba(64, 139, 255, 0.035);
+}
+
+.mesh-visibility-toggle-row .scale-link.active {
+  color: #78b7ff;
+  border-color: rgba(78, 154, 255, 0.3);
+  background: rgba(64, 139, 255, 0.12);
+}
+
+.scale-link:disabled {
+  cursor: not-allowed;
+  opacity: 0.42;
+}
+
 .vector-row {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -2263,6 +2913,14 @@ select.ui-select optgroup {
   line-height: 1.55;
 }
 
+.memory-auto-note.local-maximum-active {
+  padding: 7px 8px;
+  border: 1px solid rgba(74, 222, 178, 0.16);
+  border-radius: 7px;
+  color: #71caae;
+  background: rgba(42, 197, 151, 0.045);
+}
+
 .performance-diagnostics {
   display: grid;
   gap: 6px;
@@ -2309,6 +2967,141 @@ select.ui-select optgroup {
   display: grid;
   gap: 6px;
 }
+
+/* #WDD-gpt 2026-08-16 - 运行时策略证明和浏览器真实能力分栏展示，避免把应用预算误读成硬件可用容量。 */
+.memory-policy-proof,
+.browser-memory-reality {
+  padding: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.065);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.022);
+}
+
+.memory-policy-proof {
+  border-color: rgba(255, 188, 84, 0.17);
+  background: rgba(255, 167, 47, 0.035);
+}
+
+.memory-policy-proof.active {
+  border-color: rgba(67, 224, 176, 0.24);
+  background: linear-gradient(135deg, rgba(45, 202, 155, 0.09), rgba(45, 202, 155, 0.025));
+  box-shadow: inset 0 1px rgba(255, 255, 255, 0.025);
+}
+
+.memory-policy-proof header,
+.browser-memory-reality > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.memory-policy-proof header span {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  color: #89928f;
+  font-size: 9px;
+  font-weight: 720;
+}
+
+.memory-policy-proof header i {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #a97d40;
+  box-shadow: 0 0 7px rgba(230, 169, 78, 0.32);
+}
+
+.memory-policy-proof.active header i {
+  background: #4be0b2;
+  box-shadow: 0 0 8px rgba(75, 224, 178, 0.45);
+}
+
+.memory-policy-proof header strong {
+  color: #c29b62;
+  font-size: 9px;
+  font-weight: 760;
+}
+
+.memory-policy-proof.active header strong { color: #65e3bd; }
+.memory-policy-proof p { margin: 6px 0 0; color: #d0d8d5; font-size: 10px; font-weight: 650; }
+.memory-policy-proof small { display: block; margin-top: 4px; color: #73807c; font-size: 8px; line-height: 1.45; }
+
+.browser-memory-reality {
+  border-color: rgba(112, 168, 255, 0.15);
+  background: rgba(75, 126, 210, 0.035);
+}
+
+.browser-memory-reality > header strong { color: #b5c6e4; font-size: 9px; font-weight: 720; }
+.browser-memory-reality > header span { color: #65728a; font-size: 7px; }
+.browser-memory-reality dl { display: grid; gap: 3px; margin: 7px 0 0; }
+.browser-memory-reality dl div {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding-top: 3px;
+  border-top: 1px solid rgba(255, 255, 255, 0.035);
+}
+.browser-memory-reality dt {
+  min-width: 0;
+  overflow: hidden;
+  color: #77818d;
+  font-size: 8px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.browser-memory-reality dd {
+  flex: 0 0 auto;
+  margin: 0;
+  color: #c5ccd5;
+  font-size: 8px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.browser-memory-reality dd em { margin-left: 2px; color: #758198; font-size: 7px; font-style: normal; }
+.browser-memory-reality dd.unavailable { color: #9b7f76; }
+.browser-memory-reality > p {
+  margin: 7px 0 0;
+  padding-top: 6px;
+  border-top: 1px solid rgba(112, 168, 255, 0.08);
+  color: #65717e;
+  font-size: 8px;
+  line-height: 1.5;
+}
+
+.memory-pressure-entry {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 7px;
+  padding-top: 7px;
+  border-top: 1px solid rgba(112, 168, 255, 0.1);
+}
+.memory-pressure-entry > div { display: grid; min-width: 0; gap: 2px; }
+.memory-pressure-entry strong { color: #aebbd0; font-size: 8px; }
+.memory-pressure-entry small {
+  overflow: hidden;
+  color: #687586;
+  font-size: 7px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.memory-pressure-entry button {
+  flex: 0 0 auto;
+  min-height: 24px;
+  padding: 0 8px;
+  border: 1px solid rgba(255, 179, 75, 0.25);
+  border-radius: 6px;
+  color: #d7b67f;
+  background: rgba(255, 163, 52, 0.065);
+  font-size: 8px;
+  cursor: pointer;
+}
+.memory-pressure-entry button:hover { border-color: rgba(255, 188, 91, 0.42); color: #f0cca0; background: rgba(255, 163, 52, 0.11); }
 
 .memory-meter,
 .memory-chart {
@@ -2582,6 +3375,113 @@ select.ui-select optgroup {
   color: #71d8b5;
   font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
   font-size: 6px;
+}
+
+/* #WDD-gpt 2026-08-16 - 内存压力测试使用顶层风险对话框和醒目的真实分配进度，不与普通设置控件混排。 */
+.memory-pressure-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 40000;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(3, 4, 6, 0.76);
+  backdrop-filter: blur(15px) saturate(112%);
+}
+
+.memory-pressure-dialog {
+  display: grid;
+  width: min(520px, calc(100vw - 32px));
+  gap: 14px;
+  padding: 20px;
+  border: 1px solid rgba(255, 180, 76, 0.25);
+  border-radius: 16px;
+  background:
+    radial-gradient(circle at 92% 0%, rgba(255, 155, 53, 0.11), transparent 39%),
+    linear-gradient(150deg, rgba(24, 26, 29, 0.995), rgba(9, 11, 14, 0.995));
+  box-shadow: 0 38px 130px rgba(0, 0, 0, 0.78), inset 0 1px rgba(255, 255, 255, 0.06);
+  color: var(--text-primary);
+}
+.memory-pressure-dialog > header,
+.memory-pressure-dialog > footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.memory-pressure-dialog > header > div { display: grid; gap: 5px; }
+.memory-pressure-dialog > header span { color: #dea75c; font-size: 9px; font-weight: 800; letter-spacing: 0.16em; }
+.memory-pressure-dialog > header strong { color: #f1eee9; font-size: 19px; }
+.memory-pressure-dialog > header button {
+  display: grid;
+  width: 28px;
+  height: 28px;
+  place-items: center;
+  padding: 0;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  color: #85898f;
+  background: rgba(255, 255, 255, 0.025);
+  font-size: 18px;
+  cursor: pointer;
+}
+.memory-pressure-intro { margin: 0; color: #91969d; font-size: 11px; line-height: 1.65; }
+.memory-pressure-context { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px; margin: 0; }
+.memory-pressure-context div {
+  display: grid;
+  gap: 4px;
+  padding: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.055);
+  border-radius: 9px;
+  background: rgba(255, 255, 255, 0.02);
+}
+.memory-pressure-context dt { color: #737880; font-size: 8px; }
+.memory-pressure-context dd { margin: 0; color: #d4d7db; font-family: "SFMono-Regular", Consolas, monospace; font-size: 10px; }
+.memory-pressure-target { display: grid; grid-template-columns: minmax(0, 1fr) 150px; align-items: center; gap: 12px; color: #9a9fa6; font-size: 10px; }
+.memory-pressure-warning {
+  padding: 11px;
+  border: 1px solid rgba(255, 100, 94, 0.22);
+  border-radius: 9px;
+  background: rgba(224, 65, 57, 0.055);
+}
+.memory-pressure-warning strong { color: #f0a39e; font-size: 10px; }
+.memory-pressure-warning p { margin: 5px 0 0; color: #a27d7b; font-size: 9px; line-height: 1.55; }
+.memory-pressure-dialog > footer small { max-width: 315px; color: #6f7379; font-size: 8px; line-height: 1.45; }
+.memory-pressure-start {
+  min-height: 31px;
+  padding: 0 12px;
+  border: 1px solid rgba(255, 184, 80, 0.38);
+  border-radius: 8px;
+  color: #25180a;
+  background: linear-gradient(180deg, #efbd72, #d9983e);
+  box-shadow: 0 8px 22px rgba(203, 124, 37, 0.16);
+  font-size: 9px;
+  font-weight: 720;
+  cursor: pointer;
+}
+.memory-pressure-running { display: grid; justify-items: center; gap: 10px; padding: 28px 8px; }
+.memory-pressure-gauge { width: 100%; height: 8px; overflow: hidden; border-radius: 99px; background: rgba(255, 255, 255, 0.065); }
+.memory-pressure-gauge i { display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, #d48b36, #f0c37c); transition: width 120ms ease; }
+.memory-pressure-running > strong { color: #f0c686; font-size: 26px; }
+.memory-pressure-running p { margin: 0; color: #b7bbc0; font-size: 11px; }
+.memory-pressure-running small { color: #747980; font-size: 9px; }
+.memory-pressure-result {
+  display: grid;
+  justify-items: center;
+  gap: 8px;
+  padding: 22px;
+  border: 1px solid rgba(77, 226, 181, 0.2);
+  border-radius: 11px;
+  background: rgba(48, 205, 159, 0.055);
+  text-align: center;
+}
+.memory-pressure-result.allocation-failed,
+.memory-pressure-result.worker-error { border-color: rgba(255, 103, 99, 0.22); background: rgba(221, 65, 58, 0.05); }
+.memory-pressure-result > span { color: #72ddb9; font-size: 9px; font-weight: 760; }
+.memory-pressure-result > strong { color: #e8f7f2; font-size: 17px; }
+.memory-pressure-result > p { margin: 0; color: #8d9995; font-size: 10px; line-height: 1.55; }
+.memory-pressure-result > small { color: #68716e; font-size: 8px; }
+
+@media (max-width: 560px) {
+  .memory-pressure-backdrop { padding: 8px; }
+  .memory-pressure-dialog { width: calc(100vw - 16px); padding: 16px; }
+  .memory-pressure-context { grid-template-columns: 1fr; }
+  .memory-pressure-target { grid-template-columns: 1fr; }
 }
 
 .timeline-panel {
@@ -2911,6 +3811,48 @@ select.ui-select optgroup {
 .statusbar i.ok {
   background: var(--accent);
   box-shadow: 0 0 6px rgba(36, 201, 151, 0.45);
+}
+
+/* #WDD-gpt 2026-08-16 - 高斯统计使用紧凑的三列读数，避免挤压右侧内存监控。 */
+.statusbar .gaussian-status-summary {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  min-width: 0;
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.gaussian-status-summary > div {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  height: 16px;
+  padding: 0 6px;
+  border: 1px solid rgba(255, 255, 255, 0.055);
+  border-radius: 5px;
+  background: rgba(255, 255, 255, 0.018);
+}
+
+.gaussian-status-summary dt {
+  color: #777f8b;
+  font-size: 6px;
+  font-weight: 590;
+}
+
+.gaussian-status-summary dd {
+  margin: 0;
+  color: #d9e4e0;
+  font-size: 7px;
+  font-weight: 740;
+}
+
+.gaussian-status-summary > div:first-child dd {
+  color: #65dfb8;
+}
+
+.gaussian-status-summary > div.deleted dd {
+  color: #ff7e73;
 }
 
 .statusbar .memory-usage {

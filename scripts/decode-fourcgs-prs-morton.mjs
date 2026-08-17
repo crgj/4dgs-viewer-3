@@ -25,9 +25,13 @@ import { decodeOpacityHybrid } from './fourcgs-opacity-hybrid-codec.mjs';
 import { decodeTemporalAttribute, decodeTemporalAttributeStreams } from './fourcgs-temporal-attribute-codec.mjs';
 import { decodeSo3Rotations, decodeSo3RotationStreams } from './fourcgs-so3-temporal-codec.mjs';
 import { decodeV21StructuredStream, decodeV22StructuredParts, isV21StructuredStream } from './fourcgs-v21-lossless-codec.mjs';
+import {
+  createFourCgsCanonicalRaw4D,
+  fourCgsDecodedPropertyNames,
+} from '../src/features/gaussian/formats/fourcgs/FourCgsRaw4D.ts';
 
 const MAGIC = '4CGSPRS2';
-const SEGMENT_PATTERN = /^segment_(\d+)_(\d+)\.raw4d$/;
+const SEGMENT_PATTERN = /^segment_(\d+)_(\d+)\.(?:raw4d|ply4)$/i;
 
 function unshuffle16(shuffled) {
   if (shuffled.length % 2 !== 0) throw new Error('FP16 byte unshuffle requires an even byte count.');
@@ -79,23 +83,7 @@ async function readContainer(bytes, options = {}) {
 }
 
 function propertyNames(segment) {
-  const names = [];
-  for (let bank = 0; bank < segment.bankCounts.position; bank += 1) {
-    for (const component of ['x', 'y', 'z']) names.push(`xyz_bank_${bank}_${component}`);
-  }
-  for (let bank = 0; bank < segment.bankCounts.rotation; bank += 1) {
-    for (const component of ['w', 'x', 'y', 'z']) names.push(`rot_bank_${bank}_${component}`);
-  }
-  for (let bank = 0; bank < segment.bankCounts.colorDc; bank += 1) {
-    for (const component of ['0', '1', '2']) names.push(`f_dc_bank_${bank}_${component}`);
-  }
-  for (let bank = 0; bank < segment.bankCounts.scale; bank += 1) {
-    for (const component of ['0', '1', '2']) names.push(`scale_bank_${bank}_${component}`);
-  }
-  for (let bank = 0; bank < segment.bankCounts.opacity; bank += 1) names.push(`opacity_bank_${bank}`);
-  names.push('lifetime_mu', 'lifetime_w');
-  for (let coefficient = 0; coefficient < 45; coefficient += 1) names.push(`f_rest_${coefficient}`);
-  return names;
+  return fourCgsDecodedPropertyNames(segment);
 }
 
 function activeLayout(manifest, rawMask) {
@@ -204,7 +192,8 @@ function decodeMixRqTrack(raw, manifest, activeSlots, prefix, components, bankKe
 }
 
 function decodeSharedSh(raw, manifest, activeSlots, rows, indices) {
-  if (raw.subarray(0, 8).toString('ascii') !== 'C5T1SH01') throw new Error('Unsupported shared CoReSH-5R trajectory stream.');
+  const magic = raw.subarray(0, 8).toString('ascii');
+  if (magic !== 'C5T1SH01' && magic !== 'C5T2SH01') throw new Error('Unsupported shared SH trajectory stream.');
   const slotCount = raw.readUInt32LE(8);
   const instanceCount = raw.readUInt32LE(12);
   const segmentCount = raw.readUInt16LE(16);
@@ -213,62 +202,73 @@ function decodeSharedSh(raw, manifest, activeSlots, rows, indices) {
   const baseBytes = raw.readUInt32LE(20);
   const maskBytes = raw.readUInt32LE(24);
   const labelBytes = raw.readUInt32LE(28);
-  if (slotCount !== manifest.slotCount || segmentCount !== manifest.segments.length || dimensions !== 45 || levels !== 5) {
+  const headerBytes = magic === 'C5T2SH01' ? 40 : 32;
+  const exceptionMaskBytes = magic === 'C5T2SH01' ? raw.readUInt32LE(32) : 0;
+  const exceptionValueBytes = magic === 'C5T2SH01' ? raw.readUInt32LE(36) : 0;
+  if (slotCount !== manifest.slotCount || segmentCount !== manifest.segments.length || dimensions !== 45
+    || levels < 1 || levels > 32 || (magic === 'C5T1SH01' && levels !== 5)
+    || baseBytes !== 45 * 2 + levels * 256 * 45 * 2) {
     throw new Error('Shared CoReSH-5R metadata mismatch.');
   }
-  const baseOffset = 32;
+  const baseOffset = headerBytes;
   const mean = new Float32Array(45);
   for (let dimension = 0; dimension < 45; dimension += 1) mean[dimension] = halfToFloat(raw.readUInt16LE(baseOffset + dimension * 2));
   const codebookOffset = baseOffset + 45 * 2;
-  const codebooks = new Float32Array(5 * 256 * 45);
+  const codebooks = new Float32Array(levels * 256 * 45);
   for (let index = 0; index < codebooks.length; index += 1) codebooks[index] = halfToFloat(raw.readUInt16LE(codebookOffset + index * 2));
-  const updateMask = inflateSync(raw.subarray(baseOffset + baseBytes, baseOffset + baseBytes + maskBytes));
-  const updates = inflateSync(raw.subarray(baseOffset + baseBytes + maskBytes, baseOffset + baseBytes + maskBytes + labelBytes));
-  const state = new Uint8Array(slotCount * 5);
+  const maskOffset = baseOffset + baseBytes;
+  const labelOffset = maskOffset + maskBytes;
+  const exceptionMaskOffset = labelOffset + labelBytes;
+  const exceptionValueOffset = exceptionMaskOffset + exceptionMaskBytes;
+  const updateMask = inflateSync(raw.subarray(maskOffset, labelOffset));
+  const updates = inflateSync(raw.subarray(labelOffset, exceptionMaskOffset));
+  const exceptionMask = magic === 'C5T2SH01'
+    ? inflateSync(raw.subarray(exceptionMaskOffset, exceptionValueOffset))
+    : new Uint8Array(Math.ceil(instanceCount / 8));
+  const exceptionValues = magic === 'C5T2SH01'
+    ? inflateSync(raw.subarray(exceptionValueOffset, exceptionValueOffset + exceptionValueBytes))
+    : new Uint8Array(0);
+  if (updateMask.length !== Math.ceil(instanceCount / 8) || updates.length % levels !== 0
+    || exceptionMask.length !== Math.ceil(instanceCount / 8) || exceptionValues.length % (45 * 2) !== 0
+    || exceptionValueOffset + exceptionValueBytes !== raw.length) {
+    throw new Error('Shared SH compressed payload length mismatch.');
+  }
+  const state = new Uint8Array(slotCount * levels);
   const initialized = new Uint8Array(slotCount);
   let instance = 0;
   let updateOffset = 0;
+  let exceptionOffset = 0;
   for (let segmentIndex = 0; segmentIndex < manifest.segments.length; segmentIndex += 1) {
     const rowValues = rows[segmentIndex];
     const rowStride = indices[segmentIndex].size;
     for (let row = 0; row < activeSlots[segmentIndex].length; row += 1) {
       const slot = activeSlots[segmentIndex][row];
-      const stateOffset = slot * 5;
+      const stateOffset = slot * levels;
       if ((updateMask[instance >>> 3] & (1 << (instance & 7))) !== 0) {
-        state.set(updates.subarray(updateOffset, updateOffset + 5), stateOffset);
+        state.set(updates.subarray(updateOffset, updateOffset + levels), stateOffset);
         initialized[slot] = 1;
-        updateOffset += 5;
+        updateOffset += levels;
       }
       if (!initialized[slot]) throw new Error(`Missing SH initialization for Track ID ${slot}.`);
       for (let dimension = 0; dimension < 45; dimension += 1) {
         let value = mean[dimension];
-        for (let level = 0; level < 5; level += 1) value += codebooks[(level * 256 + state[stateOffset + level]) * 45 + dimension];
+        for (let level = 0; level < levels; level += 1) value += codebooks[(level * 256 + state[stateOffset + level]) * 45 + dimension];
         rowValues[row * rowStride + indices[segmentIndex].get(`f_rest_${dimension}`)] = floatToHalf(value);
+      }
+      if (exceptionMask[instance >>> 3] & (1 << (instance & 7))) {
+        for (let dimension = 0; dimension < 45; dimension += 1) {
+          rowValues[row * rowStride + indices[segmentIndex].get(`f_rest_${dimension}`)]
+            = exceptionValues[exceptionOffset] | (exceptionValues[exceptionOffset + 1] << 8);
+          exceptionOffset += 2;
+        }
       }
       instance += 1;
     }
   }
-  if (instance !== instanceCount || updateOffset !== updates.length) throw new Error('Shared SH trajectory decode length mismatch.');
-  return { instanceCount, updateCount: updateOffset / 5 };
-}
-
-function raw4dHeader(segment, names) {
-  const lines = [
-    'ply',
-    'format binary_little_endian 1.0',
-    `comment total_frames ${segment.totalFrames}`,
-    'comment xyz_bank_keyframe_stride 3',
-    'comment rot_bank_keyframe_stride 30',
-    'comment features_dc_bank_keyframe_stride 30',
-    'comment scaling_bank_keyframe_stride 10',
-    'comment opacity_bank_keyframe_stride 10',
-    'comment fp16_quantized 1',
-    ...names.map((name) => `comment fp16_property ${name}`),
-    `element vertex ${segment.gaussianCount}`,
-    ...names.map((name) => `property ushort ${name}`),
-    'end_header',
-  ];
-  return Buffer.from(`${lines.join('\n')}\n`, 'ascii');
+  if (instance !== instanceCount || updateOffset !== updates.length || exceptionOffset !== exceptionValues.length) {
+    throw new Error('Shared SH trajectory decode length mismatch.');
+  }
+  return { instanceCount, updateCount: updateOffset / levels, exceptionCount: exceptionOffset / (45 * 2) };
 }
 
 function normalizedQuaternion(values) {
@@ -631,10 +631,9 @@ async function main() {
   for (let segmentIndex = 0; segmentIndex < manifest.segments.length; segmentIndex += 1) {
     const segment = manifest.segments[segmentIndex];
     const outputPath = join(outputDirectory, `${segment.name}.decoded.raw4d`);
-    const header = raw4dHeader(segment, names[segmentIndex]);
-    const payload = Buffer.from(rows[segmentIndex].buffer);
-    await writeFile(outputPath, Buffer.concat([header, payload]));
-    outputs.push({ path: outputPath, bytes: header.length + payload.length, bytesM: (header.length + payload.length) / 1_000_000, gaussianCount: segment.gaussianCount });
+    const output = createFourCgsCanonicalRaw4D(segment, names[segmentIndex], rows[segmentIndex]);
+    await writeFile(outputPath, output);
+    outputs.push({ path: outputPath, bytes: output.length, bytesM: output.length / 1_000_000, gaussianCount: segment.gaussianCount });
   }
   finishPhase('writeRaw4d');
   const elapsedMilliseconds = performance.now() - started;

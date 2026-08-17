@@ -39,4 +39,15 @@ describe('GaussianSequenceEditStore', () => {
     sequence.clearSelection('global');
     expect(sequence.selectedCount('global')).toBe(0);
   });
+
+  it('reports undeleted points for only the active display segment', () => {
+    const sequence = createSequence();
+    sequence.segment(0).edits.setDeleted([0]);
+    sequence.segment(1).edits.setDeleted([0, 2]);
+
+    expect(sequence.deletionCount()).toBe(3);
+    expect(sequence.activeUndeletedCount()).toBe(3);
+    sequence.setActiveSegment(1);
+    expect(sequence.activeUndeletedCount()).toBe(1);
+  });
 });

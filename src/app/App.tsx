@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import changeLogMarkdown from '../../CHANGELOG.md?raw';
 import { formatBytes } from '../core/format/formatBytes';
 import {
   isEditorRedoShortcut,
@@ -7,13 +8,18 @@ import {
   isViewportBrowseShortcut,
 } from '../features/editor/tools/EditorKeyboardShortcuts';
 import {
+  DEFAULT_GAUSSIAN_4D_MEMORY_MODE,
   createGaussian4DMemoryPolicy,
-  detectAutomaticGaussian4DMemoryPolicy,
   type Gaussian4DMemoryMode,
 } from '../features/gaussian/memory/Gaussian4DMemoryPolicy';
 import type { GaussianRenderMode } from '../features/gaussian/runtime/GaussianRenderMode';
 import { writeFourCgsFile } from '../features/gaussian/formats/fourcgs/FourCgsContainer';
-import { exportRaw4DSequenceAsFourCgs } from '../features/gaussian/formats/fourcgs/FourCgsPresetExport';
+import {
+  encodeRaw4DMemoryAsFourCgs,
+  type FourCgsEncodeResult,
+} from '../features/gaussian/formats/fourcgs/FourCgsEncoderClient';
+import type { FourCgsProgress } from '../features/gaussian/formats/fourcgs/FourCgsTypes';
+import { exportRaw4DSequenceAsPlyDirectory } from '../features/gaussian/formats/raw4d/Raw4DPlySequenceExportClient';
 import { GaussianViewport } from '../features/viewport/components/GaussianViewport';
 import { MemoryTelemetryPanel } from '../features/viewport/components/MemoryTelemetryPanel';
 import { PerformanceDiagnosticsPanel } from '../features/viewport/components/PerformanceDiagnosticsPanel';
@@ -66,6 +72,10 @@ import { ValidatedNumberInput } from './components/ValidatedNumberInput';
 import { UiSelect } from './components/UiSelect';
 import { GlobalTooltipLayer } from './components/GlobalTooltipLayer';
 import { ViewCube3D } from './components/ViewCube3D';
+import { ReleaseNotesDialog } from './components/ReleaseNotesDialog';
+import { MemoryPressureTestDialog } from './components/MemoryPressureTestDialog';
+import { parseReleaseNotes } from './releaseNotes';
+import type { BrowserMemoryPressureResult } from '../features/gaussian/memory/BrowserMemoryPressureTest';
 
 type IconName =
   | 'cursor'
@@ -176,6 +186,22 @@ const createInitialSelectionCylinder = (): GaussianCylinderSelectionRegion => ({
 
 const transformAxes = ['x', 'y', 'z'] as const;
 const playbackFpsOptions = [1, 2, 4, 10, 15, 30, 60] as const;
+
+interface ExportMonitorState {
+  readonly kind: 'fourcgs' | 'ply-sequence';
+  readonly phase: 'running' | 'success' | 'error' | 'cancelled';
+  readonly inputBytes: number;
+  readonly progress: FourCgsProgress;
+  readonly logs: readonly { readonly elapsedMs: number; readonly message: string }[];
+  readonly result?: FourCgsEncodeResult;
+  readonly plyStats?: {
+    readonly segmentCount: number;
+    readonly frameCount: number;
+    readonly deletedPointCount: number;
+  };
+  readonly outputBytes?: number;
+  readonly error?: string;
+}
 const cameraViews: ReadonlyArray<{
   readonly id: ViewportCameraView;
   readonly labelKey: keyof UiCopy;
@@ -283,9 +309,12 @@ const initialStatus: ViewportStatus = {
   splatCount: 0,
 };
 
-const initialMemoryPolicy = detectAutomaticGaussian4DMemoryPolicy();
+const initialMemoryPolicy = createGaussian4DMemoryPolicy(DEFAULT_GAUSSIAN_4D_MEMORY_MODE);
+const releaseNotes = parseReleaseNotes(changeLogMarkdown);
 
 const initialMemoryUsage: ViewportMemoryUsage = {
+  runtimePolicyMode: null,
+  browserDeviceMemoryBytes: null,
   jsHeapBytes: null,
   jsHeapLimitBytes: null,
   gpuBytes: 0,
@@ -392,9 +421,14 @@ export function App() {
   const [shLevel, setShLevel] = useState(3);
   const [showGrid, setShowGrid] = useState(true);
   const [showAxes, setShowAxes] = useState(true);
+  const [showHeightRuler, setShowHeightRuler] = useState(false);
+  const [showGaussianEnvelope, setShowGaussianEnvelope] = useState(false);
   const [sceneTransform, setSceneTransform] = useState<ViewportTransform>(createInitialTransform);
   const [uniformScale, setUniformScale] = useState(true);
   const [exportProgress, setExportProgress] = useState<number | null>(null);
+  const [exportNotice, setExportNotice] = useState<{ readonly kind: 'progress' | 'success' | 'error'; readonly message: string } | null>(null);
+  const [exportMonitor, setExportMonitor] = useState<ExportMonitorState | null>(null);
+  const [exportElapsedMs, setExportElapsedMs] = useState(0);
   const [viewportRuntime, setViewportRuntime] = useState<ViewportRuntime | null>(null);
   const [smartAlignmentState, setSmartAlignmentState] = useState<SmartAlignmentState>(INITIAL_SMART_ALIGNMENT_STATE);
   const [gs2MeshState, setGS2MeshState] = useState<GS2MeshState>(INITIAL_GS2MESH_STATE);
@@ -403,10 +437,16 @@ export function App() {
   const [gaussianVisible, setGaussianVisible] = useState(true);
   const [modelHealthReport, setModelHealthReport] = useState<ModelHealthReport | null>(null);
   const [modelHealthBusy, setModelHealthBusy] = useState(false);
-  const [memoryMode, setMemoryMode] = useState<Gaussian4DMemoryMode>('auto');
+  const [memoryMode, setMemoryMode] = useState<Gaussian4DMemoryMode>(DEFAULT_GAUSSIAN_4D_MEMORY_MODE);
+  const [pendingLocalMaximumMode, setPendingLocalMaximumMode] = useState(false);
+  const [releaseNotesVisible, setReleaseNotesVisible] = useState(false);
+  const [memoryPressureDialogVisible, setMemoryPressureDialogVisible] = useState(false);
+  const [lastMemoryPressureResult, setLastMemoryPressureResult] = useState<BrowserMemoryPressureResult | null>(null);
   const [customCpuGiB, setCustomCpuGiB] = useState(12);
   const [customGpuGiB, setCustomGpuGiB] = useState(6);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const exportAbortRef = useRef<AbortController | null>(null);
+  const exportStartedAtRef = useRef(0);
   const workspaceRef = useRef<HTMLElement>(null);
   const pluginWindowRef = useRef<HTMLElement>(null);
   const pluginDragRef = useRef<{
@@ -426,6 +466,40 @@ export function App() {
   );
   const timelineEndFrame = Math.max(0, (status.totalFrames ?? 121) - 1);
   const copy = UI_COPY[language];
+  // #WDD-gpt 2026-08-16 - 极限内存预设必须在网页内二次确认，避免低配置设备因误触直接进入高驻留预算。
+  const requestMemoryMode = (nextMode: Gaussian4DMemoryMode) => {
+    if (nextMode === 'local-maximum' && memoryMode !== 'local-maximum') {
+      setPendingLocalMaximumMode(true);
+      return;
+    }
+    setMemoryMode(nextMode);
+  };
+  const activateLocalMaximumMode = () => {
+    setMemoryMode('local-maximum');
+    setPendingLocalMaximumMode(false);
+  };
+  useEffect(() => {
+    if (!pendingLocalMaximumMode) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      setPendingLocalMaximumMode(false);
+    };
+    window.addEventListener('keydown', closeOnEscape, true);
+    return () => window.removeEventListener('keydown', closeOnEscape, true);
+  }, [pendingLocalMaximumMode]);
+  useEffect(() => {
+    if (!releaseNotesVisible) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      setReleaseNotesVisible(false);
+    };
+    window.addEventListener('keydown', closeOnEscape, true);
+    return () => window.removeEventListener('keydown', closeOnEscape, true);
+  }, [releaseNotesVisible]);
   const cameraViewLabels = useMemo(
     () => Object.fromEntries(cameraViews.map((view) => [view.id, {
       long: UI_COPY[language][view.labelKey],
@@ -439,6 +513,12 @@ export function App() {
   const displaySceneName = sceneName ?? copy.untitledScene;
 
   const transformDisabled = status.phase !== 'ready' || status.splatCount === 0;
+  const hasGS2Mesh = gs2MeshState.stage === 'success';
+  const statusDeletedCount = selectionState.deletedCount ?? 0;
+  const statusActiveCount = Math.max(0, (selectionState.pointCount ?? status.splatCount) - statusDeletedCount);
+  const statusCurrentFrameDisplayedCount = selectionState.currentFrameDisplayedCount
+    ?? Math.max(0, status.splatCount - Math.min(status.splatCount, statusDeletedCount));
+  const gaussianCountLocale = language === 'zh' ? 'zh-CN' : 'en-US';
   const sourceFile = sourceFiles.length === 1 ? sourceFiles[0] : null;
   const localizedStatusMessage = localizeRuntimeMessage(language, status.message);
   const pluginStatusById: Readonly<Record<PluginId, PluginStatusTone>> = {
@@ -458,9 +538,19 @@ export function App() {
   const activePluginItem = pluginMenuItems.find((plugin) => plugin.id === activePlugin) ?? null;
 
   useEffect(() => () => {
+    exportAbortRef.current?.abort();
     smartAlignmentPluginRef.current?.dispose();
     gs2MeshPluginRef.current?.dispose();
   }, []);
+
+  // #WDD-gpt 2026-08-16 - 保存监督框使用主线程时钟持续刷新，即使编码 Worker 正在执行长时间同步压缩也不会看起来卡死。
+  useEffect(() => {
+    if (exportMonitor?.phase !== 'running') return;
+    const update = () => setExportElapsedMs(performance.now() - exportStartedAtRef.current);
+    update();
+    const handle = window.setInterval(update, 200);
+    return () => window.clearInterval(handle);
+  }, [exportMonitor?.phase]);
 
   useEffect(() => {
     if (!viewportRuntime) return;
@@ -696,21 +786,92 @@ export function App() {
   // #WDD-gpt  2026-08-16 - RAW4D 保存时根据软删除位集输出压实文件；编辑中的源数据保持稳定 ID。
   const exportWorkspace = async () => {
     setOpenMenu(null);
-    if (sourceFiles.length > 1) {
-      // #WDD-gpt 2026-08-16 - 多段 RAW4D 的默认导出是经过源指纹验证的 V2.4 .4cgs，不再显示自相矛盾的提示。
+    if (status.format === 'RAW4D' && sourceFiles.length > 0) {
+      // #WDD-gpt 2026-08-16 - RAW4D 默认导出冻结当前 Canonical RAM 与编辑位集，不再回读拖入时的 File 属性载荷。
+      const controller = new AbortController();
+      exportAbortRef.current = controller;
+      exportStartedAtRef.current = performance.now();
+      setExportElapsedMs(0);
       setExportProgress(0);
+      setExportNotice({ kind: 'progress', message: `正在快照内存并编码当前 ${sourceFiles.length} 个 RAW4D…` });
+      setExportMonitor({
+        kind: 'fourcgs',
+        phase: 'running',
+        inputBytes: sourceFiles.reduce((sum, file) => sum + file.size, 0),
+        progress: {
+          ratio: 0, message: `正在冻结 ${sourceFiles.length} 个 Canonical RAM 片段`,
+          stage: '内存快照', stageRatio: 0, workerCount: 1, completedTasks: 0, totalTasks: 8,
+        },
+        logs: [{ elapsedMs: 0, message: '开始从当前内存生成 4CGS' }],
+      });
       try {
-        const result = await exportRaw4DSequenceAsFourCgs(sourceFiles, ({ ratio }) => setExportProgress(ratio));
-        setExportProgress(0.97);
-        // #WDD-gpt 2026-08-16 - 已验收 V2.4 仅重写清单元数据，压缩流保持原字节并写入当前完整变换。
-        const response = await fetch(result.url);
-        if (!response.ok) throw new Error(`4CGS V2.4 资源读取失败：HTTP ${response.status}。`);
-        const blob = await writeFourCgsFile(await response.blob(), sceneTransform);
+        if (!viewportRuntime) throw new Error('视口编辑状态尚未就绪。');
+        const memorySnapshots = viewportRuntime.snapshotRaw4DExportMemory(sourceFiles);
+        const result = await encodeRaw4DMemoryAsFourCgs(memorySnapshots, (progress) => {
+          setExportProgress(progress.ratio);
+          setExportNotice({ kind: 'progress', message: progress.message });
+          setExportMonitor((current) => {
+            if (!current || current.phase !== 'running') return current;
+            const elapsedMs = performance.now() - exportStartedAtRef.current;
+            const previousMessage = current.logs.at(-1)?.message;
+            const logs = previousMessage === progress.message
+              ? current.logs
+              : [...current.logs, { elapsedMs, message: progress.message }].slice(-12);
+            return { ...current, progress, logs };
+          });
+        }, controller.signal);
+        setExportProgress(0.98);
+        setExportMonitor((current) => current ? {
+          ...current,
+          progress: {
+            ratio: 0.98, message: '正在写入场景变换并提交浏览器下载', stage: '最终文件提交',
+            stageRatio: 0.5, workerCount: result.encodeTimings?.workerCount ?? 1,
+            completedTasks: 8, totalTasks: 8,
+          },
+          logs: [...current.logs, {
+            elapsedMs: performance.now() - exportStartedAtRef.current,
+            message: '压缩载荷完成，正在写入场景元数据',
+          }].slice(-12),
+        } : current);
+        const blob = await writeFourCgsFile(result.blob, sceneTransform);
+        if (controller.signal.aborted) throw new DOMException('4CGS 保存已取消。', 'AbortError');
         setExportProgress(1);
         downloadBlob(blob, result.filename);
+        setExportNotice({
+          kind: 'success',
+          message: `已去掉 ${result.deletedPointCount.toLocaleString()} 个删除点并生成 ${result.filename} · ${(blob.size / 1_000_000).toFixed(3)}M · ${result.compressionRatio.toFixed(2)}×`,
+        });
+        setExportElapsedMs(performance.now() - exportStartedAtRef.current);
+        setExportMonitor((current) => current ? {
+          ...current,
+          phase: 'success', result, outputBytes: blob.size,
+          progress: {
+            ratio: 1, message: `已生成并下载 ${result.filename}`, stage: '完成', stageRatio: 1,
+            workerCount: result.encodeTimings?.workerCount ?? current.progress.workerCount,
+            completedTasks: 8, totalTasks: 8,
+          },
+          logs: [...current.logs, {
+            elapsedMs: performance.now() - exportStartedAtRef.current,
+            message: `完成 · ${(blob.size / 1_000_000).toFixed(3)}M · ${result.compressionRatio.toFixed(2)}×`,
+          }].slice(-12),
+        } : current);
       } catch (error) {
-        window.alert(error instanceof Error ? error.message : String(error));
+        const cancelled = error instanceof DOMException && error.name === 'AbortError';
+        const message = cancelled ? '4CGS 保存已取消。' : error instanceof Error ? error.message : String(error);
+        // #WDD-gpt 2026-08-16 - 大文件编码错误和取消原因保留在监督框，避免弹窗被浏览器策略吞掉。
+        setExportNotice({ kind: 'error', message: cancelled ? message : `4CGS 导出失败：${message}` });
+        setExportElapsedMs(performance.now() - exportStartedAtRef.current);
+        setExportMonitor((current) => current ? {
+          ...current,
+          phase: cancelled ? 'cancelled' : 'error', error: message,
+          progress: { ...current.progress, message, stage: cancelled ? '已取消' : '失败' },
+          logs: [...current.logs, {
+            elapsedMs: performance.now() - exportStartedAtRef.current,
+            message,
+          }].slice(-12),
+        } : current);
       } finally {
+        if (exportAbortRef.current === controller) exportAbortRef.current = null;
         setExportProgress(null);
       }
       return;
@@ -721,27 +882,61 @@ export function App() {
         window.alert('4CGS V2.4 前端当前采用只读压缩载荷。请撤销高斯删除后再无损另存；不会静默丢弃编辑。');
         return;
       }
+      // #WDD-gpt  2026-08-17 - 4CGS 无损另存也走右上角导出通知，不再静默下载；错误改用通知呈现，避免弹窗被浏览器策略吞掉。
+      exportStartedAtRef.current = performance.now();
+      setExportElapsedMs(0);
       setExportProgress(0.05);
+      setExportNotice({ kind: 'progress', message: '正在写入场景变换并导出 4CGS 文件…' });
       try {
         const blob = await writeFourCgsFile(sourceFile, sceneTransform);
         setExportProgress(1);
         const stem = (sceneName ?? status.objectName ?? 'dong-editor-3').replace(/\.4cgs$/i, '');
-        downloadBlob(blob, `${stem}.4cgs`);
+        const filename = `${stem}.4cgs`;
+        downloadBlob(blob, filename);
+        const elapsedMs = performance.now() - exportStartedAtRef.current;
+        setExportElapsedMs(elapsedMs);
+        setExportNotice({
+          kind: 'success',
+          message: `已无损另存 ${filename} · ${(blob.size / 1_000_000).toFixed(3)}M · ${(elapsedMs / 1000).toFixed(1)}s`,
+        });
       } catch (error) {
-        window.alert(error instanceof Error ? error.message : String(error));
+        const message = error instanceof Error ? error.message : String(error);
+        setExportElapsedMs(performance.now() - exportStartedAtRef.current);
+        setExportNotice({ kind: 'error', message: `4CGS 另存失败：${message}` });
       } finally {
         setExportProgress(null);
       }
       return;
     }
     if (status.format && status.format !== 'Procedural' && viewportRuntime) {
+      // #WDD-gpt  2026-08-17 - PLY4/SOG/PLY 压实导出接入右上角导出通知，进度带点位计数，完成后显示文件大小与耗时。
+      exportStartedAtRef.current = performance.now();
+      setExportElapsedMs(0);
       setExportProgress(0);
+      setExportNotice({ kind: 'progress', message: '正在压实导出 RAW4D 载荷…' });
       try {
-        const blob = await viewportRuntime.exportCompactedRaw4D((progress) => setExportProgress(progress.ratio));
-        const stem = (sceneName ?? status.objectName ?? 'dong-editor-3').replace(/\.raw4d$/i, '');
-        downloadBlob(blob, `${stem}.raw4d`);
+        const blob = await viewportRuntime.exportCompactedRaw4D((progress) => {
+          setExportProgress(progress.ratio);
+          setExportNotice({
+            kind: 'progress',
+            message: `正在压实导出 RAW4D · ${progress.writtenPoints.toLocaleString()}/${progress.totalPoints.toLocaleString()} 点 · ${Math.round(progress.ratio * 100)}%`,
+          });
+        });
+        const preservePly4Extension = sourceFiles.length === 1 && /\.ply4$/i.test(sourceFiles[0].name);
+        const stem = (sceneName ?? status.objectName ?? 'dong-editor-3').replace(/\.(?:raw4d|ply4)$/i, '');
+        const filename = `${stem}.${preservePly4Extension ? 'ply4' : 'raw4d'}`;
+        setExportProgress(1);
+        downloadBlob(blob, filename);
+        const elapsedMs = performance.now() - exportStartedAtRef.current;
+        setExportElapsedMs(elapsedMs);
+        setExportNotice({
+          kind: 'success',
+          message: `已导出 ${filename} · ${(blob.size / 1_000_000).toFixed(3)}M · ${(elapsedMs / 1000).toFixed(1)}s`,
+        });
       } catch (error) {
-        window.alert(error instanceof Error ? error.message : String(error));
+        const message = error instanceof Error ? error.message : String(error);
+        setExportElapsedMs(performance.now() - exportStartedAtRef.current);
+        setExportNotice({ kind: 'error', message: `RAW4D 导出失败：${message}` });
       } finally {
         setExportProgress(null);
       }
@@ -768,14 +963,145 @@ export function App() {
         { name: 'Grid & Axes', type: 'Scene Guides' },
       ],
     };
-    downloadBlob(new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' }), 'dong-editor-3-workspace.json');
+    const workspaceBlob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+    downloadBlob(workspaceBlob, 'dong-editor-3-workspace.json');
+    setExportNotice({
+      kind: 'success',
+      message: `已导出工作区快照 dong-editor-3-workspace.json · ${(workspaceBlob.size / 1_000_000).toFixed(3)}M`,
+    });
+  };
+
+  // #WDD-gpt 2026-08-17 - 文件菜单导出子菜单的 .ply 序列：选择本地目录后逐帧直写，不再打包 ZIP。
+  const exportPlySequence = async () => {
+    setOpenMenu(null);
+    if (!viewportRuntime || !status.format || status.format === 'Procedural') {
+      window.alert(language === 'zh'
+        ? '当前场景没有 RAW4D / 4CGS 序列数据，无法导出 .ply 序列。'
+        : 'The current scene has no RAW4D / 4CGS sequence data to export as .ply frames.');
+      return;
+    }
+    if (typeof window.showDirectoryPicker !== 'function') {
+      window.alert(language === 'zh'
+        ? '当前浏览器不支持选择本地写入目录（需要 File System Access API，如 Chrome/Edge）。'
+        : 'This browser does not support picking a local output directory (File System Access API).');
+      return;
+    }
+    let directory: FileSystemDirectoryHandle;
+    try {
+      directory = await window.showDirectoryPicker({
+        id: 'dong-editor-3-ply-sequence',
+        mode: 'readwrite',
+      });
+    } catch (error) {
+      // 用户在目录选择器里取消不算错误，保持静默返回。
+      if (error instanceof DOMException && error.name === 'AbortError') return;
+      window.alert(language === 'zh'
+        ? `选择目录失败：${error instanceof Error ? error.message : String(error)}`
+        : `Failed to pick a directory: ${error instanceof Error ? error.message : String(error)}`);
+      return;
+    }
+    const controller = new AbortController();
+    exportAbortRef.current = controller;
+    exportStartedAtRef.current = performance.now();
+    setExportElapsedMs(0);
+    setExportProgress(0);
+    setExportNotice({ kind: 'progress', message: '正在快照内存并准备写入目录…' });
+    setExportMonitor({
+      kind: 'ply-sequence',
+      phase: 'running',
+      inputBytes: 0,
+      progress: {
+        ratio: 0, message: `正在冻结 Canonical RAM 片段并规划时间轴，目标目录 ${directory.name}`,
+        stage: '内存快照', stageRatio: 0, workerCount: 1, completedTasks: 0, totalTasks: 1,
+      },
+      logs: [{ elapsedMs: 0, message: `开始向目录 ${directory.name} 导出 .ply 序列` }],
+    });
+    try {
+      const sources = viewportRuntime.snapshotResidentSequenceExportMemory();
+      const result = await exportRaw4DSequenceAsPlyDirectory(sources, directory, (progress) => {
+        setExportProgress(progress.ratio);
+        setExportNotice({ kind: 'progress', message: progress.message });
+        setExportMonitor((current) => {
+          if (!current || current.phase !== 'running' || current.kind !== 'ply-sequence') return current;
+          const elapsedMs = performance.now() - exportStartedAtRef.current;
+          const previousMessage = current.logs.at(-1)?.message;
+          const logs = previousMessage === progress.message
+            ? current.logs
+            : [...current.logs, { elapsedMs, message: progress.message }].slice(-12);
+          return {
+            ...current,
+            progress: {
+              ratio: progress.ratio,
+              message: progress.message,
+              stage: '帧写入',
+              stageRatio: progress.ratio,
+              workerCount: 1,
+              completedTasks: progress.frameIndex,
+              totalTasks: progress.frameCount,
+            },
+            logs,
+          };
+        });
+      }, controller.signal);
+      setExportProgress(1);
+      setExportNotice({
+        kind: 'success',
+        message: `已导出 ${result.stats.frameCount} 帧 .ply 到 ${result.directoryName}/ · 去掉 ${result.stats.deletedPointCount.toLocaleString()} 个删除点 · ${(result.stats.outputBytes / 1_000_000).toFixed(3)}M`,
+      });
+      setExportElapsedMs(performance.now() - exportStartedAtRef.current);
+      setExportMonitor((current) => current ? {
+        ...current,
+        phase: 'success',
+        plyStats: result.stats,
+        outputBytes: result.stats.outputBytes,
+        progress: {
+          ratio: 1, message: `已写入 ${result.stats.frameCount} 个 .ply 文件到 ${result.directoryName}/`,
+          stage: '完成', stageRatio: 1, workerCount: 1,
+          completedTasks: result.stats.frameCount, totalTasks: result.stats.frameCount,
+        },
+        logs: [...current.logs, {
+          elapsedMs: performance.now() - exportStartedAtRef.current,
+          message: `完成 · ${result.stats.frameCount} 帧 · ${(result.stats.outputBytes / 1_000_000).toFixed(3)}M`,
+        }].slice(-12),
+      } : current);
+    } catch (error) {
+      const cancelled = error instanceof DOMException && error.name === 'AbortError';
+      const message = error instanceof Error ? error.message : String(error);
+      // #WDD-gpt 2026-08-17 - 取消会终止 Worker，目录中可能保留已写入的部分帧文件。
+      setExportNotice({ kind: 'error', message: cancelled ? message : `PLY 序列导出失败：${message}` });
+      setExportElapsedMs(performance.now() - exportStartedAtRef.current);
+      setExportMonitor((current) => current ? {
+        ...current,
+        phase: cancelled ? 'cancelled' : 'error',
+        error: message,
+        progress: {
+          ...current.progress,
+          message: cancelled ? `${message} 目录 ${directory.name}/ 中可能保留部分帧文件。` : message,
+          stage: cancelled ? '已取消' : '失败',
+        },
+        logs: [...current.logs, {
+          elapsedMs: performance.now() - exportStartedAtRef.current,
+          message: cancelled ? `${message} 已写入的帧保留在目录中。` : message,
+        }].slice(-12),
+      } : current);
+    } finally {
+      if (exportAbortRef.current === controller) exportAbortRef.current = null;
+      setExportProgress(null);
+    }
+  };
+
+  const cancelExport = () => exportAbortRef.current?.abort();
+
+  const closeExportMonitor = () => {
+    if (exportMonitor?.phase === 'running') return;
+    setExportMonitor(null);
   };
 
   const openSourceFiles = (incoming: readonly File[]) => {
     const files = [...incoming];
     if (files.length === 0) return;
     const supported = files.every((file) => /\.(4cgs|raw4d|ply4|sog|ply)$/i.test(file.name));
-    const validMultiRaw4D = files.length === 1 || files.every((file) => /\.raw4d$/i.test(file.name));
+    const validMultiRaw4D = files.length === 1 || files.every((file) => /\.(?:raw4d|ply4)$/i.test(file.name));
     if (!supported || !validMultiRaw4D) {
       setStatus({
         phase: 'error', renderer: copy.unsupportedFile, splatCount: 0,
@@ -931,8 +1257,20 @@ export function App() {
       <header className="topbar" data-camera-input-block>
         <div className="brand">
           <strong>Dong Editor 3</strong>
-          {/* #WDD-gpt 2026-08-16 - 页面左上角直接展示由 VERSION 注入的构建版本。 */}
-          <span aria-label={`Version ${__APP_VERSION__}`} className="app-version-badge">v{__APP_VERSION__}</span>
+          {/* #WDD-gpt 2026-08-16 - 版本徽标同时作为更新信息入口，展示内容仍由 VERSION 与 CHANGELOG 两个发布文件自动驱动。 */}
+          <button
+            aria-expanded={releaseNotesVisible}
+            aria-haspopup="dialog"
+            aria-label={`${copy.releaseNotesTip} · v${__APP_VERSION__}`}
+            className="app-version-badge has-tip"
+            data-tip={copy.releaseNotesTip}
+            onClick={(event) => {
+              event.stopPropagation();
+              setOpenMenu(null);
+              setReleaseNotesVisible(true);
+            }}
+            type="button"
+          >v{__APP_VERSION__}</button>
         </div>
 
         <nav aria-label={copy.mainMenu} className="menu-bar" onClick={(event) => event.stopPropagation()}>
@@ -943,7 +1281,21 @@ export function App() {
                 <button onClick={newWorkspace} type="button"><span>{copy.newWorkspace}</span></button>
                 {/* #WDD-gpt 2026-08-16 - 文件菜单补齐与顶部按钮一致的导入、导出入口。 */}
                 <button onClick={() => { setOpenMenu(null); fileInputRef.current?.click(); }} type="button"><span>{copy.import}</span></button>
-                <button disabled={exportProgress !== null} onClick={() => void exportWorkspace()} type="button"><span>{copy.export}</span></button>
+                {/* #WDD-gpt 2026-08-17 - 导出提供 .4cgs 文件与 .ply 序列二级子菜单，悬停展开。 */}
+                <div className="submenu-anchor">
+                  <button disabled={exportProgress !== null} type="button">
+                    <span>{copy.export}</span>
+                    <b aria-hidden="true">▸</b>
+                  </button>
+                  <div className="dropdown-menu export-submenu">
+                    <button disabled={exportProgress !== null} onClick={() => void exportWorkspace()} type="button">
+                      <span>{copy.exportFourCgsFile}</span>
+                    </button>
+                    <button disabled={exportProgress !== null} onClick={() => void exportPlySequence()} type="button">
+                      <span>{copy.exportPlySequence}</span>
+                    </button>
+                  </div>
+                </div>
               </div>
             )}
           </div>
@@ -954,6 +1306,7 @@ export function App() {
                 <button onClick={toggleInspectorPanel} type="button"><span>{copy.inspector}</span><b>{inspectorPanelVisible ? '✓' : ''}</b></button>
                 <button onClick={() => setShowGrid((visible) => !visible)} type="button"><span>{copy.grid}</span><b>{showGrid ? '✓' : ''}</b></button>
                 <button onClick={() => setShowAxes((visible) => !visible)} type="button"><span>{copy.axes}</span><b>{showAxes ? '✓' : ''}</b></button>
+                <button onClick={() => setShowHeightRuler((visible) => !visible)} type="button"><span>{copy.heightRuler}</span><b>{showHeightRuler ? '✓' : ''}</b></button>
               </div>
             )}
           </div>
@@ -1045,8 +1398,128 @@ export function App() {
           <button className="primary-button has-tip" data-tip={copy.exportTip} disabled={exportProgress !== null} onClick={() => void exportWorkspace()} type="button">
             <Icon name="export" />{exportProgress === null ? copy.export : `${copy.savingRaw4D} ${Math.round(exportProgress * 100)}%`}
           </button>
+          {exportNotice && (
+            <span className={`export-notice ${exportNotice.kind}`} role={exportNotice.kind === 'error' ? 'alert' : 'status'}>
+              {exportNotice.message}
+            </span>
+          )}
         </div>
       </header>
+
+      {releaseNotesVisible && (
+        <ReleaseNotesDialog
+          copy={copy}
+          currentVersion={__APP_VERSION__}
+          onClose={() => setReleaseNotesVisible(false)}
+          releases={releaseNotes}
+        />
+      )}
+
+      {memoryPressureDialogVisible && (
+        <MemoryPressureTestDialog
+          availableBudgetBytes={Math.max(0, memoryPolicy.cpuBudgetBytes - memoryUsage.managedCpuBytes)}
+          browserDeviceMemoryBytes={memoryUsage.browserDeviceMemoryBytes}
+          copy={copy}
+          currentResidentBytes={memoryUsage.managedCpuBytes}
+          onClose={() => setMemoryPressureDialogVisible(false)}
+          onComplete={setLastMemoryPressureResult}
+        />
+      )}
+
+      {exportMonitor && (
+        <div className="export-monitor-backdrop" data-camera-input-block>
+          <section aria-label={exportMonitor.kind === 'ply-sequence'
+            ? (language === 'zh' ? 'PLY 序列导出监督' : 'PLY sequence export monitor')
+            : (language === 'zh' ? '4CGS 保存监督' : '4CGS export monitor')} aria-modal="true" className="export-monitor-dialog" role="dialog">
+            <header>
+              <div>
+                <span>{exportMonitor.kind === 'ply-sequence' ? 'RAW4D · PLY 序列' : '4CGS · V2.6'}</span>
+                <strong>{exportMonitor.kind === 'ply-sequence'
+                  ? (language === 'zh' ? 'PLY 序列导出监督' : 'PLY sequence export monitor')
+                  : (language === 'zh' ? '压缩保存监督' : 'Compression export monitor')}</strong>
+              </div>
+              <b className={`export-monitor-state ${exportMonitor.phase}`}>
+                {exportMonitor.phase === 'running' ? (language === 'zh' ? '运行中' : 'Running')
+                  : exportMonitor.phase === 'success' ? (language === 'zh' ? '已完成' : 'Complete')
+                    : exportMonitor.phase === 'cancelled' ? (language === 'zh' ? '已取消' : 'Cancelled')
+                      : (language === 'zh' ? '失败' : 'Failed')}
+              </b>
+            </header>
+
+            <div className="export-monitor-stage">
+              <div>
+                <span>{exportMonitor.progress.stage ?? (language === 'zh' ? '准备' : 'Preparing')}</span>
+                <b>{Math.round(exportMonitor.progress.ratio * 100)}%</b>
+              </div>
+              <p>{exportMonitor.progress.message}</p>
+              <div aria-label={language === 'zh' ? '总体保存进度' : 'Overall export progress'} className="export-monitor-progress" role="progressbar" aria-valuemax={100} aria-valuemin={0} aria-valuenow={Math.round(exportMonitor.progress.ratio * 100)}>
+                <i style={{ width: `${Math.max(0, Math.min(1, exportMonitor.progress.ratio)) * 100}%` }} />
+              </div>
+              {exportMonitor.progress.stageRatio !== undefined && (
+                <div className="export-monitor-subprogress"><i style={{ width: `${Math.max(0, Math.min(1, exportMonitor.progress.stageRatio)) * 100}%` }} /></div>
+              )}
+            </div>
+
+            <dl className="export-monitor-stats">
+              <div><dt>{language === 'zh' ? 'Worker' : 'Workers'}</dt><dd>{exportMonitor.progress.workerCount ?? 1}</dd></div>
+              <div><dt>{language === 'zh' ? '任务' : 'Tasks'}</dt><dd>{exportMonitor.progress.completedTasks ?? 0}/{exportMonitor.progress.totalTasks ?? 8}</dd></div>
+              <div><dt>{language === 'zh' ? '耗时' : 'Elapsed'}</dt><dd>{(exportElapsedMs / 1000).toFixed(1)} s</dd></div>
+              <div><dt>{language === 'zh' ? '输入' : 'Input'}</dt><dd>{exportMonitor.kind === 'ply-sequence'
+                ? (exportMonitor.plyStats ? `${exportMonitor.plyStats.segmentCount} 段` : '--')
+                : `${(exportMonitor.inputBytes / 1_000_000).toFixed(3)}M`}</dd></div>
+              <div><dt>{language === 'zh' ? '输出' : 'Output'}</dt><dd>{exportMonitor.outputBytes === undefined ? '--' : `${(exportMonitor.outputBytes / 1_000_000).toFixed(3)}M`}</dd></div>
+              <div><dt>{exportMonitor.kind === 'ply-sequence' ? (language === 'zh' ? '帧文件' : 'Frames') : (language === 'zh' ? '压缩比' : 'Ratio')}</dt><dd>{exportMonitor.kind === 'ply-sequence'
+                ? (exportMonitor.plyStats ? `${exportMonitor.plyStats.frameCount}` : `${exportMonitor.progress.completedTasks ?? 0}`)
+                : (exportMonitor.result ? `${exportMonitor.result.compressionRatio.toFixed(2)}×` : '--')}</dd></div>
+            </dl>
+
+            {exportMonitor.result?.encodeTimings && (
+              <div className="export-monitor-timings">
+                {Object.entries(exportMonitor.result.encodeTimings.stageMs).map(([stage, milliseconds]) => (
+                  <span key={stage}><b>{stage}</b>{(milliseconds / 1000).toFixed(2)} s</span>
+                ))}
+              </div>
+            )}
+
+            <ol className="export-monitor-log">
+              {exportMonitor.logs.map((entry, index) => (
+                <li key={`${entry.elapsedMs}-${index}`}><time>{(entry.elapsedMs / 1000).toFixed(1)}s</time><span>{entry.message}</span></li>
+              ))}
+            </ol>
+
+            <footer>
+              <small>{exportMonitor.kind === 'ply-sequence'
+                ? (language === 'zh' ? '每帧 PLY 在浏览器 Worker 中直接写入所选目录；取消不修改场景，目录中可能保留已写入的部分帧。' : 'Each PLY frame is written to the chosen directory by a browser worker; cancelling leaves already-written frames in place.')
+                : (language === 'zh' ? '压缩完全在浏览器 Worker 中执行；取消不会修改当前场景。' : 'Compression runs entirely in browser workers; cancelling does not modify the scene.')}</small>
+              {exportMonitor.phase === 'running'
+                ? <button className="quiet-button export-monitor-cancel" onClick={cancelExport} type="button">{language === 'zh' ? '取消保存' : 'Cancel'}</button>
+                : <button className="primary-button" onClick={closeExportMonitor} type="button">{language === 'zh' ? '关闭' : 'Close'}</button>}
+            </footer>
+          </section>
+        </div>
+      )}
+
+      {pendingLocalMaximumMode && (
+        <div className="memory-confirm-backdrop" data-camera-input-block>
+          <section aria-label={copy.localMaximumDialogTitle} aria-modal="true" className="memory-confirm-dialog" role="dialog">
+            <header>
+              <span>{copy.localMaximumDialogKicker}</span>
+              <strong>{copy.localMaximumDialogTitle}</strong>
+              <p>{copy.localMaximumDialogDescription}</p>
+            </header>
+            <dl>
+              <div><dt>{copy.cpuGiB}</dt><dd>32 GiB</dd></div>
+              <div><dt>{copy.gpuGiB}</dt><dd>12 GiB</dd></div>
+              <div><dt>{copy.localMaximumResidency}</dt><dd>{copy.localMaximumAllSegments}</dd></div>
+            </dl>
+            <p className="memory-confirm-warning">{copy.localMaximumWarning}</p>
+            <footer>
+              <button className="quiet-button" onClick={() => setPendingLocalMaximumMode(false)} type="button">{copy.cancel}</button>
+              <button autoFocus className="primary-button" onClick={activateLocalMaximumMode} type="button">{copy.activateLocalMaximum}</button>
+            </footer>
+          </section>
+        </div>
+      )}
 
       <section className="workspace" ref={workspaceRef}>
         <section className="viewport-stage">
@@ -1068,6 +1541,8 @@ export function App() {
             selectionCylinder={selectionCylinder}
             selectionScope={selectionScope}
             showAxes={showAxes}
+            showHeightRuler={showHeightRuler}
+            showGaussianEnvelope={showGaussianEnvelope}
             showGrid={showGrid}
             showGuides
             sourceFiles={sourceFiles}
@@ -1107,6 +1582,7 @@ export function App() {
             <div className="guide-switches">
               <button aria-pressed={showGrid} className={showGrid ? 'active' : ''} onClick={() => setShowGrid((visible) => !visible)} type="button">{copy.grid}</button>
               <button aria-pressed={showAxes} className={showAxes ? 'active' : ''} onClick={() => setShowAxes((visible) => !visible)} type="button">{copy.axes}</button>
+              <button aria-pressed={showHeightRuler} className={showHeightRuler ? 'active' : ''} onClick={() => setShowHeightRuler((visible) => !visible)} type="button">{copy.heightRuler}</button>
             </div>
             {/* #WDD-gpt 2026-08-16 - 序列摘要并入顶部工具栏，避免单独占用第二行遮挡视口。 */}
             {status.phase === 'ready' && status.raw4dSequence && (
@@ -1352,6 +1828,32 @@ export function App() {
                   <button aria-pressed={uniformScale} className={uniformScale ? 'scale-link active' : 'scale-link'} onClick={() => setUniformScale((linked) => !linked)} type="button">{uniformScale ? '●' : '○'}</button>
                 </div>
                 <TransformVectorEditor disabled={transformDisabled} label={copy.scale} max={1_000} min={0.001} onChange={(axis, value) => updateTransformVector('scale', axis, value)} onReset={() => resetTransformVector('scale')} precision={3} resetLabel={copy.reset} scrubStep={0.01} step={0.05} values={sceneTransform.scale} />
+                {/* #WDD-gpt 2026-08-16 - 未删除点外包络诊断独立于网格和坐标轴，默认关闭以免干扰正常编辑。 */}
+                <div className="scale-link-row gaussian-envelope-toggle-row">
+                  <span>{copy.gaussianEnvelope}</span>
+                  <button
+                    aria-label={copy.gaussianEnvelopeTip}
+                    aria-pressed={showGaussianEnvelope}
+                    className={showGaussianEnvelope ? 'scale-link active has-tip' : 'scale-link has-tip'}
+                    data-tip={copy.gaussianEnvelopeTip}
+                    disabled={transformDisabled}
+                    onClick={() => setShowGaussianEnvelope((visible) => !visible)}
+                    type="button"
+                  >{showGaussianEnvelope ? '●' : '○'}</button>
+                </div>
+                {/* #WDD-gpt 2026-08-16 - 在变换检查器复用 GS2Mesh 唯一可见状态，避免与插件窗口的显隐开关失步。 */}
+                <div className="scale-link-row mesh-visibility-toggle-row">
+                  <span>{copy.meshVisibility}</span>
+                  <button
+                    aria-label={copy.meshVisibilityTip}
+                    aria-pressed={gs2MeshVisible}
+                    className={gs2MeshVisible ? 'scale-link active has-tip' : 'scale-link has-tip'}
+                    data-tip={copy.meshVisibilityTip}
+                    disabled={!hasGS2Mesh}
+                    onClick={() => changeGS2MeshVisible(!gs2MeshVisible)}
+                    type="button"
+                  >{gs2MeshVisible ? '●' : '○'}</button>
+                </div>
               </section>
             )}
 
@@ -1379,18 +1881,22 @@ export function App() {
                   <select
                     aria-label={copy.memoryModeLabel}
                     className="ui-select"
-                    onChange={(event) => setMemoryMode(event.target.value as Gaussian4DMemoryMode)}
+                    onChange={(event) => requestMemoryMode(event.target.value as Gaussian4DMemoryMode)}
                     value={memoryMode}
                   >
                     <option value="auto">{copy.modeAuto}</option>
                     <option value="compatible">{copy.modeCompatible}</option>
                     <option value="balanced">{copy.modeBalanced}</option>
                     <option value="performance">{copy.modePerformance}</option>
+                    <option value="local-maximum">{copy.modeLocalMaximum}</option>
                     <option value="custom">{copy.modeCustom}</option>
                   </select>
                 </label>
                 {memoryMode === 'auto' && (
                   <p className="memory-auto-note">{copy.autoBudgetNote}</p>
+                )}
+                {memoryMode === 'local-maximum' && (
+                  <p className="memory-auto-note local-maximum-active">{copy.localMaximumActiveNote}</p>
                 )}
                 {memoryMode === 'custom' && (
                   <div className="memory-custom-grid">
@@ -1398,7 +1904,13 @@ export function App() {
                     <label><span>{copy.gpuGiB}</span><ValidatedNumberInput aria-label={copy.gpuGiB} max={32} min={0.5} onCommit={setCustomGpuGiB} precision={1} step={0.5} value={customGpuGiB} /></label>
                   </div>
                 )}
-                <MemoryTelemetryPanel language={language} usage={memoryUsage} />
+                <MemoryTelemetryPanel
+                  language={language}
+                  lastPressureResult={lastMemoryPressureResult}
+                  onOpenPressureTest={() => setMemoryPressureDialogVisible(true)}
+                  policy={memoryPolicy}
+                  usage={memoryUsage}
+                />
                 <dl className="property-list memory-details">
                   <div><dt>{copy.transport}</dt><dd>{memoryUsage.transport === 'shared-array-buffer' ? 'SharedArrayBuffer' : 'Transferable'}</dd></div>
                   <div><dt>{copy.loaderWorker}</dt><dd>{status.decodeBackend === 'wasm' ? 'WASM + TypedArray' : status.decodeBackend === 'fp16-bits' ? 'FP16 Bits + TypedArray' : status.decodeBackend === 'image-codebook' ? 'Image Codebook' : status.decodeBackend ? 'TypedArray' : '--'}</dd></div>
@@ -1471,11 +1983,13 @@ export function App() {
                 )}
                 {activePlugin === 'relighting' && (
                   <RelightingPanel
-                    hasMesh={gs2MeshState.stage === 'success'}
+                    hasMesh={hasGS2Mesh}
                     language={language}
+                    meshVisible={gs2MeshVisible}
                     onAddLight={addRelightingLight}
                     onEnabledChange={changeRelightingEnabled}
                     onLightChange={updateRelightingLight}
+                    onMeshVisibleChange={changeGS2MeshVisible}
                     onRemoveLight={removeRelightingLight}
                     onSelectLight={selectRelightingLight}
                     onSettingsChange={updateRelightingSettings}
@@ -1574,7 +2088,12 @@ export function App() {
 
       <footer className="statusbar" data-camera-input-block>
         <span><i className={status.phase === 'ready' ? 'ok' : ''} />{status.phase === 'ready' ? copy.sceneReady : copy.scenePreparing}</span>
-        <span>{status.splatCount.toLocaleString(language === 'zh' ? 'zh-CN' : 'en-US')} {copy.splats}</span>
+        {/* #WDD-gpt 2026-08-16 - 左下角同时展示全局有效点、当前活动片段显示点和全局软删除点。 */}
+        <dl aria-label={copy.gaussianStatusSummary} className="gaussian-status-summary">
+          <div><dt>{copy.activeGaussianStatus}</dt><dd>{statusActiveCount.toLocaleString(gaussianCountLocale)}</dd></div>
+          <div><dt>{copy.currentFrameGaussianStatus}</dt><dd>{statusCurrentFrameDisplayedCount.toLocaleString(gaussianCountLocale)}</dd></div>
+          <div className={statusDeletedCount > 0 ? 'deleted' : ''}><dt>{copy.deletedGaussianStatus}</dt><dd>{statusDeletedCount.toLocaleString(gaussianCountLocale)}</dd></div>
+        </dl>
         <span
           aria-label={`${copy.memoryUsage}: JS ${formatBytes(memoryUsage.jsHeapBytes)}, 4D ${formatBytes(memoryUsage.managedCpuBytes)}, GPU ${formatBytes(memoryUsage.gpuBytes)}`}
           className="memory-usage has-tip"

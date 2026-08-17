@@ -136,6 +136,8 @@ export class GaussianMemoryCoordinator {
     const gpuManagedBytes = this.gpuPool.committedBytes + externalGpuBytes;
     const gpuActiveBytes = this.gpuPool.activeBytes + externalGpuBytes;
     return {
+      // #WDD-gpt 2026-08-16 - 将运行时实际策略随统计回传，界面据此验证预设已应用而不是只相信下拉框状态。
+      policyMode: this.policy.mode,
       cpuResidentBytes: cpu.residentBytes,
       cpuCompressedBytes: cpu.compressedBytes,
       cpuDecodedBytes: cpu.decodedBytes,

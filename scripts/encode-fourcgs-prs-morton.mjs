@@ -18,10 +18,26 @@ import { encodeTemporalAttribute } from './fourcgs-temporal-attribute-codec.mjs'
 import { encodeSo3Rotations } from './fourcgs-so3-temporal-codec.mjs';
 
 const MAGIC = '4CGSPRS2';
-const SEGMENT_PATTERN = /^segment_(\d+)_(\d+)\.raw4d$/;
+const SEGMENT_PATTERN = /^segment_(\d+)_(\d+)\.(?:raw4d|ply4)$/i;
 const SH_HEADER_BYTES = 20;
 const SH_MEAN_BYTES = 45 * 2;
 const SH_CODEBOOK_BYTES = 5 * 256 * 45 * 2;
+
+function sourceKeyframeStrides(segment) {
+  const dc = Number(segment.comments.get('features_dc_bank_keyframe_stride'));
+  const value = (name, fallback) => {
+    const parsed = Number(segment.comments.get(name) ?? fallback);
+    if (!Number.isSafeInteger(parsed) || parsed <= 0) throw new Error(`Invalid ${name} in ${segment.path}.`);
+    return parsed;
+  };
+  return {
+    position: value('xyz_bank_keyframe_stride'),
+    rotation: value('rot_bank_keyframe_stride'),
+    colorDc: value('features_dc_bank_keyframe_stride'),
+    scale: value('scaling_bank_keyframe_stride', Number.isSafeInteger(dc) && dc > 0 ? dc : 1),
+    opacity: value('opacity_bank_keyframe_stride', Number.isSafeInteger(dc) && dc > 0 ? dc : 1),
+  };
+}
 
 function robustCenter(segment) {
   const axes = ['x', 'y', 'z'].map((component) => {
@@ -568,7 +584,7 @@ async function main() {
     } : undefined,
     shPolicy: 'one shared ordinary CoReSH-5R codebook; exact trajectory labels on permanent Track IDs',
     segments: entries.map((entry, index) => ({
-      name: entry.name.replace(/\.raw4d$/, ''),
+      name: entry.name.replace(/\.(?:raw4d|ply4)$/i, ''),
       firstFrame: Number(entry.match[1]),
       lastFrame: Number(entry.match[2]),
       sourceGaussianCount: segments[index].count,
@@ -581,6 +597,8 @@ async function main() {
         scale: scaleBanks[index],
         opacity: bankCount(segments[index], 'opacity_bank'),
       },
+      // #WDD-gpt 2026-08-16 - 4CGS 清单保留源 PLY4 的真实 stride，避免解码时从 bank 数量反推歧义时间轴。
+      keyframeStrides: sourceKeyframeStrides(segments[index]),
     })),
     matches: layout.matches.map((match) => ({
       previous: match.previous.split('/').at(-1),

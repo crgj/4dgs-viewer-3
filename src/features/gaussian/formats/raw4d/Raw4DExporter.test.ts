@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { parseRaw4D } from './Raw4DParser';
+import { parseRaw4D, readRaw4DHeader } from './Raw4DParser';
 import { exportCompactedRaw4D, exportCompactedRaw4DSource } from './Raw4DExporter';
 import type { Raw4DAsset, Raw4DTrack } from './Raw4DTypes';
 
@@ -30,7 +30,13 @@ describe('Raw4DExporter', () => {
     const deletionWords = new Uint32Array(1);
     deletionWords[0] = (1 << 1) | (1 << 3);
     const blob = await exportCompactedRaw4D(fixture(), deletionWords, { chunkRows: 256 });
+    const header = await readRaw4DHeader(blob);
     const decoded = await parseRaw4D(blob, { sourceName: 'compacted.raw4d' });
+    expect(header.propertyNames.slice(0, 15)).toEqual([
+      'x', 'y', 'z', 'nx', 'ny', 'nz', 'f_dc_0', 'f_dc_1', 'f_dc_2',
+      'opacity', 'scale_0', 'scale_1', 'scale_2', 'lifetime_mu', 'lifetime_w',
+    ]);
+    expect(header.propertyNames).toHaveLength(43);
     expect(decoded.splatCount).toBe(2);
     expect(Array.from(decoded.lifetimeMu)).toEqual([0.25, 2.25]);
     expect(Array.from(decoded.position.values[0])).toEqual([0, 20]);

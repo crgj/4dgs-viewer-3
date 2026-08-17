@@ -5,6 +5,8 @@ import {
 } from './selection/GaussianCylinderSelection';
 import {
   Application,
+  ASPECT_AUTO,
+  ASPECT_MANUAL,
   Color,
   DEVICETYPE_WEBGPU,
   Entity,
@@ -19,6 +21,7 @@ import {
   Vec3,
   createGraphicsDevice,
 } from 'playcanvas';
+import { evaluationCameraManualAspectRatio } from './camera/EvaluationCameraProjection';
 import { RenderExtensionRegistry } from '../../../core/engine/RenderExtension';
 import {
   EditorHistory,
@@ -38,7 +41,7 @@ import type {
   GaussianSourceFormat,
   ImportedGaussianAsset,
 } from '../../gaussian/formats/import/GaussianImportTypes';
-import type { Raw4DAsset } from '../../gaussian/formats/raw4d/Raw4DTypes';
+import type { Raw4DAsset, Raw4DMemorySnapshot } from '../../gaussian/formats/raw4d/Raw4DTypes';
 import {
   exportCompactedRaw4D as encodeCompactedRaw4D,
   exportCompactedRaw4DSource,
@@ -57,6 +60,7 @@ import {
 } from '../../gaussian/memory/GaussianMemoryCoordinator';
 import {
   detectAutomaticGaussian4DMemoryPolicy,
+  type Gaussian4DMemoryMode,
   type Gaussian4DMemoryPolicy,
 } from '../../gaussian/memory/Gaussian4DMemoryPolicy';
 import { chooseRaw4DGpuEviction } from '../../gaussian/memory/Raw4DGpuResidencyPolicy';
@@ -68,7 +72,9 @@ import {
 import { Raw4DFrameSampler } from '../../gaussian/runtime/Raw4DFrameSampler';
 import {
   installGaussianRenderModes,
+  setGaussianRasterKernel,
   setGaussianRenderMode,
+  type GaussianRasterKernel,
   type GaussianRenderMode,
 } from '../../gaussian/runtime/GaussianRenderMode';
 import {
@@ -116,6 +122,10 @@ import {
 } from './selection/GaussianScreenSelection';
 import { Raw4DSelectionFrameSampler } from './selection/Raw4DSelectionFrameSampler';
 import { GaussianSequenceEditStore } from './selection/GaussianSequenceEditStore';
+import {
+  computeGaussianEnvelopeMesh,
+  type GaussianEnvelopeSource,
+} from './scene/GaussianEnvelope';
 import { SceneGuides } from './scene/SceneGuides';
 import { ViewportPerformanceMonitor, type ViewportPerformanceSnapshot } from './ViewportPerformanceMonitor';
 import {
@@ -216,6 +226,8 @@ interface ResidentRaw4DGpuLoad {
 }
 
 export interface ViewportMemoryUsage {
+  runtimePolicyMode: Gaussian4DMemoryMode | null;
+  browserDeviceMemoryBytes: number | null;
   jsHeapBytes: number | null;
   jsHeapLimitBytes: number | null;
   gpuBytes: number;
@@ -243,7 +255,17 @@ export interface EvaluationCameraPose {
   position: [number, number, number];
   rotation: [[number, number, number], [number, number, number], [number, number, number]];
   fx: number;
+  fy?: number;
   sourceWidth: number;
+  sourceHeight?: number;
+}
+
+export interface GaussianRasterizationQuality {
+  readonly alphaClipForward?: number;
+  readonly antiAlias?: boolean;
+  readonly minContribution?: number;
+  readonly minPixelSize?: number;
+  readonly kernel?: GaussianRasterKernel;
 }
 
 export type ViewportTransformTool = 'move' | 'rotate' | 'scale';
@@ -261,6 +283,7 @@ export interface ViewportSelectionState {
   readonly selectedCount: number;
   readonly deletedCount?: number;
   readonly pointCount?: number;
+  readonly currentFrameDisplayedCount?: number;
   readonly hitCount?: number;
   readonly message?: string;
 }
@@ -272,6 +295,7 @@ export const INITIAL_VIEWPORT_SELECTION_STATE: ViewportSelectionState = {
   selectedCount: 0,
   deletedCount: 0,
   pointCount: 0,
+  currentFrameDisplayedCount: 0,
 };
 
 export { INITIAL_EDITOR_HISTORY_STATE };
@@ -338,6 +362,10 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
   private shLevel = 3;
   private gridVisible = true;
   private axesVisible = true;
+  private heightRulerVisible = false;
+  private gaussianEnvelopeVisible = false;
+  private gaussianEnvelopeGeneration = 0;
+  private gaussianEnvelopeTimer: number | null = null;
   private editorTool: ViewportEditorTool = 'select';
   private selectionScope: ViewportSelectionScope = 'visible';
   private selectionBrushRadius = 48;
@@ -426,7 +454,8 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
 
     const camera = new Entity('Editor Camera');
     camera.addComponent('camera', {
-      clearColor: new Color(0.025, 0.026, 0.029),
+      // #WDD-gpt 2026-08-16 - RAW4D 质量参考以纯黑清屏；避免近黑编辑器底色污染整帧 PSNR 与半透明边缘。
+      clearColor: new Color(0, 0, 0),
       fov: 48,
       nearClip: 0.01,
       farClip: 200,
@@ -448,6 +477,9 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
       this.guides = new SceneGuides(app, camera.camera!);
       this.guides.setGridVisible(this.gridVisible);
       this.guides.setAxesVisible(this.axesVisible);
+      this.guides.setHeightRulerVisible(this.heightRulerVisible);
+      this.guides.setGaussianEnvelopeVisible(this.gaussianEnvelopeVisible);
+      this.guides.setGaussianEnvelope(null, this.pendingTransform);
     }
 
     this.resizeObserver = new ResizeObserver(() => this.resize());
@@ -464,6 +496,9 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
 
   destroy(): void {
     this.destroyRequested = true;
+    this.gaussianEnvelopeGeneration += 1;
+    if (this.gaussianEnvelopeTimer !== null) window.clearTimeout(this.gaussianEnvelopeTimer);
+    this.gaussianEnvelopeTimer = null;
     this.history.clear();
     this.destroyGaussianSelectionInput();
     this.resizeObserver?.disconnect();
@@ -522,6 +557,27 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
     camera.lookAt(position.clone().add(forward), up);
     camera.camera.horizontalFov = true;
     camera.camera.fov = 2 * Math.atan(pose.sourceWidth / (2 * pose.fx)) * 180 / Math.PI;
+    const manualAspectRatio = evaluationCameraManualAspectRatio(pose);
+    // #WDD-gpt 2026-08-16 - 训练相机 fx/fy 并非严格相等；手动宽高比让 PlayCanvas 投影同时复现两轴焦距。
+    camera.camera.aspectRatioMode = manualAspectRatio === null ? ASPECT_AUTO : ASPECT_MANUAL;
+    if (manualAspectRatio !== null) camera.camera.aspectRatio = manualAspectRatio;
+  }
+
+  setGaussianRasterizationQuality(quality: GaussianRasterizationQuality): void {
+    const gsplat = this.app?.scene.gsplat;
+    if (!gsplat) return;
+    // #WDD-gpt 2026-08-16 - 独立质量验收需要扫描PlayCanvas裁剪阈值，统一通过运行时API设置并沿用正式渲染路径。
+    if (quality.alphaClipForward !== undefined && Number.isFinite(quality.alphaClipForward)) {
+      gsplat.alphaClipForward = Math.max(0, quality.alphaClipForward);
+    }
+    if (quality.minContribution !== undefined && Number.isFinite(quality.minContribution)) {
+      gsplat.minContribution = Math.max(0, quality.minContribution);
+    }
+    if (quality.minPixelSize !== undefined && Number.isFinite(quality.minPixelSize)) {
+      gsplat.minPixelSize = Math.max(0, quality.minPixelSize);
+    }
+    if (quality.antiAlias !== undefined) gsplat.antiAlias = quality.antiAlias;
+    if (quality.kernel !== undefined && this.app) setGaussianRasterKernel(this.app, quality.kernel);
   }
 
   setRenderMode(mode: GaussianRenderMode): void {
@@ -563,6 +619,17 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
   setAxesVisible(visible: boolean): void {
     this.axesVisible = visible;
     this.guides?.setAxesVisible(visible);
+  }
+
+  setHeightRulerVisible(visible: boolean): void {
+    this.heightRulerVisible = visible;
+    this.guides?.setHeightRulerVisible(visible);
+  }
+
+  setGaussianEnvelopeVisible(visible: boolean): void {
+    this.gaussianEnvelopeVisible = visible;
+    this.guides?.setGaussianEnvelopeVisible(visible);
+    if (visible && !this.canvas.dataset.gaussianEnvelopePoints) this.requestGaussianEnvelopeUpdate(0);
   }
 
   // #WDD-gpt 2026-08-16 - 编辑 API 始终使用源点稳定 ID；删除只更新紧凑位集和 GPU R8 掩码，不重排 Canonical 数据。
@@ -654,13 +721,80 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
     const raw4D = this.activeRaw4D;
     const asset = this.activeRaw4DAsset;
     if (!raw4D || !asset) throw new Error('No active RAW4D dataset.');
-    return this.activeRaw4DSource && this.activeFormat === 'RAW4D'
+    return this.activeRaw4DSource && (this.activeFormat === 'RAW4D' || this.activeFormat === 'PLY4')
       ? exportCompactedRaw4DSource(this.activeRaw4DSource, raw4D.edits.deletionWords, { onProgress })
       : encodeCompactedRaw4D(asset, raw4D.edits.deletionWords, { onProgress });
   }
 
+  // #WDD-gpt 2026-08-16 - 4CGS 导出按原始 File 身份快照每段删除位集，避免时间排序后把 A 段删除掩码误套到 B 段。
+  snapshotRaw4DExportDeletionWords(files: readonly File[]): readonly Uint32Array[] {
+    return this.snapshotRaw4DExportMemory(files).map((snapshot) => snapshot.deletionWords);
+  }
+
+  // #WDD-gpt 2026-08-16 - 保存入口直接快照当前 Canonical RAM；File 只用于匹配段落身份和保留输出名称。
+  snapshotRaw4DExportMemory(files: readonly File[]): readonly Raw4DMemorySnapshot[] {
+    if (files.length === 0) throw new Error('No RAW4D sources are available for export.');
+    const sequence = this.gaussianSelectionSequence;
+    if (sequence && this.raw4DSequenceGpuOrder.length > 0) {
+      if (sequence.edits.segmentCount !== this.raw4DSequenceGpuOrder.length) {
+        throw new Error('RAW4D sequence edit state is inconsistent with the resident segment order.');
+      }
+      const used = new Set<number>();
+      return files.map((file) => {
+        const segmentIndex = this.raw4DSequenceGpuOrder.findIndex((residentId, index) => {
+          if (used.has(index)) return false;
+          return this.residentRaw4DSegments.get(residentId)?.handle.file === file;
+        });
+        if (segmentIndex < 0) throw new Error(`${file.name} has no matching RAW4D memory snapshot.`);
+        const resident = this.residentRaw4DSegments.get(this.raw4DSequenceGpuOrder[segmentIndex]);
+        if (!resident) throw new Error(`${file.name} is no longer resident in canonical memory.`);
+        used.add(segmentIndex);
+        return {
+          name: file.name,
+          asset: resident.loaded.asset,
+          deletionWords: sequence.edits.segment(segmentIndex).edits.deletionWords.slice(),
+        };
+      });
+    }
+    if (files.length !== 1 || !this.activeRaw4D || !this.activeRaw4DAsset || files[0] !== this.activeRaw4DSource) {
+      throw new Error('RAW4D export memory does not match the selected source files.');
+    }
+    return [{
+      name: files[0].name,
+      asset: this.activeRaw4DAsset,
+      deletionWords: this.activeRaw4D.edits.deletionWords.slice(),
+    }];
+  }
+
   getGaussianDeletionCount(): number {
     return this.gaussianDeletionCount();
+  }
+
+  // #WDD-gpt 2026-08-17 - PLY 序列导出不依赖拖入 File 身份，直接按时间轴顺序快照驻留 Canonical 段。
+  snapshotResidentSequenceExportMemory(): readonly Raw4DMemorySnapshot[] {
+    const sequence = this.gaussianSelectionSequence;
+    if (sequence && this.raw4DSequenceGpuOrder.length > 0) {
+      if (sequence.edits.segmentCount !== this.raw4DSequenceGpuOrder.length) {
+        throw new Error('RAW4D sequence edit state is inconsistent with the resident segment order.');
+      }
+      return this.raw4DSequenceGpuOrder.map((residentId, segmentIndex) => {
+        const resident = this.residentRaw4DSegments.get(residentId);
+        if (!resident) throw new Error(`RAW4D 第 ${segmentIndex + 1} 段已退出系统内存。`);
+        return {
+          name: resident.handle.file.name,
+          asset: resident.loaded.asset,
+          deletionWords: sequence.edits.segment(segmentIndex).edits.deletionWords.slice(),
+        };
+      });
+    }
+    if (!this.activeRaw4D || !this.activeRaw4DAsset) {
+      throw new Error('No active RAW4D dataset.');
+    }
+    return [{
+      name: this.activeRaw4DAsset.sourceName,
+      asset: this.activeRaw4DAsset,
+      deletionWords: this.activeRaw4D.edits.deletionWords.slice(),
+    }];
   }
 
   // #WDD-gpt  2026-08-16 - 反选遵循当前范围：可见只切换当前帧视口内高斯，全局切换整个文件的未删除稳定 ID。
@@ -726,12 +860,14 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
       scale: transform.scale.map((value) => Math.max(0.001, value)) as [number, number, number],
     };
     this.syncSceneTransformDataset(next);
+    this.guides?.setGaussianEnvelopeTransform(next);
     if (this.transformsEqual(this.pendingTransform, next)) return;
     const previous = this.getSceneTransform();
     this.pendingTransform = next;
     const entity = this.activeRaw4D?.entity;
     if (!entity) return;
     this.applyTransform(entity, this.pendingTransform);
+    this.gs2MeshObject?.syncTransform(entity);
     this.activeGizmo()?.update();
     this.pushTransformHistory(previous, next);
   }
@@ -745,8 +881,12 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
     };
     this.pendingTransform = next;
     const entity = this.activeRaw4D?.entity;
-    if (entity) this.applyTransform(entity, next);
+    if (entity) {
+      this.applyTransform(entity, next);
+      this.gs2MeshObject?.syncTransform(entity);
+    }
     this.activeGizmo()?.update();
+    this.guides?.setGaussianEnvelopeTransform(next);
     this.syncSceneTransformDataset(next);
     this.options.onTransformChange?.(this.getSceneTransform());
   }
@@ -847,7 +987,14 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
     const memory = (performance as PerformanceWithMemory).memory;
     const vram = this.app?.graphicsDevice._vram;
     const managed = this.memoryCoordinator?.getStats();
+    const navigatorWithMemory = navigator as Navigator & { deviceMemory?: number };
+    const deviceMemoryGiB = navigatorWithMemory.deviceMemory;
     return {
+      runtimePolicyMode: managed?.policyMode ?? null,
+      // #WDD-gpt 2026-08-16 - deviceMemory 是浏览器隐私降精度后的设备 RAM 提示，保留原值但不冒充系统实时可用内存。
+      browserDeviceMemoryBytes: Number.isFinite(deviceMemoryGiB) && (deviceMemoryGiB ?? 0) > 0
+        ? (deviceMemoryGiB as number) * 1024 ** 3
+        : null,
       jsHeapBytes: memory?.usedJSHeapSize ?? null,
       jsHeapLimitBytes: memory?.jsHeapSizeLimit ?? null,
       gpuBytes: vram
@@ -1406,7 +1553,7 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
   installGS2Mesh(data: GS2MeshData): GS2MeshSceneStats {
     if (!this.app) throw new Error('三维视口尚未初始化完成。');
     const previous = this.gs2MeshObject;
-    const next = new GS2MeshSceneObject(this.app, data);
+    const next = new GS2MeshSceneObject(this.app, data, this.activeRaw4D?.entity);
     this.gs2MeshObject = next;
     this.relighting?.setProxy(next);
     previous?.destroy();
@@ -1554,8 +1701,8 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
     onProgress?: (progress: ViewportRaw4DResidencyProgress) => void,
   ): Promise<readonly ViewportResidentRaw4DSegment[]> {
     if (!this.memoryCoordinator || !this.gaussianImporter) throw new Error('三维视口尚未初始化完成。');
-    if (files.length === 0 || files.some((file) => !file.name.toLowerCase().endsWith('.raw4d'))) {
-      throw new Error('系统内存片段驻留只接受一个或更多 RAW4D 文件。');
+    if (files.length === 0 || files.some((file) => !/\.(?:raw4d|ply4)$/i.test(file.name))) {
+      throw new Error('系统内存片段驻留只接受一个或更多 RAW4D / PLY4 文件。');
     }
     this.cancelImport();
     const controller = new AbortController();
@@ -1716,7 +1863,13 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
           transport: 'transferable',
           pinned: true,
         });
-        tracked.push({ lease, stop: edits.onChange(() => lease.resize(edits.byteLength)) });
+        tracked.push({
+          lease,
+          stop: edits.onChange((event) => {
+            lease.resize(edits.byteLength);
+            if (event.kind === 'deleted') this.requestGaussianEnvelopeUpdate();
+          }),
+        });
       }
     } catch (error) {
       for (const entry of tracked) {
@@ -1783,6 +1936,7 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
     this.raw4DSequenceGpuOrder = order;
     this.raw4DSequenceActiveIndex = -1;
     this.assetDisposer = this.raw4DSequenceAssetDisposer;
+    this.requestGaussianEnvelopeUpdate(0);
   }
 
   isResidentRaw4DGpuReady(handle: ViewportResidentRaw4DSegment): boolean {
@@ -1950,7 +2104,10 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
       throw error;
     }
     const stopTrackingEditMemory = editLease
-      ? raw4D.edits.onChange(() => editLease!.resize(raw4D.edits.byteLength))
+      ? raw4D.edits.onChange((event) => {
+        editLease!.resize(raw4D.edits.byteLength);
+        if (event.kind === 'deleted') this.requestGaussianEnvelopeUpdate();
+      })
       : () => undefined;
     raw4D.setFrame(0);
     raw4D.setAllMode(this.renderMode === 'all');
@@ -2094,6 +2251,7 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
     }
     this.raw4DSequenceGpuOrder = [];
     this.raw4DSequenceActiveIndex = -1;
+    this.clearGaussianEnvelope();
     this.memoryCoordinator?.gpuPool.trim();
   }
 
@@ -2170,7 +2328,10 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
       throw error;
     }
     const stopTrackingEditMemory = editLease
-      ? raw4D.edits.onChange(() => editLease!.resize(raw4D.edits.byteLength))
+      ? raw4D.edits.onChange((event) => {
+        editLease!.resize(raw4D.edits.byteLength);
+        if (event.kind === 'deleted') this.requestGaussianEnvelopeUpdate();
+      })
       : () => undefined;
     raw4D.setFrame(this.pendingFrame);
     raw4D.setAllMode(this.renderMode === 'all');
@@ -2187,9 +2348,10 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
     if (!this.gaussianSelectionSequence) this.history.clear();
     this.activeRaw4D = raw4D;
     this.activeRaw4DAsset = residentAsset.value;
-    this.activeRaw4DSource = loadedAsset.format === 'RAW4D' ? file : null;
+    this.activeRaw4DSource = loadedAsset.format === 'RAW4D' || loadedAsset.format === 'PLY4' ? file : null;
     this.activeFormat = loadedAsset.format;
     this.memoryCoordinator.setActiveCpuPage(residentAsset.id);
+    if (!this.gaussianSelectionSequence) this.requestGaussianEnvelopeUpdate(0);
     this.applyTransform(raw4D.entity, this.pendingTransform);
     // #WDD-gpt  2026-08-15 - 仅在存在活动 Gaussian 时挂载网格深度代理，避免空场景保留已销毁的绘制实例。
     this.guides?.setGaussianDepthSourceEnabled(true);
@@ -2261,6 +2423,7 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
     this.activeRaw4DAsset = null;
     this.activeRaw4DSource = null;
     this.activeFormat = null;
+    this.clearGaussianEnvelope();
     this.gaussianSelectionSequence?.releaseEdits();
     this.gaussianSelectionSequence = null;
     this.clearGS2Mesh();
@@ -2636,12 +2799,20 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
   }
 
   private publishSelectionState(state: ViewportSelectionState): void {
+    const activeEdits = this.activeRaw4D?.edits ?? null;
     this.options.onSelectionChange?.({
       ...state,
       deletedCount: this.gaussianDeletionCount(),
       pointCount: this.gaussianSelectionSequence?.edits.totalPointCount
         ?? this.activeRaw4D?.splatCount
         ?? 0,
+      // #WDD-gpt 2026-08-16 - 当前帧统计只扣除当前活动片段的删除位，不将其他片段的全局删除重复计入。
+      currentFrameDisplayedCount: Math.max(
+        0,
+        this.gaussianSelectionSequence?.edits.activeUndeletedCount()
+          ?? ((activeEdits?.pointCount ?? this.activeRaw4D?.splatCount ?? 0)
+            - (activeEdits?.deletionCount ?? 0)),
+      ),
     });
   }
 
@@ -3067,6 +3238,7 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
     entity.setLocalPosition(...transform.position);
     entity.setLocalEulerAngles(...transform.rotation);
     entity.setLocalScale(...transform.scale);
+    this.guides?.setGaussianEnvelopeTransform(transform);
   }
 
   private transformsEqual(first: ViewportTransform, second: ViewportTransform): boolean {
@@ -3089,8 +3261,12 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
   private applyHistoricalTransform(transform: ViewportTransform): void {
     this.pendingTransform = this.cloneTransform(transform);
     const entity = this.activeRaw4D?.entity;
-    if (entity) this.applyTransform(entity, this.pendingTransform);
+    if (entity) {
+      this.applyTransform(entity, this.pendingTransform);
+      this.gs2MeshObject?.syncTransform(entity);
+    }
     this.activeGizmo()?.update();
+    this.guides?.setGaussianEnvelopeTransform(this.pendingTransform);
     this.syncSceneTransformDataset(this.pendingTransform);
     this.options.onTransformChange?.(this.getSceneTransform());
   }
@@ -3101,6 +3277,75 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
       rotation: transform.rotation,
       scale: transform.scale,
     });
+  }
+
+  private collectGaussianEnvelopeSources(): readonly GaussianEnvelopeSource[] {
+    const sequence = this.gaussianSelectionSequence;
+    if (sequence && this.raw4DSequenceGpuOrder.length === sequence.edits.segmentCount) {
+      return this.raw4DSequenceGpuOrder.map((residentId, segmentIndex) => ({
+        asset: this.residentRaw4DSegments.get(residentId)!.loaded.asset,
+        edits: sequence.edits.segment(segmentIndex).edits,
+      }));
+    }
+    return this.activeRaw4DAsset && this.activeRaw4D
+      ? [{ asset: this.activeRaw4DAsset, edits: this.activeRaw4D.edits }]
+      : [];
+  }
+
+  private requestGaussianEnvelopeUpdate(delayMilliseconds = 120): void {
+    const generation = ++this.gaussianEnvelopeGeneration;
+    if (this.gaussianEnvelopeTimer !== null) window.clearTimeout(this.gaussianEnvelopeTimer);
+    const sources = this.collectGaussianEnvelopeSources();
+    if (sources.length === 0) {
+      this.gaussianEnvelopeTimer = null;
+      this.guides?.setGaussianEnvelope(null, this.pendingTransform);
+      delete this.canvas.dataset.gaussianEnvelopePoints;
+      this.canvas.dataset.gaussianEnvelopeState = 'empty';
+      return;
+    }
+    this.canvas.dataset.gaussianEnvelopeState = 'pending';
+    this.gaussianEnvelopeTimer = window.setTimeout(() => {
+      this.gaussianEnvelopeTimer = null;
+      void this.rebuildGaussianEnvelope(sources, generation);
+    }, Math.max(0, delayMilliseconds));
+  }
+
+  private async rebuildGaussianEnvelope(
+    sources: readonly GaussianEnvelopeSource[],
+    generation: number,
+  ): Promise<void> {
+    this.canvas.dataset.gaussianEnvelopeState = 'computing';
+    try {
+      const envelope = await computeGaussianEnvelopeMesh(
+        sources,
+        () => generation !== this.gaussianEnvelopeGeneration || this.destroyRequested,
+      );
+      if (generation !== this.gaussianEnvelopeGeneration || this.destroyRequested) return;
+      this.guides?.setGaussianEnvelope(envelope, this.pendingTransform);
+      if (envelope) {
+        this.canvas.dataset.gaussianEnvelopePoints = String(envelope.activePointCount);
+        this.canvas.dataset.gaussianEnvelopeFaces = String(envelope.triangleIndices.length / 3);
+        this.canvas.dataset.gaussianEnvelopeState = 'ready';
+      } else {
+        delete this.canvas.dataset.gaussianEnvelopePoints;
+        delete this.canvas.dataset.gaussianEnvelopeFaces;
+        this.canvas.dataset.gaussianEnvelopeState = 'empty';
+      }
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') return;
+      this.canvas.dataset.gaussianEnvelopeState = 'error';
+      console.warn('Gaussian envelope calculation failed.', error);
+    }
+  }
+
+  private clearGaussianEnvelope(): void {
+    this.gaussianEnvelopeGeneration += 1;
+    if (this.gaussianEnvelopeTimer !== null) window.clearTimeout(this.gaussianEnvelopeTimer);
+    this.gaussianEnvelopeTimer = null;
+    this.guides?.setGaussianEnvelope(null, this.pendingTransform);
+    delete this.canvas.dataset.gaussianEnvelopePoints;
+    delete this.canvas.dataset.gaussianEnvelopeFaces;
+    this.canvas.dataset.gaussianEnvelopeState = 'empty';
   }
 
   private cloneTransform(transform: ViewportTransform): ViewportTransform {
@@ -3417,6 +3662,7 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
   private publishActiveTransform(): void {
     const entity = this.activeRaw4D?.entity;
     if (!entity) return;
+    this.gs2MeshObject?.syncTransform(entity);
     const position = entity.getLocalPosition();
     const rotation = entity.getLocalEulerAngles();
     const scale = entity.getLocalScale();
@@ -3425,6 +3671,7 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
       rotation: [rotation.x, rotation.y, rotation.z],
       scale: [scale.x, scale.y, scale.z],
     };
+    this.guides?.setGaussianEnvelopeTransform(this.pendingTransform);
     this.syncSceneTransformDataset(this.pendingTransform);
     this.options.onTransformChange?.(this.pendingTransform);
   }

@@ -168,7 +168,9 @@ export function encodeSo3Rotations(segments, layout, bankCounts, options = {}) {
     return reconstructed;
   };
   for (let segmentIndex = 0; segmentIndex < segments.length; segmentIndex += 1) {
-    if (bankCounts[segmentIndex] !== 2) throw new Error('SO(3) codec expects two Rotation banks per segment.');
+    if (!Number.isInteger(bankCounts[segmentIndex]) || bankCounts[segmentIndex] < 1) {
+      throw new Error('SO(3) codec requires at least one Rotation bank per segment.');
+    }
     const segment = segments[segmentIndex];
     const active = layout.activeSlots[segmentIndex];
     const inverse = layout.slotToLocal[segmentIndex];
@@ -191,13 +193,17 @@ export function encodeSo3Rotations(segments, layout, bankCounts, options = {}) {
         start = halfQuaternion(applyTangent(previous, codes.map((value) => value * step)));
       }
       start = accept(startSource, start, bitsAt(0)); ordinal += 1;
-      const endSource = sourceQuaternion(segment, local, 1);
-      const vector = tangent(start, endSource);
-      const codes = vector.map((value) => Math.round(value / step));
-      for (let axis = 0; axis < 3; axis += 1) context.endpoint[axis].sint(codes[axis]);
-      let end = halfQuaternion(applyTangent(start, codes.map((value) => value * step)));
-      end = accept(endSource, end, bitsAt(1)); ordinal += 1;
-      state.set(end, slot * 4);
+      let previous = start;
+      for (let bank = 1; bank < bankCounts[segmentIndex]; bank += 1) {
+        const source = sourceQuaternion(segment, local, bank);
+        const vector = tangent(previous, source);
+        const codes = vector.map((value) => Math.round(value / step));
+        for (let axis = 0; axis < 3; axis += 1) context.endpoint[axis].sint(codes[axis]);
+        let reconstructed = halfQuaternion(applyTangent(previous, codes.map((value) => value * step)));
+        reconstructed = accept(source, reconstructed, bitsAt(bank)); ordinal += 1;
+        previous = reconstructed;
+      }
+      state.set(previous, slot * 4);
       initialized[slot] = 1;
     }
   }
@@ -280,13 +286,16 @@ export function prepareSo3RotationStreams(metadata, streams, manifest, activeSlo
   const seen = new Uint8Array(manifest.slotCount);
   let instanceCount = 0;
   let boundaryCount = 0;
-  for (const active of activeSlots) {
+  let intraCount = 0;
+  for (let segmentIndex = 0; segmentIndex < activeSlots.length; segmentIndex += 1) {
+    const active = activeSlots[segmentIndex];
     for (let row = 0; row < active.length; row += 1) {
       const slot = active[row];
       if (seen[slot]) boundaryCount += 1;
       else seen[slot] = 1;
       instanceCount += 1;
     }
+    intraCount += active.length * (metadata.bankCounts[segmentIndex] - 1);
   }
   const boundary = Array.from({ length: 3 }, (_, axis) => {
     const values = int32Storage(boundaryCount, shared);
@@ -295,7 +304,7 @@ export function prepareSo3RotationStreams(metadata, streams, manifest, activeSlo
     return values;
   });
   const endpoint = Array.from({ length: 3 }, (_, axis) => {
-    const values = int32Storage(instanceCount, shared);
+    const values = int32Storage(intraCount, shared);
     for (let index = 0; index < values.length; index += 1) values[index] = context.endpoint[axis].sint();
     context.endpoint[axis].done();
     return values;
@@ -303,12 +312,14 @@ export function prepareSo3RotationStreams(metadata, streams, manifest, activeSlo
   const expectedObservations = metadata.bankCounts.reduce(
     (sum, count, segmentIndex) => sum + count * activeSlots[segmentIndex].length, 0,
   );
-  if (expectedObservations !== instanceCount * 2) throw new Error('SO(3) codec expects two Rotation banks per segment.');
+  if (expectedObservations !== instanceCount + intraCount) throw new Error('SO(3) Rotation bank observation count mismatch.');
   return {
     bits: metadata.bits,
     stepDegrees: metadata.stepDegrees,
     slotCount: manifest.slotCount,
     instanceCount,
+    intraCount,
+    bankCounts: metadata.bankCounts,
     boundaryCount,
     exceptionCount,
     birthLargest,
@@ -336,14 +347,16 @@ export function decodeSo3RotationPartition(prepared, manifest, activeSlots, rows
   const step = prepared.stepDegrees * Math.PI / 180;
   const state = new Float32Array(manifest.slotCount * 4);
   const seen = new Uint8Array(manifest.slotCount);
-  const propertyOffsets = manifest.segments.map((_, segmentIndex) => [0, 1].map((bank) => ['w', 'x', 'y', 'z'].map((component) => {
+  const propertyOffsets = manifest.segments.map((segment, segmentIndex) => Array.from({ length: segment.bankCounts.rotation }, (_, bank) => ['w', 'x', 'y', 'z'].map((component) => {
     const property = indices[segmentIndex].get(`rot_bank_${bank}_${component}`);
     if (property === undefined) throw new Error(`SO(3) property layout missing for segment ${segmentIndex}, bank ${bank}, ${component}.`);
     return property;
   })));
   let instance = 0;
   let boundaryIndex = 0;
-  let processedInstances = 0;
+  let intraIndex = 0;
+  let observationOrdinal = 0;
+  let processedObservations = 0;
   for (let segmentIndex = 0; segmentIndex < manifest.segments.length; segmentIndex += 1) {
     const rowValues = rows[segmentIndex];
     const stride = indices[segmentIndex].size;
@@ -354,10 +367,14 @@ export function decodeSo3RotationPartition(prepared, manifest, activeSlots, rows
       if (!continuing) seen[slot] = 1;
       const currentBoundary = boundaryIndex;
       if (continuing) boundaryIndex += 1;
-      const currentInstance = instance;
       instance += 1;
+      const bankCount = prepared.bankCounts[segmentIndex];
+      const currentIntraIndex = intraIndex;
+      intraIndex += bankCount - 1;
+      const currentObservationOrdinal = observationOrdinal;
+      observationOrdinal += bankCount;
       if (slot % partitionCount !== partitionIndex) continue;
-      processedInstances += 1;
+      processedObservations += bankCount;
       let start;
       if (!continuing) {
         const birthOffset = slot * 3;
@@ -373,27 +390,33 @@ export function decodeSo3RotationPartition(prepared, manifest, activeSlots, rows
           prepared.boundary[2][currentBoundary] * step,
         ]));
       }
-      const startOrdinal = currentInstance * 2;
+      const startOrdinal = currentObservationOrdinal;
       const startException = exceptions.get(startOrdinal);
       const startBits = startException ?? start.map(floatToHalf);
       if (startException) start = normalized(startBits.map(halfToFloat));
       const rowOffset = row * stride;
       for (let axis = 0; axis < 4; axis += 1) rowValues[rowOffset + offsets[0][axis]] = startBits[axis];
-      let end = halfQuaternion(applyTangent(start, [
-        prepared.endpoint[0][currentInstance] * step,
-        prepared.endpoint[1][currentInstance] * step,
-        prepared.endpoint[2][currentInstance] * step,
-      ]));
-      const endException = exceptions.get(startOrdinal + 1);
-      const endBits = endException ?? end.map(floatToHalf);
-      if (endException) end = normalized(endBits.map(halfToFloat));
-      for (let axis = 0; axis < 4; axis += 1) rowValues[rowOffset + offsets[1][axis]] = endBits[axis];
-      state.set(end, slot * 4);
+      let previous = start;
+      for (let bank = 1; bank < bankCount; bank += 1) {
+        const endpoint = currentIntraIndex + bank - 1;
+        let reconstructed = halfQuaternion(applyTangent(previous, [
+          prepared.endpoint[0][endpoint] * step,
+          prepared.endpoint[1][endpoint] * step,
+          prepared.endpoint[2][endpoint] * step,
+        ]));
+        const exception = exceptions.get(startOrdinal + bank);
+        const bits = exception ?? reconstructed.map(floatToHalf);
+        if (exception) reconstructed = normalized(bits.map(halfToFloat));
+        for (let axis = 0; axis < 4; axis += 1) rowValues[rowOffset + offsets[bank][axis]] = bits[axis];
+        previous = reconstructed;
+      }
+      state.set(previous, slot * 4);
     }
   }
-  if (instance !== prepared.instanceCount || boundaryIndex !== prepared.boundaryCount) throw new Error('SO(3) partition traversal mismatch.');
+  if (instance !== prepared.instanceCount || boundaryIndex !== prepared.boundaryCount
+    || intraIndex !== prepared.intraCount) throw new Error('SO(3) partition traversal mismatch.');
   return {
-    observationCount: processedInstances * 2,
+    observationCount: processedObservations,
     appliedExceptions: prepared.exceptionCount,
     stepDegrees: prepared.stepDegrees,
   };
@@ -403,6 +426,6 @@ export function decodeSo3RotationPartition(prepared, manifest, activeSlots, rows
 export function decodeSo3RotationStreams(metadata, streams, manifest, activeSlots, rows, indices) {
   const prepared = prepareSo3RotationStreams(metadata, streams, manifest, activeSlots, false);
   const result = decodeSo3RotationPartition(prepared, manifest, activeSlots, rows, indices);
-  if (result.observationCount !== prepared.instanceCount * 2) throw new Error('SO(3) observation mismatch.');
+  if (result.observationCount !== prepared.instanceCount + prepared.intraCount) throw new Error('SO(3) observation mismatch.');
   return result;
 }

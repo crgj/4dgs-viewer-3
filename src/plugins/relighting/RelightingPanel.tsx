@@ -15,6 +15,7 @@ const COPY = {
     missingMesh: '请先在 GS2Mesh 插件中生成当前帧 Mesh。',
     ready: 'Mesh 代理已就绪。启用后可在视口拖动所选光源。',
     enabled: '启用重光照',
+    meshVisible: '显示 Mesh',
     blend: '影响强度',
     brightness: '光照亮度',
     background: '代理外亮度',
@@ -37,6 +38,7 @@ const COPY = {
     missingMesh: 'Generate the current-frame mesh in GS2Mesh first.',
     ready: 'The mesh proxy is ready. Enable relighting, then drag the selected light in the viewport.',
     enabled: 'Enable relighting',
+    meshVisible: 'Show mesh',
     blend: 'Influence',
     brightness: 'Lighting brightness',
     background: 'Outside-proxy brightness',
@@ -57,10 +59,12 @@ const COPY = {
 interface RelightingPanelProps {
   readonly hasMesh: boolean;
   readonly language: UiLanguage;
+  readonly meshVisible: boolean;
   readonly state: RelightingState;
   readonly onAddLight: () => void;
   readonly onEnabledChange: (enabled: boolean) => void;
   readonly onLightChange: (id: string, patch: RelightingLightPatch) => void;
+  readonly onMeshVisibleChange: (visible: boolean) => void;
   readonly onRemoveLight: (id: string) => void;
   readonly onSelectLight: (id: string) => void;
   readonly onSettingsChange: (patch: Partial<RelightingSettings>) => void;
@@ -71,10 +75,12 @@ const axes = ['X', 'Y', 'Z'] as const;
 export function RelightingPanel({
   hasMesh,
   language,
+  meshVisible,
   state,
   onAddLight,
   onEnabledChange,
   onLightChange,
+  onMeshVisibleChange,
   onRemoveLight,
   onSelectLight,
   onSettingsChange,
@@ -100,6 +106,16 @@ export function RelightingPanel({
           checked={state.enabled}
           disabled={!hasMesh}
           onChange={(event) => onEnabledChange(event.target.checked)}
+          type="checkbox"
+        />
+      </label>
+
+      <label className="relighting-master-toggle">
+        <span><strong>{copy.meshVisible}</strong><small>{meshVisible ? 'ON' : 'OFF'}</small></span>
+        <input
+          checked={meshVisible}
+          disabled={!hasMesh}
+          onChange={(event) => onMeshVisibleChange(event.target.checked)}
           type="checkbox"
         />
       </label>

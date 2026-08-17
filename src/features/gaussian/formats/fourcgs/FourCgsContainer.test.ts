@@ -6,6 +6,7 @@ import {
   writeFourCgsFile,
 } from './FourCgsContainer';
 import type { FourCgsManifest, FourCgsSegment } from './FourCgsTypes';
+import { RAW4D_BUNDLE_CODEC_NAME } from './FourCgsRaw4DBundle';
 
 const segments: FourCgsSegment[] = [
   { name: 'segment_180_210', firstFrame: 180, lastFrame: 210, gaussianCount: 2, totalFrames: 31, bankCounts: { position: 11, rotation: 2, colorDc: 2, scale: 4, opacity: 4 } },
@@ -13,8 +14,8 @@ const segments: FourCgsSegment[] = [
   { name: 'segment_240_259', firstFrame: 240, lastFrame: 259, gaussianCount: 2, totalFrames: 20, bankCounts: { position: 8, rotation: 2, colorDc: 2, scale: 3, opacity: 3 } },
 ];
 
-function fixture(metadata?: unknown): File {
-  const names = ['active_masks', 'prs_position', 'so3_rotation', 'tattr_scale', 'tattr_dc', 'mixsc_opacity', 'lifetime_mu', 'lifetime_w', 'coresh5r_shared'];
+function fixture(metadata?: unknown, scaleNames: readonly string[] = ['tattr_scale']): File {
+  const names = ['active_masks', 'prs_position', 'so3_rotation', ...scaleNames, 'tattr_dc', 'mixsc_opacity', 'lifetime_mu', 'lifetime_w', 'coresh5r_shared'];
   const manifest: FourCgsManifest = {
     format: '4CGS', version: 2, codecName: 'fixture-v24', slotCount: 3,
     firstFrame: 180, lastFrame: 259, uniqueFrameCount: 80, segments,
@@ -32,9 +33,41 @@ function fixture(metadata?: unknown): File {
   return new File([header, manifestBytes, new Uint8Array(names.length)], 'fixture.4cgs');
 }
 
+function raw4DBundleFixture(): File {
+  const bundleSegments = segments.slice(0, 2);
+  const manifest: FourCgsManifest = {
+    format: '4CGS', version: 2, codecName: RAW4D_BUNDLE_CODEC_NAME, slotCount: 3,
+    firstFrame: 180, lastFrame: 240, uniqueFrameCount: 61, segments: bundleSegments,
+    streams: [5, 6].map((sourceBytes, index) => ({
+      name: `raw4d_segment:${index}:0`,
+      compression: 'deflate-shuffle16' as const,
+      rawBytes: sourceBytes + (sourceBytes & 1), storedBytes: 1,
+      rawSha256: `${index}`.repeat(64), storedSha256: `${index + 2}`.repeat(64),
+    })),
+    crop: { center: [0, 0, 0], halfExtent: 1 }, prs: { mode: 'raw4d-lossless-bundle' },
+    metadata: {
+      raw4dBundle: {
+        version: 1,
+        chunkBytes: 8,
+        segmentChunkCounts: [1, 1],
+        sourceNames: ['first.raw4d', 'second.raw4d'],
+        sourceByteLengths: [5, 6],
+        sourceSha256: ['a'.repeat(64), 'b'.repeat(64)],
+        exactSourceBytes: true,
+      },
+    },
+  };
+  const manifestBytes = new TextEncoder().encode(JSON.stringify(manifest));
+  const header = new Uint8Array(12);
+  header.set(new TextEncoder().encode(FOUR_CGS_MAGIC));
+  new DataView(header.buffer).setUint32(8, manifestBytes.length, true);
+  return new File([header, manifestBytes, new Uint8Array(2)], 'dynamic.4cgs');
+}
+
 describe('4CGS container', () => {
   it('maps duplicate boundary frames to the following segment', () => {
     expect(locateFourCgsFrame(segments, 29)).toEqual({ segmentIndex: 0, localFrame: 29, sourceFrame: 209 });
+    expect(locateFourCgsFrame(segments, 29.5)).toEqual({ segmentIndex: 0, localFrame: 29.5, sourceFrame: 209.5 });
     expect(locateFourCgsFrame(segments, 30)).toEqual({ segmentIndex: 1, localFrame: 0, sourceFrame: 210 });
     expect(locateFourCgsFrame(segments, 79)).toEqual({ segmentIndex: 2, localFrame: 19, sourceFrame: 259 });
   });
@@ -45,6 +78,27 @@ describe('4CGS container', () => {
     expect(manifest.codecName).toBe('fixture-v24');
     const output = await writeFourCgsFile(source);
     expect(new Uint8Array(await output.arrayBuffer())).toEqual(new Uint8Array(await source.arrayBuffer()));
+  });
+
+  it('accepts the V2.6 three-way Scale streams used by parallel encoding', async () => {
+    const source = fixture(undefined, ['tattr_scale_0', 'tattr_scale_1', 'tattr_scale_2']);
+    const { manifest } = await readFourCgsManifest(source);
+    expect(manifest.streams.filter((stream) => stream.name.startsWith('tattr_scale_')).map((stream) => stream.name))
+      .toEqual(['tattr_scale_0', 'tattr_scale_1', 'tattr_scale_2']);
+  });
+
+  it('rejects an incomplete V2.6 Scale axis set', async () => {
+    await expect(readFourCgsManifest(fixture(undefined, ['tattr_scale_0', 'tattr_scale_1'])))
+      .rejects.toThrow('Scale 三轴流不完整');
+  });
+
+  it('accepts a self-contained bundle encoded from the current dragged RAW4D files', async () => {
+    const source = raw4DBundleFixture();
+    const { manifest } = await readFourCgsManifest(source);
+    expect(manifest.codecName).toBe(RAW4D_BUNDLE_CODEC_NAME);
+    expect(manifest.metadata?.raw4dBundle?.sourceNames).toEqual(['first.raw4d', 'second.raw4d']);
+    expect(new Uint8Array(await (await writeFourCgsFile(source)).arrayBuffer()))
+      .toEqual(new Uint8Array(await source.arrayBuffer()));
   });
 
   it('round-trips the complete scene transform while preserving compressed stream bytes', async () => {

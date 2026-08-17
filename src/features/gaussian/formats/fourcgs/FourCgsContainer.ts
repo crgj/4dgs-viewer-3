@@ -6,6 +6,7 @@ import type {
   FourCgsSegment,
   FourCgsStreamEntry,
 } from './FourCgsTypes';
+import { RAW4D_BUNDLE_CODEC_NAME, paddedEvenLength, raw4DBundleStreamName } from './FourCgsRaw4DBundle';
 
 export const FOUR_CGS_MAGIC = '4CGSPRS2';
 export const FOUR_CGS_HEADER_BYTES = 12;
@@ -79,6 +80,37 @@ function validateMetadata(value: unknown): FourCgsMetadata | undefined {
   };
 }
 
+function validateRaw4DBundle(manifest: Partial<FourCgsManifest>, segments: readonly FourCgsSegment[], streams: readonly FourCgsStreamEntry[]): void {
+  const bundle = manifest.metadata?.raw4dBundle;
+  if (!bundle || bundle.version !== 1 || bundle.exactSourceBytes !== true) throw new Error('4CGS RAW4D Bundle 缺少有效元数据。');
+  const count = segments.length;
+  if (!Number.isSafeInteger(bundle.chunkBytes) || bundle.chunkBytes <= 0 || bundle.chunkBytes % 2 !== 0
+    || ![bundle.segmentChunkCounts, bundle.sourceNames, bundle.sourceByteLengths, bundle.sourceSha256]
+      .every((values) => Array.isArray(values) && values.length === count)) {
+    throw new Error('4CGS RAW4D Bundle 段目录长度不一致。');
+  }
+  let expectedStreamCount = 0;
+  for (let index = 0; index < count; index += 1) {
+    const sourceBytes = bundle.sourceByteLengths[index];
+    const chunkCount = bundle.segmentChunkCounts[index];
+    if (typeof bundle.sourceNames[index] !== 'string' || bundle.sourceNames[index].length === 0
+      || !Number.isSafeInteger(sourceBytes) || sourceBytes <= 0
+      || !Number.isSafeInteger(chunkCount) || chunkCount !== Math.ceil(sourceBytes / bundle.chunkBytes)
+      || !/^[0-9a-f]{64}$/i.test(bundle.sourceSha256[index] ?? '')) {
+      throw new Error(`4CGS RAW4D Bundle 第 ${index + 1} 段目录无效。`);
+    }
+    expectedStreamCount += chunkCount;
+    for (let chunkIndex = 0; chunkIndex < chunkCount; chunkIndex += 1) {
+      const chunkSourceBytes = Math.min(bundle.chunkBytes, sourceBytes - chunkIndex * bundle.chunkBytes);
+      const stream = streams.find((entry) => entry.name === raw4DBundleStreamName(index, chunkIndex));
+      if (!stream || stream.compression !== 'deflate-shuffle16' || stream.rawBytes !== paddedEvenLength(chunkSourceBytes)) {
+        throw new Error(`4CGS RAW4D Bundle 第 ${index + 1} 段第 ${chunkIndex + 1} 块目录无效。`);
+      }
+    }
+  }
+  if (streams.length !== expectedStreamCount) throw new Error('4CGS RAW4D Bundle 包含未登记的额外流。');
+}
+
 function sceneTransformsEqual(first: FourCgsSceneTransform, second: FourCgsSceneTransform): boolean {
   return first.schemaVersion === second.schemaVersion
     && first.coordinateSystem === second.coordinateSystem
@@ -103,6 +135,7 @@ function validateSegment(value: unknown, index: number): FourCgsSegment {
   positiveInteger(segment.totalFrames, `${segment.name}.totalFrames`);
   for (const key of ['position', 'rotation', 'colorDc', 'scale', 'opacity'] as const) {
     positiveInteger(segment.bankCounts[key], `${segment.name}.bankCounts.${key}`);
+    if (segment.keyframeStrides) positiveInteger(segment.keyframeStrides[key], `${segment.name}.keyframeStrides.${key}`);
   }
   if (!Number.isSafeInteger(segment.firstFrame) || !Number.isSafeInteger(segment.lastFrame) || segment.lastFrame! < segment.firstFrame!) {
     throw new Error(`4CGS ${segment.name} 帧范围无效。`);
@@ -113,7 +146,7 @@ function validateSegment(value: unknown, index: number): FourCgsSegment {
 function validateStream(value: unknown, index: number): FourCgsStreamEntry {
   if (!value || typeof value !== 'object') throw new Error(`4CGS 第 ${index + 1} 条流清单无效。`);
   const stream = value as Partial<FourCgsStreamEntry>;
-  if (typeof stream.name !== 'string' || !['raw', 'deflate', 'brotli', 'brotli-shuffle16'].includes(stream.compression ?? '')) {
+  if (typeof stream.name !== 'string' || !['raw', 'deflate', 'deflate-shuffle16', 'brotli', 'brotli-shuffle16'].includes(stream.compression ?? '')) {
     throw new Error(`4CGS 第 ${index + 1} 条流名称或压缩方式无效。`);
   }
   positiveInteger(stream.rawBytes, `${stream.name}.rawBytes`);
@@ -142,9 +175,24 @@ export function validateFourCgsManifest(value: unknown, fileBytes?: number): Fou
     if (streamNames.has(stream.name)) throw new Error(`4CGS 流名称重复：${stream.name}。`);
     streamNames.add(stream.name);
   }
-  const required = ['active_masks', 'prs_position', 'so3_rotation', 'tattr_scale', 'tattr_dc', 'mixsc_opacity', 'lifetime_mu', 'lifetime_w', 'coresh5r_shared'];
-  const missing = required.find((name) => !streamNames.has(name));
-  if (missing) throw new Error(`4CGS V2.4 缺少必需流：${missing}。`);
+  if (manifest.codecName === RAW4D_BUNDLE_CODEC_NAME) {
+    // #WDD-gpt 2026-08-16 - 动态 RAW4D Bundle 直接保存本次拖入段，不得拿 V2.4 属性流目录误判或偷偷回退到固定成品。
+    validateRaw4DBundle({ ...manifest, metadata }, segments, streams);
+  } else {
+    // #WDD-gpt 2026-08-16 - V2.6 可把 Scale 三轴独立压缩以并行编码；继续接受旧版单一 tattr_scale 流。
+    const required = ['active_masks', 'prs_position', 'so3_rotation', 'tattr_dc', 'mixsc_opacity', 'lifetime_mu', 'lifetime_w', 'coresh5r_shared'];
+    const missing = required.find((name) => !streamNames.has(name));
+    if (missing) throw new Error(`4CGS V2.4 缺少必需流：${missing}。`);
+    const hasLegacyScale = streamNames.has('tattr_scale');
+    const scaleAxisNames = ['tattr_scale_0', 'tattr_scale_1', 'tattr_scale_2'];
+    const hasSplitScale = scaleAxisNames.every((name) => streamNames.has(name));
+    if (!hasLegacyScale && !hasSplitScale) {
+      const partialAxis = scaleAxisNames.find((name) => streamNames.has(name));
+      throw new Error(partialAxis
+        ? '4CGS V2.6 的 Scale 三轴流不完整。'
+        : '4CGS V2.4 缺少必需流：tattr_scale。');
+    }
+  }
   if (fileBytes !== undefined) {
     const storedBytes = streams.reduce((sum, stream) => sum + stream.storedBytes, 0);
     const manifestBytes = new TextEncoder().encode(JSON.stringify(value)).byteLength;
@@ -176,12 +224,12 @@ export async function readFourCgsManifest(source: Blob): Promise<{ manifest: Fou
   return { manifest, manifestBytes };
 }
 
-// #WDD-gpt 2026-08-16 - 六段边界帧只出现一次；边界时选择后一段 local=0，完整时间轴严格保持 180 帧。
+// #WDD-gpt 2026-08-16 - 保留浮点帧时间用于关键帧间插值；六段重复边界仍选择后一段 local=0。
 export function locateFourCgsFrame(segments: readonly FourCgsSegment[], globalFrame: number): FourCgsFrameLocation {
   if (segments.length === 0) throw new Error('4CGS 没有时间段。');
   const firstFrame = segments[0].firstFrame;
   const lastFrame = segments.at(-1)!.lastFrame;
-  const sourceFrame = Math.max(firstFrame, Math.min(lastFrame, firstFrame + Math.round(globalFrame)));
+  const sourceFrame = Math.max(firstFrame, Math.min(lastFrame, firstFrame + globalFrame));
   let segmentIndex = 0;
   for (let index = 1; index < segments.length; index += 1) {
     if (segments[index].firstFrame <= sourceFrame) segmentIndex = index;

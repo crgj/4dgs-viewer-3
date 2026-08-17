@@ -3,7 +3,7 @@
 import { Buffer } from 'buffer';
 import type { FourCgsManifest, FourCgsSegment } from './FourCgsTypes';
 
-type AttributeTask = 'position' | 'rotation' | 'scale' | 'dc';
+type AttributeTask = 'position' | 'rotation' | 'scale' | 'scale0' | 'scale1' | 'scale2' | 'dc';
 
 interface DecodeRequest {
   readonly task: AttributeTask;
@@ -81,12 +81,13 @@ async function decode(request: DecodeRequest): Promise<unknown> {
     const direct = await structuredCodec.decodeV21PositionContexts(stream);
     return prs.decodePositionContextStreams(direct.contexts, request.manifest, activeSlots, rows, indices);
   }
-  if (request.task === 'scale') {
+  if (request.task.startsWith('scale')) {
     const [attributeCodec, structuredCodec] = await Promise.all([
       import('../../../../../scripts/fourcgs-temporal-attribute-codec.mjs'),
       import('../../../../../scripts/fourcgs-v21-lossless-codec.mjs'),
     ]);
-    const direct = await structuredCodec.decodeV22ScaleReaders(stream);
+    const streamName = request.task === 'scale' ? 'tattr_scale' : `tattr_scale_${request.task.slice(-1)}`;
+    const direct = await structuredCodec.decodeV22ScaleReaders(stream, streamName);
     return attributeCodec.decodeTemporalAttributeReaders(direct.metadata, direct.readers, request.manifest, activeSlots, rows, indices);
   }
   if (request.task === 'rotation') {

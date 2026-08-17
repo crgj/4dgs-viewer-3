@@ -122,7 +122,8 @@ function decodeSharedSh(
   halfToFloat: (bits: number) => number,
   floatToHalf: (value: number) => number,
 ): void {
-  if (raw.subarray(0, 8).toString('ascii') !== 'C5T1SH01') throw new Error('不支持的 CoReSH-5R 共享流。');
+  const magic = raw.subarray(0, 8).toString('ascii');
+  if (magic !== 'C5T1SH01' && magic !== 'C5T2SH01') throw new Error('不支持的共享 SH 流。');
   const slotCount = raw.readUInt32LE(8);
   const instanceCount = raw.readUInt32LE(12);
   const segmentCount = raw.readUInt16LE(16);
@@ -131,18 +132,38 @@ function decodeSharedSh(
   const baseBytes = raw.readUInt32LE(20);
   const maskBytes = raw.readUInt32LE(24);
   const labelBytes = raw.readUInt32LE(28);
-  if (slotCount !== manifest.slotCount || segmentCount !== manifest.segments.length || dimensions !== 45 || levels !== 5) {
+  const headerBytes = magic === 'C5T2SH01' ? 40 : 32;
+  const exceptionMaskBytes = magic === 'C5T2SH01' ? raw.readUInt32LE(32) : 0;
+  const exceptionValueBytes = magic === 'C5T2SH01' ? raw.readUInt32LE(36) : 0;
+  if (slotCount !== manifest.slotCount || segmentCount !== manifest.segments.length || dimensions !== 45
+    || levels < 1 || levels > 32 || (magic === 'C5T1SH01' && levels !== 5)
+    || baseBytes !== 45 * 2 + levels * 256 * 45 * 2) {
     throw new Error('4CGS 共享 SH 元数据不一致。');
   }
-  const baseOffset = 32;
+  const baseOffset = headerBytes;
   const mean = new Float32Array(45);
   for (let dimension = 0; dimension < 45; dimension += 1) mean[dimension] = halfToFloat(raw.readUInt16LE(baseOffset + dimension * 2));
   const codebookOffset = baseOffset + 45 * 2;
-  const codebooks = new Float32Array(5 * 256 * 45);
+  const codebooks = new Float32Array(levels * 256 * 45);
   for (let index = 0; index < codebooks.length; index += 1) codebooks[index] = halfToFloat(raw.readUInt16LE(codebookOffset + index * 2));
-  const updateMask = unzlibSync(raw.subarray(baseOffset + baseBytes, baseOffset + baseBytes + maskBytes));
-  const updates = unzlibSync(raw.subarray(baseOffset + baseBytes + maskBytes, baseOffset + baseBytes + maskBytes + labelBytes));
-  const state = new Uint8Array(slotCount * 5);
+  const maskOffset = baseOffset + baseBytes;
+  const labelOffset = maskOffset + maskBytes;
+  const exceptionMaskOffset = labelOffset + labelBytes;
+  const exceptionValueOffset = exceptionMaskOffset + exceptionMaskBytes;
+  const updateMask = unzlibSync(raw.subarray(maskOffset, labelOffset));
+  const updates = unzlibSync(raw.subarray(labelOffset, exceptionMaskOffset));
+  const exceptionMask = magic === 'C5T2SH01'
+    ? unzlibSync(raw.subarray(exceptionMaskOffset, exceptionValueOffset))
+    : new Uint8Array(Math.ceil(instanceCount / 8));
+  const exceptionValues = magic === 'C5T2SH01'
+    ? unzlibSync(raw.subarray(exceptionValueOffset, exceptionValueOffset + exceptionValueBytes))
+    : new Uint8Array(0);
+  if (updateMask.byteLength !== Math.ceil(instanceCount / 8) || updates.byteLength % levels !== 0
+    || exceptionMask.byteLength !== Math.ceil(instanceCount / 8) || exceptionValues.byteLength % (45 * 2) !== 0
+    || exceptionValueOffset + exceptionValueBytes !== raw.byteLength) {
+    throw new Error('4CGS 共享 SH 压缩载荷长度不一致。');
+  }
+  const state = new Uint8Array(slotCount * levels);
   const initialized = new Uint8Array(slotCount);
   const decodedSh = new Uint16Array(slotCount * 45);
   const restOffsets = indices.map((properties, segmentIndex) => {
@@ -155,36 +176,31 @@ function decodeSharedSh(
   });
   let instance = 0;
   let updateOffset = 0;
-  // #WDD-gpt 2026-08-16 - CoReSH-5R 只在 Track 码字更新时重建 45D FP16，跨段未更新实例直接复用逐 Track 缓存。
+  let exceptionOffset = 0;
+  // #WDD-gpt 2026-08-16 - 共享 SH 解码支持输入自训练的 5/10/15 级模板及逐实例稀疏 FP16 质量修正。
   for (let segmentIndex = 0; segmentIndex < manifest.segments.length; segmentIndex += 1) {
     const stride = indices[segmentIndex].size;
     const rowValues = rows[segmentIndex];
     const restOffset = restOffsets[segmentIndex];
     for (let row = 0; row < activeSlots[segmentIndex].length; row += 1) {
       const slot = activeSlots[segmentIndex][row];
-      const stateOffset = slot * 5;
+      const stateOffset = slot * levels;
       const shOffset = slot * 45;
       const rowOffset = row * stride + restOffset;
       const updated = (updateMask[instance >>> 3] & (1 << (instance & 7))) !== 0;
       if (updated) {
-        state.set(updates.subarray(updateOffset, updateOffset + 5), stateOffset);
+        state.set(updates.subarray(updateOffset, updateOffset + levels), stateOffset);
         initialized[slot] = 1;
-        updateOffset += 5;
+        updateOffset += levels;
       }
       if (!initialized[slot]) throw new Error(`4CGS Track ${slot} 缺少 SH 初始化。`);
       if (updated) {
-        const code0 = state[stateOffset] * 45;
-        const code1 = (256 + state[stateOffset + 1]) * 45;
-        const code2 = (512 + state[stateOffset + 2]) * 45;
-        const code3 = (768 + state[stateOffset + 3]) * 45;
-        const code4 = (1024 + state[stateOffset + 4]) * 45;
         for (let dimension = 0; dimension < 45; dimension += 1) {
-          const bits = floatToHalf(mean[dimension]
-            + codebooks[code0 + dimension]
-            + codebooks[code1 + dimension]
-            + codebooks[code2 + dimension]
-            + codebooks[code3 + dimension]
-            + codebooks[code4 + dimension]);
+          let value = mean[dimension];
+          for (let level = 0; level < levels; level += 1) {
+            value += codebooks[(level * 256 + state[stateOffset + level]) * 45 + dimension];
+          }
+          const bits = floatToHalf(value);
           decodedSh[shOffset + dimension] = bits;
           rowValues[rowOffset + dimension] = bits;
         }
@@ -193,10 +209,19 @@ function decodeSharedSh(
           rowValues[rowOffset + dimension] = decodedSh[shOffset + dimension];
         }
       }
+      if (exceptionMask[instance >>> 3] & (1 << (instance & 7))) {
+        for (let dimension = 0; dimension < 45; dimension += 1) {
+          rowValues[rowOffset + dimension] = exceptionValues[exceptionOffset]
+            | (exceptionValues[exceptionOffset + 1] << 8);
+          exceptionOffset += 2;
+        }
+      }
       instance += 1;
     }
   }
-  if (instance !== instanceCount || updateOffset !== updates.length) throw new Error('4CGS 共享 SH 长度不一致。');
+  if (instance !== instanceCount || updateOffset !== updates.length || exceptionOffset !== exceptionValues.length) {
+    throw new Error('4CGS 共享 SH 长度不一致。');
+  }
 }
 
 async function decode(request: DecodeRequest): Promise<void> {

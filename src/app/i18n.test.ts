@@ -21,5 +21,16 @@ describe('UI localization', () => {
     expect(UI_COPY.zh.renderAll).toBe('全部');
     expect(UI_COPY.zh.grid).toBe('网格');
     expect(UI_COPY.zh.axes).toBe('坐标轴');
+    expect(UI_COPY.zh.heightRuler).toBe('身高尺');
+    expect(UI_COPY.zh.gaussianEnvelope).toBe('有效高斯外包络');
+    expect(UI_COPY.zh.meshVisibility).toBe('Mesh 显示');
+    expect(UI_COPY.zh.activeGaussianStatus).toBe('活跃高斯');
+    expect(UI_COPY.zh.currentFrameGaussianStatus).toBe('当前帧显示');
+    expect(UI_COPY.zh.deletedGaussianStatus).toBe('已删除高斯');
+    expect(UI_COPY.zh.modeLocalMaximum).toBe('高内存・高显存 · 32GB / 12GB');
+    expect(UI_COPY.zh.releaseNotes).toBe('更新信息');
+    expect(UI_COPY.zh.browserNotExposed).toBe('浏览器未开放');
+    expect(UI_COPY.zh.runtimePolicyActive).toBe('● 已生效');
+    expect(UI_COPY.zh.memoryPressureButton).toBe('压力测试');
   });
 });
