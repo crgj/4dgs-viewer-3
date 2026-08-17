@@ -3,6 +3,11 @@ import type {
   SmartAlignmentWorkerRequest,
   SmartAlignmentWorkerResponse,
 } from './SmartAlignmentWorkerProtocol';
+import {
+  restoreSmartAlignmentPoseRotation,
+  type SmartAlignmentImageRotation,
+} from './SmartAlignmentPoseRotation';
+import type { SmartAlignmentPose } from './SmartAlignmentTypes';
 
 interface SmartAlignmentWorkerScope {
   onmessage: ((event: MessageEvent<SmartAlignmentWorkerRequest>) => void) | null;
@@ -48,13 +53,51 @@ async function initialize(
   }
 }
 
+function detectPoses(source: ImageBitmap | OffscreenCanvas): SmartAlignmentPose[] {
+  if (!landmarker) throw new Error('Smart alignment pose model is not initialized.');
+  const poseResult = landmarker.detect(source);
+  return poseResult.landmarks.map((landmarks) => ({
+    landmarks: landmarks.map(({ x, y, z, visibility }) => ({ x, y, z, visibility })),
+  }));
+}
+
+function createRotatedPoseSource(
+  bitmap: ImageBitmap,
+  rotation: Exclude<SmartAlignmentImageRotation, 0>,
+): OffscreenCanvas {
+  const swapDimensions = Math.abs(rotation) === 90;
+  const canvas = new OffscreenCanvas(
+    swapDimensions ? bitmap.height : bitmap.width,
+    swapDimensions ? bitmap.width : bitmap.height,
+  );
+  const context = canvas.getContext('2d');
+  if (!context) throw new Error('Smart alignment cannot create a rotated pose canvas.');
+  if (rotation === 90) {
+    context.translate(bitmap.height, 0);
+    context.rotate(Math.PI / 2);
+  } else if (rotation === -90) {
+    context.translate(0, bitmap.width);
+    context.rotate(-Math.PI / 2);
+  } else {
+    context.translate(bitmap.width, bitmap.height);
+    context.rotate(Math.PI);
+  }
+  context.drawImage(bitmap, 0, 0);
+  return canvas;
+}
+
 function detect(request: Extract<SmartAlignmentWorkerRequest, { type: 'detect' }>): void {
   try {
     if (!landmarker) throw new Error('Smart alignment pose model is not initialized.');
-    const poseResult = landmarker.detect(request.bitmap);
-    const poses = poseResult.landmarks.map((landmarks) => ({
-      landmarks: landmarks.map(({ x, y, z, visibility }) => ({ x, y, z, visibility })),
-    }));
+    let poses = detectPoses(request.bitmap);
+    // #WDD-gpt 2026-08-17 - 未知世界朝上方向会让人物横置或倒置；常规检测为零时在 Worker 内旋转截图重试，命中后再恢复原图坐标。
+    for (const rotation of [90, -90, 180] as const) {
+      if (poses.length > 0) break;
+      const rotatedPoses = detectPoses(createRotatedPoseSource(request.bitmap, rotation));
+      if (rotatedPoses.length > 0) {
+        poses = restoreSmartAlignmentPoseRotation(rotatedPoses, rotation);
+      }
+    }
     workerScope.postMessage({ type: 'detection', requestId: request.requestId, poses, faces: [] });
   } catch (error) {
     reportError(request.requestId, error);

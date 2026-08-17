@@ -37,6 +37,12 @@ export interface SmartAlignmentCenterSolution {
   readonly viewsUsed: number;
 }
 
+export interface SmartAlignmentDirectedBodyUpSolution {
+  readonly worldUp: SmartAlignmentVector3;
+  readonly confidence: number;
+  readonly viewsUsed: number;
+}
+
 const add = (a: SmartAlignmentVector3, b: SmartAlignmentVector3): SmartAlignmentVector3 => (
   [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
 );
@@ -206,6 +212,61 @@ export function estimateConsensusPeopleCount(
   return counts.length > 0 ? counts[Math.floor((counts.length - 1) / 2)] : 0;
 }
 
+// #WDD-gpt 2026-08-17 - 强制兜底直接融合姿态模型的脚到头有向身体轴；即使人脸模型漏检，也不再把身体轴折叠后靠世界半球猜测头脚。
+export function solveSmartAlignmentDirectedBodyUp(
+  views: readonly SmartAlignmentViewAnalysis[],
+): SmartAlignmentDirectedBodyUpSolution | null {
+  const peopleCount = estimateConsensusPeopleCount(views);
+  const directedViews: Array<{ vector: SmartAlignmentVector3; weight: number }> = [];
+  for (const view of views) {
+    const observations = viewPoseObservations(view)
+      .map(({ up }) => up)
+      .sort((a, b) => b.confidence - a.confidence)
+      .slice(0, Math.max(1, peopleCount));
+    if (observations.length === 0) continue;
+    let combined: SmartAlignmentVector3 = [0, 0, 0];
+    let totalWeight = 0;
+    for (const observation of observations) {
+      combined = add(combined, scale(observation.vector, observation.confidence));
+      totalWeight += observation.confidence;
+    }
+    const vector = normalize(combined);
+    if (vector && totalWeight > 0) {
+      directedViews.push({ vector, weight: totalWeight / observations.length });
+    }
+  }
+  if (directedViews.length === 0) return null;
+
+  const minimumAgreement = Math.cos(55 * (Math.PI / 180));
+  let inliers: typeof directedViews = [];
+  let bestScore = Number.NEGATIVE_INFINITY;
+  for (const seed of directedViews) {
+    const candidate = directedViews.filter(({ vector }) => dot(seed.vector, vector) >= minimumAgreement);
+    const score = candidate.reduce((sum, observation) => (
+      sum + observation.weight * Math.max(0, dot(seed.vector, observation.vector))
+    ), 0);
+    if (score > bestScore) {
+      bestScore = score;
+      inliers = candidate;
+    }
+  }
+
+  let combined: SmartAlignmentVector3 = [0, 0, 0];
+  let totalWeight = 0;
+  for (const observation of inliers) {
+    combined = add(combined, scale(observation.vector, observation.weight));
+    totalWeight += observation.weight;
+  }
+  const worldUp = normalize(combined);
+  if (!worldUp || totalWeight <= 0) return null;
+  const consistency = length(combined) / totalWeight;
+  return {
+    worldUp,
+    confidence: Math.max(0, Math.min(1, consistency * Math.min(1, inliers.length / 3))),
+    viewsUsed: inliers.length,
+  };
+}
+
 // #WDD-gpt 2026-08-15 - 多视角只融合屏幕平面投影，避免依赖单张图像中不稳定的单目深度尺度。
 export function solveSmartAlignmentUp(
   views: readonly SmartAlignmentViewAnalysis[],
@@ -236,7 +297,7 @@ export function solveSmartAlignmentUp(
     viewDirections.push({ vector: stableVector, weight: meanWeight });
   }
 
-  if (viewDirections.length < 2) return null;
+  if (viewDirections.length < 1) return null;
   // #WDD-gpt 2026-08-15 - 背面渲染偶尔会产生倒置姿态；以 55 度球面邻域寻找主方向簇，避免少数离群视角与正确结果相互抵消。
   const minimumAgreement = Math.cos(55 * (Math.PI / 180));
   let inliers: typeof viewDirections = [];
@@ -260,7 +321,7 @@ export function solveSmartAlignmentUp(
   }
   const viewsUsed = inliers.length;
   const worldAxis = normalize(combined);
-  if (!worldAxis || viewsUsed < 2 || totalWeight <= 0) return null;
+  if (!worldAxis || viewsUsed < 1 || totalWeight <= 0) return null;
   const consistency = length(combined) / totalWeight;
   const coverage = Math.min(1, viewsUsed / 8);
   const inlierRatio = viewsUsed / viewDirections.length;
@@ -331,6 +392,7 @@ export function solveSmartAlignmentCenter(
   const vector = [0, 0, 0];
   let confidenceSum = 0;
   let viewsUsed = 0;
+  let singleViewCenter: SmartAlignmentVector3 | null = null;
   const peopleCount = estimateConsensusPeopleCount(views);
 
   for (const view of views) {
@@ -353,6 +415,7 @@ export function solveSmartAlignmentCenter(
         scale(view.up, (0.5 - mean.y) * view.verticalSpan),
       ),
     );
+    singleViewCenter = projected;
 
     for (const axis of [view.right, view.up]) {
       const target = dot(axis, projected);
@@ -367,7 +430,8 @@ export function solveSmartAlignmentCenter(
     viewsUsed += 1;
   }
 
-  const standingCenter = viewsUsed >= 2 ? solveLinear3(matrix, vector) : null;
+  // #WDD-gpt 2026-08-17 - 单人脸极限兜底缺少深度交会时，将脚点投影到用户 Orbit target 平面，仍可给出可撤销的保守近似原点。
+  const standingCenter = viewsUsed >= 2 ? solveLinear3(matrix, vector) : singleViewCenter;
   if (!standingCenter) return null;
   return {
     standingCenter,

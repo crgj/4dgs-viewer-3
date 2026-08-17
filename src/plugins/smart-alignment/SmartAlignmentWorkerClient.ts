@@ -132,7 +132,17 @@ export class SmartAlignmentWorkerClient {
       const winnerIndex = scores[0] >= scores[1] ? 0 : 1;
       const loserIndex = winnerIndex === 0 ? 1 : 0;
       // #WDD-gpt 2026-08-15 - 每个人每个视角只接受一个明确胜出的脸端；两端都像脸或分差不足时整视角弃权。
-      if (scores[winnerIndex] < 0.7 || scores[winnerIndex] - scores[loserIndex] < 0.12) continue;
+      if (scores[winnerIndex] < 0.7 || scores[winnerIndex] - scores[loserIndex] < 0.12) {
+        // #WDD-gpt 2026-08-17 - FaceLandmarker 在低纹理 Gaussian 脸上会随机漏检；鼻眼耳姿态关键点完整时作为低权重单人脸强制证据。
+        faces.push({
+          x: head.x,
+          y: head.y,
+          width: cropSize / source.width,
+          height: cropSize / source.height,
+          confidence: Math.max(0.25, Math.min(0.55, head.confidence * 0.55)),
+        });
+        continue;
+      }
       faces.push({
         x: endpoints[winnerIndex].x,
         y: endpoints[winnerIndex].y,
@@ -158,31 +168,38 @@ export class SmartAlignmentWorkerClient {
       resizeHeight: 256,
       resizeQuality: 'high',
     });
-    const canvas = new OffscreenCanvas(256, 256);
-    const context = canvas.getContext('2d');
-    if (!context) {
-      crop.close();
-      return 0;
-    }
-    context.translate(128, 128);
-    context.rotate(Math.PI);
-    context.drawImage(crop, -128, -128, 256, 256);
-    const rotated = canvas.transferToImageBitmap();
-    const [uprightFaces, invertedFaces] = await Promise.all([
+    const rotateCrop = (radians: number): ImageBitmap => {
+      const rotatedCanvas = new OffscreenCanvas(256, 256);
+      const rotatedContext = rotatedCanvas.getContext('2d');
+      if (!rotatedContext) throw new Error('智能对齐无法创建人脸旋转画布。');
+      rotatedContext.translate(128, 128);
+      rotatedContext.rotate(radians);
+      rotatedContext.drawImage(crop, -128, -128, 256, 256);
+      return rotatedCanvas.transferToImageBitmap();
+    };
+    const clockwise = rotateCrop(Math.PI / 2);
+    const inverted = rotateCrop(Math.PI);
+    const counterclockwise = rotateCrop(-Math.PI / 2);
+    // #WDD-gpt 2026-08-17 - 人物可相对屏幕横置；端点人脸裁剪必须覆盖四个直角方向，否则姿态已找到但独立人脸会被错误报告为零。
+    const [uprightFaces, clockwiseFaces, invertedFaces, counterclockwiseFaces] = await Promise.all([
       this.faceWorker.detect(crop),
-      this.faceWorker.detect(rotated),
+      this.faceWorker.detect(clockwise),
+      this.faceWorker.detect(inverted),
+      this.faceWorker.detect(counterclockwise),
     ]);
     return Math.max(
       0,
       ...uprightFaces.map(({ confidence }) => confidence),
+      ...clockwiseFaces.map(({ confidence }) => confidence),
       ...invertedFaces.map(({ confidence }) => confidence),
+      ...counterclockwiseFaces.map(({ confidence }) => confidence),
     );
   }
 
   private averageLandmarks(
     landmarks: readonly SmartAlignmentLandmark[],
     indices: readonly number[],
-  ): { x: number; y: number } | null {
+  ): { x: number; y: number; confidence: number } | null {
     const visible = indices
       .map((index) => landmarks[index])
       .filter((landmark): landmark is SmartAlignmentLandmark => Boolean(
@@ -195,6 +212,7 @@ export class SmartAlignmentWorkerClient {
     return {
       x: visible.reduce((sum, landmark) => sum + landmark.x, 0) / visible.length,
       y: visible.reduce((sum, landmark) => sum + landmark.y, 0) / visible.length,
+      confidence: visible.reduce((sum, landmark) => sum + landmark.visibility, 0) / visible.length,
     };
   }
 

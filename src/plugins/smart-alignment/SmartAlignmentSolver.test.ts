@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   estimateConsensusPeopleCount,
   solveSmartAlignmentCenter,
+  solveSmartAlignmentDirectedBodyUp,
   solveSmartAlignmentUp,
 } from './SmartAlignmentSolver';
 import type {
@@ -112,5 +113,32 @@ describe('SmartAlignmentSolver', () => {
     expect(solution!.semanticDominance).toBeGreaterThan(0.99);
     expect(solution!.unsignedWorldUp[1]).toBeGreaterThan(0.99);
     expect(solution!.worldUp[1]).toBeLessThan(-0.99);
+  });
+
+  it('provides a conservative target-plane fallback from one face and pose view', () => {
+    const onlyView = view('positive-z', [pose(0.5, 0.75)]);
+    const up = solveSmartAlignmentUp([onlyView]);
+    const center = solveSmartAlignmentCenter([onlyView]);
+    expect(up).not.toBeNull();
+    expect(up!.viewsUsed).toBe(1);
+    expect(up!.facesDetected).toBe(1);
+    expect(up!.worldUp[1]).toBeGreaterThan(0.99);
+    expect(center).not.toBeNull();
+    expect(center!.viewsUsed).toBe(1);
+    expect(center!.standingCenter).toEqual([0, 0, 0]);
+  });
+
+  it('keeps the pose semantic feet-to-head direction when no face is detected', () => {
+    const bodyOnly = view(
+      'positive-z',
+      [pose(0.5, 0.18, 0.5, 0.78)],
+      [],
+    );
+    const directed = solveSmartAlignmentDirectedBodyUp([bodyOnly]);
+    expect(directed).not.toBeNull();
+    expect(directed!.viewsUsed).toBe(1);
+    expect(directed!.worldUp[0]).toBeCloseTo(0, 5);
+    expect(directed!.worldUp[1]).toBeLessThan(-0.99);
+    expect(directed!.worldUp[2]).toBeCloseTo(0, 5);
   });
 });

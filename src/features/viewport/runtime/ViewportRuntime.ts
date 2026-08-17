@@ -36,6 +36,7 @@ import type {
   SmartAlignmentVector3,
   SmartAlignmentViewId,
 } from '../../../plugins/smart-alignment/SmartAlignmentTypes';
+import { smartAlignmentSphereDirection } from '../../../plugins/smart-alignment/SmartAlignmentSphereViews';
 import { GaussianAssetImporter, detectGaussianSourceFormat } from '../../gaussian/formats/import/GaussianAssetImporter';
 import type {
   GaussianSourceFormat,
@@ -130,7 +131,6 @@ import { SceneGuides } from './scene/SceneGuides';
 import { ViewportPerformanceMonitor, type ViewportPerformanceSnapshot } from './ViewportPerformanceMonitor';
 import {
   findCompletelyInvisibleStableIds,
-  GAUSSIAN_RENDER_ALPHA_CLIP,
   inspectGaussianModel,
   type ModelHealthReport,
 } from '../../../plugins/model-health/ModelHealth';
@@ -326,6 +326,7 @@ interface ViewportRuntimeOptions {
 
 interface SmartAlignmentCameraStart {
   readonly azimuthRadians: number;
+  readonly captureSpan: number;
   readonly distance: number;
   readonly target: Vec3;
 }
@@ -1041,7 +1042,6 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
     if (!this.activeRaw4DAsset) throw new Error('没有可检查的 Gaussian 模型。');
     const edits = this.activeRaw4D?.edits;
     return inspectGaussianModel(this.activeRaw4DAsset, false, {
-      alphaClip: this.app?.scene.gsplat.alphaClipForward ?? GAUSSIAN_RENDER_ALPHA_CLIP,
       isDeleted: (stableId) => edits?.isDeleted(stableId) ?? false,
     });
   }
@@ -1050,10 +1050,8 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
     if (!this.activeRaw4DAsset || !this.activeRaw4D) throw new Error('没有可修复的 Gaussian 模型。');
     const asset = this.activeRaw4DAsset;
     const raw4D = this.activeRaw4D;
-    const alphaClip = this.app?.scene.gsplat.alphaClipForward ?? GAUSSIAN_RENDER_ALPHA_CLIP;
     // #WDD-gpt 2026-08-16 - 删除候选必须在任何数值修复之前取证，避免修复生成的替代值反过来成为删除依据。
     const invisibleStableIds = findCompletelyInvisibleStableIds(asset, {
-      alphaClip,
       isDeleted: (stableId) => raw4D.edits.isDeleted(stableId),
     });
     const repaired = inspectGaussianModel(asset, true, { includeVisibility: false });
@@ -1080,7 +1078,6 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
       this.publishGaussianEditHistoryState(invisibleStableIds.length);
     }
     const verified = inspectGaussianModel(asset, false, {
-      alphaClip,
       isDeleted: (stableId) => raw4D.edits.isDeleted(stableId),
     });
     return {
@@ -3379,8 +3376,26 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
     }
     const offset = camera.getPosition().clone().sub(target);
     const distance = Math.max(0.01, offset.length());
+    const aspect = Math.max(0.01, this.canvas.width / Math.max(1, this.canvas.height));
+    let horizontalSpan: number;
+    let verticalSpan: number;
+    if (camera.camera.projection === PROJECTION_ORTHOGRAPHIC) {
+      verticalSpan = camera.camera.orthoHeight * 2;
+      horizontalSpan = verticalSpan * aspect;
+    } else {
+      const fieldOfView = camera.camera.fov * (Math.PI / 180);
+      if (camera.camera.horizontalFov) {
+        horizontalSpan = 2 * distance * Math.tan(fieldOfView * 0.5);
+        verticalSpan = horizontalSpan / aspect;
+      } else {
+        verticalSpan = 2 * distance * Math.tan(fieldOfView * 0.5);
+        horizontalSpan = verticalSpan * aspect;
+      }
+    }
     return {
       azimuthRadians: Math.atan2(offset.z, offset.x),
+      // #WDD-gpt 2026-08-17 - 智能对齐实际截取画布中央正方形，因此球面机位沿用当前用户构图的较短轴世界跨度。
+      captureSpan: Math.max(0.1, Math.min(horizontalSpan, verticalSpan)),
       distance,
       target,
     };
@@ -3392,22 +3407,6 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
   ): Omit<SmartAlignmentCapture, 'bitmap'> {
     const camera = this.camera;
     if (!camera?.camera) throw new Error('智能对齐相机不可用。');
-    const aspect = Math.max(0.01, this.canvas.width / Math.max(1, this.canvas.height));
-    let horizontalSpan: number;
-    let verticalSpan: number;
-    if (camera.camera.projection === PROJECTION_ORTHOGRAPHIC) {
-      verticalSpan = camera.camera.orthoHeight * 2;
-      horizontalSpan = verticalSpan * aspect;
-    } else {
-      const fieldOfView = camera.camera.fov * (Math.PI / 180);
-      if (camera.camera.horizontalFov) {
-        horizontalSpan = 2 * start.distance * Math.tan(fieldOfView * 0.5);
-        verticalSpan = horizontalSpan / aspect;
-      } else {
-        verticalSpan = 2 * start.distance * Math.tan(fieldOfView * 0.5);
-        horizontalSpan = verticalSpan * aspect;
-      }
-    }
     const forward = camera.forward.clone().normalize();
     const right = camera.right.clone().normalize();
     const up = camera.up.clone().normalize();
@@ -3418,8 +3417,8 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
       right: [right.x, right.y, right.z],
       up: [up.x, up.y, up.z],
       forward: [forward.x, forward.y, forward.z],
-      horizontalSpan,
-      verticalSpan,
+      horizontalSpan: start.captureSpan,
+      verticalSpan: start.captureSpan,
     };
   }
 
@@ -3441,16 +3440,17 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
       'negative-x-positive-z': new Vec3(-1, 0, 1).normalize(),
       'negative-x-negative-z': new Vec3(-1, 0, -1).normalize(),
     };
-    // #WDD-gpt 2026-08-15 - azimuth ID 使用十分之一度编码，允许智能对齐以 22.5 度间隔稳定扩展到十六个环绕视角。
+    // #WDD-gpt 2026-08-17 - 兼容旧方位角 ID，同时让新 sphere ID 按当前相机方位旋转后的 Fibonacci 球面方向布置机位。
     const azimuthTenths = id.startsWith('azimuth-') ? Number(id.slice('azimuth-'.length)) : Number.NaN;
     const azimuthRadians = start.azimuthRadians + (azimuthTenths / 10) * (Math.PI / 180);
-    // #WDD-gpt 2026-08-15 - 仅第一张保留用户俯仰；其余环绕视图保持水平，避免把单个透视俯仰误差复制到全部身体轴观测。
-    const pitchRadians = 0;
-    const cameraDirection = Number.isFinite(azimuthRadians)
+    const sphereDirection = smartAlignmentSphereDirection(id, start.azimuthRadians);
+    const cameraDirection = sphereDirection
+      ? new Vec3(...sphereDirection)
+      : Number.isFinite(azimuthRadians)
       ? new Vec3(
-        Math.cos(azimuthRadians) * Math.cos(pitchRadians),
-        Math.sin(pitchRadians),
-        Math.sin(azimuthRadians) * Math.cos(pitchRadians),
+        Math.cos(azimuthRadians),
+        0,
+        Math.sin(azimuthRadians),
       )
       : legacyCameraDirectionById[id]?.clone();
     if (!cameraDirection) throw new Error(`未知的智能对齐视角：${id}`);
@@ -3459,31 +3459,12 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
     const right = new Vec3().cross(forward, upHint).normalize();
     const up = new Vec3().cross(right, forward).normalize();
 
-    const { min, max, corners } = this.getSmartAlignmentWorldBounds();
-    const boundsCenter = min.clone().add(max).mulScalar(0.5);
-    let minRight = Number.POSITIVE_INFINITY;
-    let maxRight = Number.NEGATIVE_INFINITY;
-    let minUp = Number.POSITIVE_INFINITY;
-    let maxUp = Number.NEGATIVE_INFINITY;
-    for (const corner of corners) {
-      const offset = corner.clone().sub(boundsCenter);
-      const rightDistance = offset.dot(right);
-      const upDistance = offset.dot(up);
-      minRight = Math.min(minRight, rightDistance);
-      maxRight = Math.max(maxRight, rightDistance);
-      minUp = Math.min(minUp, upDistance);
-      maxUp = Math.max(maxUp, upDistance);
-    }
-    const frameCenter = boundsCenter
-      .clone()
-      .add(right.clone().mulScalar((minRight + maxRight) * 0.5))
-      .add(up.clone().mulScalar((minUp + maxUp) * 0.5));
-    const halfWidth = Math.max(0.05, (maxRight - minRight) * 0.5);
-    const halfHeight = Math.max(0.05, (maxUp - minUp) * 0.5);
-    const aspect = Math.max(0.01, this.canvas.width / Math.max(1, this.canvas.height));
-    const orthoHeight = Math.max(halfHeight, halfWidth / aspect) * 1.16;
+    const { min, max } = this.getSmartAlignmentWorldBounds();
+    // #WDD-gpt 2026-08-17 - 所有多视角都严格围绕用户鼠标环绕的 Orbit target，并保持点击分析时的缩放构图，不再跳回全模型包围盒中心。
+    const frameCenter = start.target.clone();
+    const orthoHeight = start.captureSpan * 0.5;
     const diagonal = max.clone().sub(min).length();
-    const distance = Math.max(2, diagonal * 1.4);
+    const distance = Math.max(start.distance, 2, diagonal * 1.4);
 
     camera.camera.projection = PROJECTION_ORTHOGRAPHIC;
     camera.camera.orthoHeight = orthoHeight;
@@ -3498,7 +3479,7 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
       right: [right.x, right.y, right.z],
       up: [up.x, up.y, up.z],
       forward: [forward.x, forward.y, forward.z],
-      horizontalSpan: orthoHeight * 2 * aspect,
+      horizontalSpan: orthoHeight * 2,
       verticalSpan: orthoHeight * 2,
     };
   }

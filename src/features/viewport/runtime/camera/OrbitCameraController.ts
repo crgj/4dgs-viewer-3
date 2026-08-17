@@ -261,6 +261,10 @@ export class OrbitCameraController {
     this.canvas.dataset.cameraPosition = [position.x, position.y, position.z]
       .map((value) => value.toFixed(5))
       .join(',');
+    // #WDD-gpt 2026-08-17 - 同步记录真实 Orbit target，便于确认智能对齐球面机位围绕用户当前旋转中心而不是模型包围盒中心。
+    this.canvas.dataset.cameraTarget = [this.target.x, this.target.y, this.target.z]
+      .map((value) => value.toFixed(5))
+      .join(',');
   }
 
   private getPinchDistance(): number {

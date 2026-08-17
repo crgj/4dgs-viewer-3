@@ -3,7 +3,10 @@ import type {
   SmartAlignmentCenterSolution,
   SmartAlignmentUpSolution,
 } from './SmartAlignmentSolver';
-import { assessSmartAlignmentVerification } from './SmartAlignmentVerification';
+import {
+  assessSmartAlignmentVerification,
+  getSmartAlignmentVerificationRollbackReason,
+} from './SmartAlignmentVerification';
 
 function upSolution(overrides: Partial<SmartAlignmentUpSolution> = {}): SmartAlignmentUpSolution {
   return {
@@ -58,5 +61,37 @@ describe('assessSmartAlignmentVerification', () => {
     );
     expect(assessment.orientationReliable).toBe(true);
     expect(assessment.centerReliable).toBe(false);
+  });
+
+  it('retains the initial alignment when the verification geometry is inconclusive', () => {
+    const assessment = assessSmartAlignmentVerification(
+      upSolution({ confidence: 0.22, directionalDominance: 0.51, viewsUsed: 5 }),
+      centerSolution(),
+    );
+    expect(assessment.orientationReliable).toBe(false);
+    expect(getSmartAlignmentVerificationRollbackReason(assessment, 78, 60)).toBeNull();
+  });
+
+  it('retains the initial alignment when no residual body axis can be solved', () => {
+    const assessment = assessSmartAlignmentVerification(null, centerSolution());
+    expect(getSmartAlignmentVerificationRollbackReason(assessment, null, 60)).toBeNull();
+  });
+
+  it('rolls back on reliable inverted semantic evidence even if geometry is weak', () => {
+    const assessment = assessSmartAlignmentVerification(upSolution({
+      confidence: 0.2,
+      directionalDominance: 0.5,
+      facesDetected: 4,
+      semanticDominance: 0.82,
+      semanticViewsUsed: 4,
+      viewsUsed: 5,
+      worldUp: [0, -1, 0],
+    }), centerSolution());
+    expect(getSmartAlignmentVerificationRollbackReason(assessment, 20, 60)).toBe('inverted');
+  });
+
+  it('rolls back on a reliable excessive residual tilt', () => {
+    const assessment = assessSmartAlignmentVerification(upSolution(), centerSolution());
+    expect(getSmartAlignmentVerificationRollbackReason(assessment, 72, 60)).toBe('excessive-tilt');
   });
 });

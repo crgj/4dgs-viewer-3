@@ -2,9 +2,7 @@ import { FloatPacking } from 'playcanvas';
 import type { Raw4DAsset, Raw4DBounds, Raw4DScalarArray, Raw4DTrack } from '../../features/gaussian/formats/raw4d/Raw4DTypes';
 import { readRaw4DScalar } from '../../features/gaussian/formats/raw4d/Raw4DValues';
 
-// #WDD-gpt 2026-08-16 - 健康修复只软删除完整时间轴均低于实际渲染阈值的点，证据不完整时一律保留。
-
-export const GAUSSIAN_RENDER_ALPHA_CLIP = 1 / 255;
+// #WDD-gpt 2026-08-17 - 健康修复只软删除所有透明度关键帧均精确为 -Infinity 的点；有限低透明度和证据不完整一律保留。
 
 export type ModelHealthSeverity = 'warning' | 'error';
 export interface ModelHealthIssue {
@@ -19,10 +17,10 @@ export interface ModelHealthReport {
   readonly healthy: boolean;
   readonly issues: readonly ModelHealthIssue[];
   readonly markedDeletedPoints: number;
+  readonly safeDeletionCandidates: number;
 }
 
 export interface ModelHealthInspectOptions {
-  readonly alphaClip?: number;
   readonly includeVisibility?: boolean;
   readonly isDeleted?: (stableId: number) => boolean;
 }
@@ -36,41 +34,16 @@ function inspectArray(
   encoding: 'float16' | 'float32',
   replacement: (value: number, index: number) => number,
   repair: boolean,
+  isValid: (value: number) => boolean = Number.isFinite,
 ): { checked: number; invalid: number; fixed: number } {
   let invalid = 0; let fixed = 0;
   for (let index = 0; index < array.length; index += 1) {
     const value = readRaw4DScalar(array, index, encoding);
-    if (Number.isFinite(value)) continue;
+    if (isValid(value)) continue;
     invalid += 1;
     if (repair) { writeScalar(array, index, encoding, replacement(value, index)); fixed += 1; }
   }
   return { checked: array.length, invalid, fixed };
-}
-
-function rendererSigmoid(value: number): number {
-  const clamped = Math.max(-20, Math.min(20, value));
-  if (clamped >= 0) return 1 / (1 + Math.exp(-clamped));
-  const exponential = Math.exp(clamped);
-  return exponential / (1 + exponential);
-}
-
-function opacitySpan(track: Raw4DTrack, frame: number): { left: number; right: number; alpha: number } {
-  if (track.keyframes.length === 1 || frame <= track.keyframes[0]) {
-    return { left: 0, right: 0, alpha: 0 };
-  }
-  const last = track.keyframes.length - 1;
-  if (frame >= track.keyframes[last]) return { left: last, right: last, alpha: 0 };
-  for (let right = 1; right < track.keyframes.length; right += 1) {
-    if (frame > track.keyframes[right]) continue;
-    const left = right - 1;
-    const frameSpan = track.keyframes[right] - track.keyframes[left];
-    return {
-      left,
-      right,
-      alpha: frameSpan > 0 ? (frame - track.keyframes[left]) / frameSpan : 0,
-    };
-  }
-  return { left: last, right: last, alpha: 0 };
 }
 
 function hasCompleteVisibilityEvidence(asset: Raw4DAsset, stableId: number): boolean {
@@ -78,13 +51,20 @@ function hasCompleteVisibilityEvidence(asset: Raw4DAsset, stableId: number): boo
   const mu = readRaw4DScalar(asset.lifetimeMu, stableId, asset.sourceEncoding);
   const width = readRaw4DScalar(asset.lifetimeW, stableId, asset.sourceEncoding);
   if (!Number.isFinite(mu) || !Number.isFinite(width) || width < 0) return false;
-  if (asset.opacity.keyframes.length === 0 || asset.opacity.values.length !== asset.opacity.keyframes.length) return false;
+  if (
+    asset.opacity.components !== 1
+    || asset.opacity.keyframes.length === 0
+    || asset.opacity.values.length !== asset.opacity.keyframes.length
+  ) return false;
   for (let key = 0; key < asset.opacity.keyframes.length; key += 1) {
     const frame = asset.opacity.keyframes[key];
     if (!Number.isFinite(frame) || (key > 0 && frame <= asset.opacity.keyframes[key - 1])) return false;
   }
   for (const values of asset.opacity.values) {
-    if (stableId >= values.length || !Number.isFinite(readRaw4DScalar(values, stableId, asset.opacity.encoding))) {
+    const value = stableId < values.length
+      ? readRaw4DScalar(values, stableId, asset.opacity.encoding)
+      : Number.NaN;
+    if (!Number.isFinite(value) && value !== Number.NEGATIVE_INFINITY) {
       return false;
     }
   }
@@ -92,39 +72,23 @@ function hasCompleteVisibilityEvidence(asset: Raw4DAsset, stableId: number): boo
 }
 
 /**
- * Returns only points which cannot contribute a single pixel in normal rendering at any playback frame.
- * A temporary gate at only the current frame, scale, frustum and camera occlusion are deliberately not
- * used as deletion evidence. Invalid data is also retained because invisibility cannot be proven safely.
+ * Returns only points whose opacity Logit is exactly -Infinity at every keyframe. The renderer preserves
+ * -Infinity through its extended interpolation and maps sigmoid(-Infinity) to exact zero, so these points
+ * cannot contribute at any playback frame. Finite low opacity, camera occlusion, frustum, scale and a
+ * temporary lifetime gate are deliberately not accepted as deletion evidence.
  */
 export function findCompletelyInvisibleStableIds(
   asset: Raw4DAsset,
   options: ModelHealthInspectOptions = {},
 ): number[] {
   if (!Number.isInteger(asset.totalFrames) || asset.totalFrames <= 0 || asset.opacity.keyframes.length === 0) return [];
-  const alphaClip = Number.isFinite(options.alphaClip)
-    ? Math.max(0, Math.min(1, options.alphaClip ?? GAUSSIAN_RENDER_ALPHA_CLIP))
-    : GAUSSIAN_RENDER_ALPHA_CLIP;
-  const spans = Array.from({ length: Math.max(0, asset.totalFrames) }, (_, frame) => opacitySpan(asset.opacity, frame));
   const invisible: number[] = [];
   for (let stableId = 0; stableId < asset.splatCount; stableId += 1) {
     if (options.isDeleted?.(stableId) || !hasCompleteVisibilityEvidence(asset, stableId)) continue;
-    const mu = readRaw4DScalar(asset.lifetimeMu, stableId, asset.sourceEncoding);
-    const width = readRaw4DScalar(asset.lifetimeW, stableId, asset.sourceEncoding);
-    let visibleInAnyFrame = false;
-    for (let frame = 0; frame < asset.totalFrames; frame += 1) {
-      const span = spans[frame];
-      const left = readRaw4DScalar(asset.opacity.values[span.left], stableId, asset.opacity.encoding);
-      const right = readRaw4DScalar(asset.opacity.values[span.right], stableId, asset.opacity.encoding);
-      const opacityLogit = span.alpha <= 0 ? left : left + (right - left) * span.alpha;
-      const leftGate = rendererSigmoid(10 * (frame - (mu - width)));
-      const rightGate = rendererSigmoid(10 * ((mu + width) - frame));
-      const effectiveAlpha = rendererSigmoid(opacityLogit) * leftGate * rightGate;
-      if (effectiveAlpha > alphaClip) {
-        visibleInAnyFrame = true;
-        break;
-      }
-    }
-    if (!visibleInAnyFrame) invisible.push(stableId);
+    const allOpacityKeysAreNegativeInfinity = asset.opacity.values.every((values) => (
+      readRaw4DScalar(values, stableId, asset.opacity.encoding) === Number.NEGATIVE_INFINITY
+    ));
+    if (allOpacityKeysAreNegativeInfinity) invisible.push(stableId);
   }
   return invisible;
 }
@@ -216,7 +180,9 @@ export function inspectGaussianModel(
         name === 'opacity' && Number.isNaN(value)
           ? 0
           : nonFiniteTrackReplacement(track, valueIndex, stableId, value, componentFallback, range)
-      ), repair);
+      ), repair, (value) => Number.isFinite(value) || (
+        name === 'opacity' && value === Number.NEGATIVE_INFINITY
+      ));
       checkedValues += result.checked; invalid += result.invalid; fixedValues += result.fixed;
     }
     add(`nonfinite-${name}`, invalid, `${name} 包含非有限数值`, 'error');
@@ -263,6 +229,7 @@ export function inspectGaussianModel(
   for (const values of asset.opacity.values) {
     for (let index = 0; index < values.length; index += 1) {
       const value = readRaw4DScalar(values, index, asset.opacity.encoding);
+      if (value === Number.NEGATIVE_INFINITY || !Number.isFinite(value)) continue;
       const safe = Math.max(-20, Math.min(20, value));
       if (safe === value) continue;
       clampedOpacity += 1;
@@ -287,20 +254,21 @@ export function inspectGaussianModel(
   checkedValues += asset.splatCount * 2;
   add('lifetime', lifetimeIssues, '生命周期范围无效', 'error');
 
-  if (options.includeVisibility !== false) {
-    const invisible = findCompletelyInvisibleStableIds(asset, options);
-    add(
-      'completely-invisible',
-      invisible.length,
-      '完整时间轴均低于渲染阈值（可安全标记删除）',
-      'warning',
-    );
-  }
+  const safeDeletionCandidates = options.includeVisibility === false
+    ? 0
+    : findCompletelyInvisibleStableIds(asset, options).length;
   if (repair) {
     // #WDD-gpt 2026-08-16 - 包围盒必须解码 FP16 并覆盖全部位置关键帧，否则后续动画帧会被错误视锥裁剪。
     const bounds = calculateModelBounds(asset.position);
     (asset as unknown as { bounds: Raw4DBounds }).bounds = bounds;
   }
   const issues = [...counts.entries()].map(([code, issue]) => ({ code, ...issue }));
-  return { checkedValues, fixedValues, healthy: issues.length === 0, issues, markedDeletedPoints: 0 };
+  return {
+    checkedValues,
+    fixedValues,
+    healthy: issues.length === 0,
+    issues,
+    markedDeletedPoints: 0,
+    safeDeletionCandidates,
+  };
 }

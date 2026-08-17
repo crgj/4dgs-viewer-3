@@ -15,9 +15,10 @@ const COPY = {
     confidence: '置信度',
     idle: '先调整摄像机让人物清晰完整，再开始分析；低置信度结果不会写入变换。',
     success: '对齐完成，角色朝上且站立中心已归零。',
+    successInconclusive: '已保留首轮对齐：复检证据不足，但没有发现明确倒立或可靠的大倾角。',
     stages: {
       'loading-model': '正在加载本地姿态模型',
-      'capturing-orientation': '正以当前摄像机为起点渲染十六个环绕视图',
+      'capturing-orientation': '正在渲染 16 个赤道机位与 24 个球面机位',
       'analyzing-orientation': '正在融合人物朝向',
       'analyzing-ground': '正在计算多人站立中心',
       applying: '正在写入场景变换',
@@ -37,9 +38,10 @@ const COPY = {
     confidence: 'Confidence',
     idle: 'Frame the complete character clearly, then start analysis. Low-confidence results are never applied.',
     success: 'Alignment complete. Characters are upright and their standing center is at the origin.',
+    successInconclusive: 'Initial alignment kept: verification was inconclusive, with no clear inversion or reliable large tilt.',
     stages: {
       'loading-model': 'Loading the local pose model',
-      'capturing-orientation': 'Rendering sixteen orbit views from the current camera',
+      'capturing-orientation': 'Rendering 16 equatorial and 24 full-sphere views',
       'analyzing-orientation': 'Fusing character orientation',
       'analyzing-ground': 'Solving the multi-person standing center',
       applying: 'Applying the scene transform',
@@ -69,7 +71,7 @@ export function SmartAlignmentPanel({
   const copy = COPY[language];
   const running = isRunning(state);
   const stageText = state.stage === 'success'
-    ? copy.success
+    ? state.verificationStatus === 'inconclusive' ? copy.successInconclusive : copy.success
     : state.stage === 'error'
       ? state.error
       : state.stage === 'idle'

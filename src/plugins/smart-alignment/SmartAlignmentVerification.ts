@@ -9,6 +9,8 @@ export interface SmartAlignmentVerificationAssessment {
   readonly semanticStatus: 'upright' | 'inverted' | 'unknown';
 }
 
+export type SmartAlignmentVerificationRollbackReason = 'inverted' | 'excessive-tilt' | null;
+
 // #WDD-gpt 2026-08-15 - 复检将几何方向、头脚语义和脚点分开判定；暂时看不到脸或脚时不再撤销首轮可靠对齐。
 export function assessSmartAlignmentVerification(
   up: SmartAlignmentUpSolution | null,
@@ -36,4 +38,21 @@ export function assessSmartAlignmentVerification(
       ? 'inverted'
       : 'upright';
   return { centerReliable, orientationReliable, semanticStatus };
+}
+
+// #WDD-gpt 2026-08-17 - 复检证据不足只跳过二次校正；仅明确倒立或可靠的大残余倾角才能推翻首轮严格对齐。
+export function getSmartAlignmentVerificationRollbackReason(
+  assessment: SmartAlignmentVerificationAssessment,
+  residualTiltDegrees: number | null,
+  maximumReliableTiltDegrees: number,
+): SmartAlignmentVerificationRollbackReason {
+  if (assessment.semanticStatus === 'inverted') return 'inverted';
+  if (
+    assessment.orientationReliable
+    && residualTiltDegrees !== null
+    && residualTiltDegrees > maximumReliableTiltDegrees
+  ) {
+    return 'excessive-tilt';
+  }
+  return null;
 }

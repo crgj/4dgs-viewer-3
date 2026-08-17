@@ -9,6 +9,7 @@ export type SmartAlignmentViewId =
   | 'positive-x-negative-z'
   | 'negative-x-positive-z'
   | 'negative-x-negative-z'
+  | `sphere-${number}`
   | `azimuth-${
     | '0000' | '0225' | '0450' | '0675'
     | '0900' | '1125' | '1350' | '1575'
@@ -99,6 +100,7 @@ export interface SmartAlignmentState {
   readonly viewsUsed?: number;
   readonly confidence?: number;
   readonly standingCenter?: SmartAlignmentVector3;
+  readonly verificationStatus?: 'confirmed' | 'inconclusive';
   readonly error?: string;
 }
 
