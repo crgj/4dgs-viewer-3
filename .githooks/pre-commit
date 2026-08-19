@@ -1,3 +1,4 @@
 #!/bin/sh
-# #WDD-gpt 2026-08-16 - 在提交前自动维护页面版本号与本次修改说明。
-exec node scripts/update-version.mjs
+# #WDD-gpt 2026-08-19 - 提交前先自动更新版本，再强制验证主页徽标与发布版本契约。
+node scripts/update-version.mjs || exit $?
+exec node scripts/verify-release-version.mjs

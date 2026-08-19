@@ -234,8 +234,9 @@ function validateCanonicalChunk(
     }
     const lifetimeMu = headerlessValue(chunk, offset + plan.lifetimeMu, header.scalarEncoding);
     const lifetimeW = headerlessValue(chunk, offset + plan.lifetimeW, header.scalarEncoding);
-    if (!Number.isFinite(lifetimeMu) || !Number.isFinite(lifetimeW) || lifetimeW < 0) {
-      throw new Error(`RAW4D lifetime must be finite with non-negative lifetime_w at row ${firstRow + row}.`);
+    // #WDD-gpt 2026-08-18 - 兼容裁剪/SVD 流程产生的微小负 lifetime_w：它表示空生命周期并由健康检查单独报告，导入层只拒绝会污染运行时的非有限值且保持源位精确。
+    if (!Number.isFinite(lifetimeMu) || !Number.isFinite(lifetimeW)) {
+      throw new Error(`RAW4D lifetime must be finite at row ${firstRow + row}.`);
     }
   }
 }

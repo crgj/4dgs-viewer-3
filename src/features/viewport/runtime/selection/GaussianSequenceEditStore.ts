@@ -1,4 +1,8 @@
-import { GaussianEditStore, type GaussianSelectionMode } from '../../../gaussian/edit/GaussianEditStore';
+import {
+  GaussianEditStore,
+  type GaussianEditBitsetSnapshot,
+  type GaussianSelectionMode,
+} from '../../../gaussian/edit/GaussianEditStore';
 
 export interface GaussianSequenceEditSegment {
   readonly id: string;
@@ -109,6 +113,17 @@ export class GaussianSequenceEditStore {
   markSelectedDeleted(scope: 'visible' | 'global'): number {
     return this.entriesForScope(scope)
       .reduce((total, entry) => total + entry.edits.markSelectedDeleted(), 0);
+  }
+
+  snapshotBitsets(): readonly GaussianEditBitsetSnapshot[] {
+    return this.entries.map((entry) => entry.edits.snapshotBitsets());
+  }
+
+  restoreBitsets(snapshots: readonly GaussianEditBitsetSnapshot[]): void {
+    if (snapshots.length !== this.entries.length) {
+      throw new Error('工作区片段数量与当前 Gaussian 序列不匹配。');
+    }
+    snapshots.forEach((snapshot, index) => this.entries[index].edits.restoreBitsets(snapshot));
   }
 
   private entriesForScope(scope: 'visible' | 'global'): readonly GaussianSequenceEditEntry[] {

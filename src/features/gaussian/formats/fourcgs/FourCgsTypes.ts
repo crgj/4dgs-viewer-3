@@ -38,8 +38,26 @@ export interface FourCgsSceneTransform {
   readonly scale: readonly [number, number, number];
 }
 
+export interface FourCgsCameraBookmark {
+  readonly distance: number;
+  readonly pitch: number;
+  readonly target: readonly [number, number, number];
+  readonly yaw: number;
+}
+
+export interface FourCgsCameraBookmarks {
+  readonly schemaVersion: 1;
+  readonly coordinateSystem: 'playcanvas-y-up';
+  readonly bookmarks: readonly [
+    FourCgsCameraBookmark | null,
+    FourCgsCameraBookmark | null,
+    FourCgsCameraBookmark | null,
+  ];
+}
+
 export interface FourCgsMetadata {
   readonly sceneTransform?: FourCgsSceneTransform;
+  readonly cameraBookmarks?: FourCgsCameraBookmarks;
   readonly raw4dBundle?: {
     readonly version: 1;
     readonly chunkBytes: number;
@@ -90,6 +108,7 @@ export interface FourCgsDescriptor {
   readonly slotCount: number;
   readonly segments: readonly FourCgsSegment[];
   readonly sceneTransform?: FourCgsSceneTransform;
+  readonly cameraBookmarks?: FourCgsCameraBookmarks;
   readonly crossOriginIsolated: boolean;
   readonly decodeTimings: FourCgsDecodeTimings;
 }

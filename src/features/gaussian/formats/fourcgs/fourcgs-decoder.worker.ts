@@ -601,6 +601,7 @@ async function open(file: File): Promise<FourCgsDescriptor> {
     slotCount: manifest.slotCount,
     segments: manifest.segments,
     sceneTransform: manifest.metadata?.sceneTransform,
+    cameraBookmarks: manifest.metadata?.cameraBookmarks,
     crossOriginIsolated: globalThis.crossOriginIsolated,
     decodeTimings: {
       streamReadMs,

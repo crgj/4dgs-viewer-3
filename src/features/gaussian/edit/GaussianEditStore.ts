@@ -18,6 +18,12 @@ export interface GaussianEditEvent {
   readonly attribute?: string;
 }
 
+export interface GaussianEditBitsetSnapshot {
+  readonly pointCount: number;
+  readonly deletionWords: Uint32Array;
+  readonly selectionWords: Uint32Array;
+}
+
 class DenseBitSet {
   readonly words: Uint32Array;
 
@@ -157,6 +163,27 @@ export class GaussianEditStore {
 
   get selectionCount(): number {
     return this.selected.count;
+  }
+
+  // #WDD-gpt 2026-08-18 - 工作区恢复仅复制紧凑稳定 ID 位集，不复制 Canonical 高斯数据，也不改变源文件顺序。
+  snapshotBitsets(): GaussianEditBitsetSnapshot {
+    return {
+      pointCount: this.pointCount,
+      deletionWords: this.deleted.words.slice(),
+      selectionWords: this.selected.words.slice(),
+    };
+  }
+
+  restoreBitsets(snapshot: GaussianEditBitsetSnapshot): void {
+    if (snapshot.pointCount !== this.pointCount
+      || snapshot.deletionWords.length !== this.deleted.words.length
+      || snapshot.selectionWords.length !== this.selected.words.length) {
+      throw new Error('工作区编辑位集与当前 Gaussian 点数不匹配。');
+    }
+    this.deleted.words.set(snapshot.deletionWords);
+    this.selected.words.set(snapshot.selectionWords);
+    this.emit({ kind: 'deleted' });
+    this.emit({ kind: 'selection' });
   }
 
   // #WDD-gpt  2026-08-16 - 删除历史只保存被操作的稳定 ID，撤销时无需复制整份百万点位集。

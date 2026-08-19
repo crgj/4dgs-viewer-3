@@ -51,9 +51,11 @@ import {
 import { readRaw4DScalar, readRaw4DTrack } from '../../gaussian/formats/raw4d/Raw4DValues';
 import type {
   GaussianAttributeDefinition,
+  GaussianEditBitsetSnapshot,
   GaussianEditStore,
   GaussianSelectionMode,
 } from '../../gaussian/edit/GaussianEditStore';
+import { installPlayCanvasSortResultGuard } from '../../gaussian/runtime/PlayCanvasSortResultGuard';
 import {
   GaussianMemoryCoordinator,
   type GaussianCpuPageLease,
@@ -125,6 +127,13 @@ import {
 import { Raw4DSelectionFrameSampler } from './selection/Raw4DSelectionFrameSampler';
 import { GaussianSequenceEditStore } from './selection/GaussianSequenceEditStore';
 import {
+  Raw4DHistogramFrameSampler,
+  buildGaussianHistogramBins,
+  histogramRangeIds,
+  type GaussianHistogramAggregation,
+  type GaussianHistogramMetric,
+} from './histogram/GaussianHistogram';
+import {
   bakeGaussianAssetTransform,
   gaussianTransformBakeTrackCount,
   isIdentityGaussianBakeTransform,
@@ -171,8 +180,20 @@ export interface ViewportStatus {
     readonly sharedShSavedBytes: number;
     readonly keyframes: readonly number[];
     readonly segmentNodes: readonly number[];
+    readonly firstFrame: number;
+    readonly segments: readonly {
+      readonly name: string;
+      readonly firstFrame: number;
+      readonly lastFrame: number;
+      readonly pointCount: number;
+    }[];
+    readonly keyframeTracks?: Readonly<Record<'position' | 'rotation' | 'colorDc' | 'scale' | 'opacity', readonly number[]>>;
   };
 }
+
+export type ViewportGaussianEditSnapshot = GaussianEditBitsetSnapshot;
+
+installPlayCanvasSortResultGuard();
 
 export interface ViewportResidentRaw4DSegment {
   readonly residentId: string;
@@ -209,6 +230,40 @@ export interface ViewportGaussianSelectionSequenceSegment {
   readonly id: string;
   readonly pointCount: number;
   readonly totalFrames: number;
+}
+
+export interface ViewportGaussianHistogramOptions {
+  readonly aggregation: GaussianHistogramAggregation;
+  readonly binCount?: number;
+  readonly metric: GaussianHistogramMetric;
+  readonly scope: ViewportSelectionScope;
+  readonly signal?: AbortSignal;
+  readonly onProgress?: (progress: number, message: string) => void;
+}
+
+export interface ViewportGaussianHistogram {
+  readonly aggregation: GaussianHistogramAggregation;
+  readonly analysisId: number;
+  readonly bins: readonly number[];
+  readonly count: number;
+  readonly frameCount: number;
+  readonly metric: GaussianHistogramMetric;
+  readonly rangeMax: number;
+  readonly rangeMin: number;
+  readonly scope: ViewportSelectionScope;
+  readonly valueMax: number;
+  readonly valueMin: number;
+}
+
+interface GaussianHistogramAnalysisGroup {
+  readonly edits: GaussianEditStore;
+  readonly eligible: Uint8Array;
+  readonly segmentIndex: number;
+  readonly values: Float32Array;
+}
+
+interface GaussianHistogramAnalysisCache extends ViewportGaussianHistogram {
+  readonly groups: readonly GaussianHistogramAnalysisGroup[];
 }
 
 export interface ViewportExternalGaussianSelectionSequence {
@@ -424,6 +479,8 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
   private selectionPointer: GaussianScreenPoint | null = null;
   private selectionPolygonModifiers: GaussianSelectionModifiers | null = null;
   private selectionRunId = 0;
+  private gaussianHistogramAnalysisId = 0;
+  private gaussianHistogramAnalysis: GaussianHistogramAnalysisCache | null = null;
   private selectionSegmentImportController: AbortController | null = null;
   private gaussianSelectionSequence: GaussianSelectionSequenceRuntime | null = null;
   private selectionDrag: {
@@ -545,6 +602,7 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
     this.importController = null;
     this.selectionSegmentImportController?.abort();
     this.selectionSegmentImportController = null;
+    this.gaussianHistogramAnalysis = null;
     this.gaussianSelectionSequence?.releaseEdits();
     this.gaussianSelectionSequence = null;
     this.assetDisposer?.();
@@ -625,6 +683,76 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
   // #WDD-gpt 2026-08-16 - 为独立导航立方体提供只读姿态与受控环绕入口，不暴露底层 PlayCanvas 相机实体。
   getCameraState(): ViewportCameraState | null {
     return this.orbit?.getState() ?? null;
+  }
+
+  setCameraState(state: ViewportCameraState): void {
+    this.orbit?.setState(state);
+  }
+
+  // #WDD-gpt 2026-08-19 - 书签恢复使用独立平滑入口；工作区恢复继续使用即时 setCameraState，避免打开场景时出现无意义飞行动画。
+  transitionCameraState(state: ViewportCameraState, durationMs = 600): void {
+    this.orbit?.transitionToState(state, durationMs);
+  }
+
+  // #WDD-gpt 2026-08-18 - Home 与 Outliner 聚焦使用真实世界包围盒，使高频构图命令直接作用于运行时相机。
+  frameScene(): boolean {
+    if (!this.orbit || !this.activeRaw4D) return false;
+    const { min, max } = this.getSmartAlignmentWorldBounds();
+    this.orbit.frameBounds([min.x, min.y, min.z], [max.x, max.y, max.z]);
+    return true;
+  }
+
+  // #WDD-gpt 2026-08-19 - F 聚焦遵循可见/全局选择范围；全局模式按需读取全部片段，避免非活动片段已有选择却误报为空。
+  async frameSelectedGaussians(): Promise<boolean> {
+    const orbit = this.orbit;
+    const raw4D = this.activeRaw4D;
+    const asset = this.activeRaw4DAsset;
+    if (!orbit || !raw4D || !asset) return false;
+    const sequence = this.gaussianSelectionSequence;
+    const selectedGroups = sequence
+      ? sequence.edits.selectedStableIds(this.selectionScope)
+      : [{ segmentIndex: 0, stableIds: raw4D.edits.selectedStableIds() }];
+    if (selectedGroups.length === 0) return false;
+    const activeSegmentIndex = sequence?.edits.activeSegmentIndex ?? 0;
+    const matrix = raw4D.entity.getWorldTransform().clone();
+    const local = new Vec3();
+    const world = new Vec3();
+    const min = new Vec3(Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY);
+    const max = new Vec3(Number.NEGATIVE_INFINITY, Number.NEGATIVE_INFINITY, Number.NEGATIVE_INFINITY);
+    let count = 0;
+    const controller = new AbortController();
+    for (const group of selectedGroups) {
+      let selectionAsset = asset;
+      let releaseAsset: () => void = () => undefined;
+      if (sequence && group.segmentIndex !== activeSegmentIndex) {
+        const lease = await sequence.acquireAsset(group.segmentIndex, controller.signal);
+        selectionAsset = lease.asset;
+        releaseAsset = lease.release;
+      }
+      try {
+        if (sequence
+          && selectionAsset.splatCount !== sequence.edits.segment(group.segmentIndex).pointCount) {
+          throw new Error(`片段 ${group.segmentIndex + 1} 点数与编辑位集不一致。`);
+        }
+        const sampler = new Raw4DSelectionFrameSampler(selectionAsset);
+        sampler.sample(Math.max(0, Math.min(selectionAsset.totalFrames - 1, this.pendingFrame)));
+        const frame = sampler.properties;
+        for (const stableId of group.stableIds) {
+          if (stableId < 0 || stableId >= selectionAsset.splatCount) continue;
+          matrix.transformPoint(local.set(frame.x[stableId], frame.y[stableId], frame.z[stableId]), world);
+          if (![world.x, world.y, world.z].every(Number.isFinite)) continue;
+          min.x = Math.min(min.x, world.x); min.y = Math.min(min.y, world.y); min.z = Math.min(min.z, world.z);
+          max.x = Math.max(max.x, world.x); max.y = Math.max(max.y, world.y); max.z = Math.max(max.z, world.z);
+          count += 1;
+        }
+      } finally {
+        releaseAsset();
+      }
+    }
+    if (count === 0 || orbit !== this.orbit || raw4D !== this.activeRaw4D
+      || sequence !== this.gaussianSelectionSequence) return false;
+    orbit.frameBounds([min.x, min.y, min.z], [max.x, max.y, max.z]);
+    return true;
   }
 
   orbitCameraBy(deltaYaw: number, deltaPitch: number): void {
@@ -800,6 +928,23 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
 
   getGaussianDeletionCount(): number {
     return this.gaussianDeletionCount();
+  }
+
+  snapshotGaussianEditState(): readonly ViewportGaussianEditSnapshot[] {
+    const sequence = this.gaussianSelectionSequence;
+    if (sequence) return sequence.edits.snapshotBitsets();
+    return this.activeRaw4D ? [this.activeRaw4D.edits.snapshotBitsets()] : [];
+  }
+
+  restoreGaussianEditState(snapshots: readonly ViewportGaussianEditSnapshot[]): void {
+    const sequence = this.gaussianSelectionSequence;
+    if (sequence) sequence.edits.restoreBitsets(snapshots);
+    else {
+      if (!this.activeRaw4D || snapshots.length !== 1) throw new Error('工作区编辑状态与当前场景不匹配。');
+      this.activeRaw4D.edits.restoreBitsets(snapshots[0]);
+    }
+    this.publishGaussianEditHistoryState(0);
+    this.requestGaussianEnvelopeUpdate(0);
   }
 
   hasCanonicalGaussianDataChanges(): boolean {
@@ -1082,6 +1227,119 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
         selectedCount: this.gaussianSelectedCount(scope),
       });
     }
+  }
+
+  // #WDD-gpt 2026-08-19 - 直方图以稳定 ID 聚合；可见模式读取当前帧，全局模式逐片段逐帧计算最小/平均/最大值。
+  async analyzeGaussianHistogram(options: ViewportGaussianHistogramOptions): Promise<ViewportGaussianHistogram> {
+    const raw4D = this.activeRaw4D;
+    const activeAsset = this.activeRaw4DAsset;
+    const sequence = this.gaussianSelectionSequence;
+    if (!raw4D || !activeAsset) throw new Error('请先导入 Gaussian 场景。');
+    const analysisId = ++this.gaussianHistogramAnalysisId;
+    const activeSegmentIndex = sequence?.edits.activeSegmentIndex ?? 0;
+    const segmentIndices = options.scope === 'global' && sequence
+      ? Array.from({ length: sequence.edits.segmentCount }, (_, index) => index)
+      : [activeSegmentIndex];
+    const totalFrames = options.scope === 'global'
+      ? segmentIndices.reduce((total, segmentIndex) => total + (sequence?.edits.segment(segmentIndex).totalFrames ?? activeAsset.totalFrames), 0)
+      : 1;
+    const groups: GaussianHistogramAnalysisGroup[] = [];
+    let completedFrames = 0;
+
+    for (const segmentIndex of segmentIndices) {
+      if (options.signal?.aborted) throw new DOMException('直方图分析已取消。', 'AbortError');
+      let asset = activeAsset;
+      let releaseAsset: () => void = () => undefined;
+      if (sequence && segmentIndex !== activeSegmentIndex) {
+        const lease = await sequence.acquireAsset(segmentIndex, options.signal ?? new AbortController().signal);
+        asset = lease.asset;
+        releaseAsset = lease.release;
+      }
+      try {
+        const edits = sequence?.edits.segment(segmentIndex).edits ?? raw4D.edits;
+        const sampler = new Raw4DHistogramFrameSampler(asset, options.metric);
+        const eligible = new Uint8Array(asset.splatCount);
+        const values = new Float32Array(asset.splatCount);
+        values.fill(Number.NaN);
+        const aggregates = new Float64Array(asset.splatCount);
+        if (options.aggregation === 'minimum') aggregates.fill(Number.POSITIVE_INFINITY);
+        if (options.aggregation === 'maximum') aggregates.fill(Number.NEGATIVE_INFINITY);
+        const samples = new Uint32Array(asset.splatCount);
+        const frameCount = options.scope === 'global' ? asset.totalFrames : 1;
+        const firstFrame = options.scope === 'global' ? 0 : this.pendingFrame;
+        for (let offset = 0; offset < frameCount; offset += 1) {
+          if (options.signal?.aborted || analysisId !== this.gaussianHistogramAnalysisId
+            || raw4D !== this.activeRaw4D || sequence !== this.gaussianSelectionSequence) {
+            throw new DOMException('直方图分析已取消。', 'AbortError');
+          }
+          sampler.sample(firstFrame + offset);
+          for (let stableId = 0; stableId < asset.splatCount; stableId += 1) {
+            if (edits.isDeleted(stableId)) continue;
+            if (options.scope === 'visible' && sampler.opacity[stableId] < 0.01) continue;
+            const value = sampler.value(stableId);
+            if (!Number.isFinite(value)) continue;
+            eligible[stableId] = 1;
+            samples[stableId] += 1;
+            if (options.aggregation === 'minimum') aggregates[stableId] = Math.min(aggregates[stableId], value);
+            else if (options.aggregation === 'maximum') aggregates[stableId] = Math.max(aggregates[stableId], value);
+            else aggregates[stableId] += value;
+          }
+          completedFrames += 1;
+          options.onProgress?.(
+            completedFrames / Math.max(1, totalFrames),
+            segmentIndices.length > 1 ? `正在分析片段 ${segmentIndex + 1}/${segmentIndices.length}` : '正在分析 Gaussian 数据',
+          );
+          await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
+        }
+        for (let stableId = 0; stableId < values.length; stableId += 1) {
+          if (!eligible[stableId]) continue;
+          values[stableId] = options.aggregation === 'mean'
+            ? aggregates[stableId] / Math.max(1, samples[stableId])
+            : aggregates[stableId];
+        }
+        groups.push({ edits, eligible, segmentIndex, values });
+      } finally {
+        releaseAsset();
+      }
+    }
+
+    const histogram = buildGaussianHistogramBins(groups, Math.max(16, Math.min(96, options.binCount ?? 48)));
+    const result: GaussianHistogramAnalysisCache = {
+      ...histogram,
+      aggregation: options.aggregation,
+      analysisId,
+      frameCount: totalFrames,
+      groups,
+      metric: options.metric,
+      scope: options.scope,
+    };
+    this.gaussianHistogramAnalysis = result;
+    return result;
+  }
+
+  selectGaussiansFromHistogram(
+    analysisId: number,
+    lower: number,
+    upper: number,
+    mode: GaussianSelectionMode = 'replace',
+  ): number {
+    const analysis = this.gaussianHistogramAnalysis;
+    if (!analysis || analysis.analysisId !== analysisId) throw new Error('直方图已经过期，请重新分析。');
+    let hitCount = 0;
+    for (const group of analysis.groups) {
+      const stableIds = histogramRangeIds(group.values, group.eligible, lower, upper);
+      group.edits.select(stableIds, mode);
+      hitCount += stableIds.length;
+    }
+    this.selectionScope = analysis.scope;
+    this.publishSelectionState({
+      phase: 'ready',
+      scope: analysis.scope,
+      progress: 1,
+      selectedCount: this.gaussianSelectedCount(analysis.scope),
+      hitCount,
+    });
+    return hitCount;
   }
 
   setGaussianSelectionBrushRadius(radius: number): void {

@@ -228,6 +228,18 @@ describe('RAW4D parser', () => {
     await expect(parseRaw4D(new Blob([bytes]))).rejects.toThrow(/opacity logit/);
   });
 
+  it('preserves finite negative lifetime widths instead of rejecting the complete PLY4 file', async () => {
+    const source = syntheticRaw4D();
+    const header = await readRaw4DHeader(source);
+    const bytes = new Uint8Array(await source.arrayBuffer());
+    const lifetimeW = header.propertyNames.indexOf('lifetime_w');
+    new DataView(bytes.buffer).setFloat32(header.dataOffset + lifetimeW * 4, -0.005, true);
+
+    const asset = await parseRaw4D(new Blob([bytes]));
+
+    expect(asset.lifetimeW[0]).toBeCloseTo(-0.005);
+  });
+
   it('decodes through WASM directly into shared TypedArray storage', async () => {
     const extractor = await Raw4DWasmExtractor.create();
     const asset = await parseRaw4D(syntheticRaw4D(), {

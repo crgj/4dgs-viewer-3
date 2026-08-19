@@ -1,4 +1,6 @@
 import type {
+  FourCgsCameraBookmark,
+  FourCgsCameraBookmarks,
   FourCgsFrameLocation,
   FourCgsManifest,
   FourCgsMetadata,
@@ -18,6 +20,13 @@ export interface FourCgsTransformInput {
   readonly scale: readonly [number, number, number];
 }
 
+export interface FourCgsCameraBookmarkInput {
+  readonly distance: number;
+  readonly pitch: number;
+  readonly target: readonly [number, number, number];
+  readonly yaw: number;
+}
+
 function finiteVector3(value: unknown, label: string, positive = false): [number, number, number] {
   if (!Array.isArray(value) || value.length !== 3
     || value.some((component) => !Number.isFinite(component)
@@ -25,6 +34,38 @@ function finiteVector3(value: unknown, label: string, positive = false): [number
     throw new Error(`4CGS ${label} 必须是三个${positive ? '正' : ''}有限数值。`);
   }
   return [Number(value[0]), Number(value[1]), Number(value[2])];
+}
+
+function finiteNumber(value: unknown, label: string, positive = false): number {
+  if (!Number.isFinite(value) || (positive && (value as number) <= 0)) {
+    throw new Error(`4CGS ${label} 必须是${positive ? '正' : ''}有限数值。`);
+  }
+  return Number(value);
+}
+
+function createCameraBookmark(value: FourCgsCameraBookmarkInput, index: number): FourCgsCameraBookmark {
+  return {
+    distance: finiteNumber(value.distance, `metadata.cameraBookmarks.bookmarks[${index}].distance`, true),
+    pitch: finiteNumber(value.pitch, `metadata.cameraBookmarks.bookmarks[${index}].pitch`),
+    target: finiteVector3(value.target, `metadata.cameraBookmarks.bookmarks[${index}].target`),
+    yaw: finiteNumber(value.yaw, `metadata.cameraBookmarks.bookmarks[${index}].yaw`),
+  };
+}
+
+// #WDD-gpt 2026-08-19 - 4CGS 固定保存三个 Orbit 书签槽位，null 明确表示该槽未启用，避免旧场景书签串入新文件。
+export function createFourCgsCameraBookmarks(
+  bookmarks: readonly (FourCgsCameraBookmarkInput | null)[],
+): FourCgsCameraBookmarks {
+  if (bookmarks.length !== 3) throw new Error('4CGS 视角书签必须包含三个槽位。');
+  return {
+    schemaVersion: 1,
+    coordinateSystem: 'playcanvas-y-up',
+    bookmarks: bookmarks.map((bookmark, index) => bookmark === null ? null : createCameraBookmark(bookmark, index)) as [
+      FourCgsCameraBookmark | null,
+      FourCgsCameraBookmark | null,
+      FourCgsCameraBookmark | null,
+    ],
+  };
 }
 
 export function createFourCgsSceneTransform(input: FourCgsTransformInput): FourCgsSceneTransform {
@@ -67,6 +108,19 @@ function validateSceneTransform(value: unknown): FourCgsSceneTransform | undefin
   };
 }
 
+function validateCameraBookmarks(value: unknown): FourCgsCameraBookmarks | undefined {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('4CGS metadata.cameraBookmarks 无效。');
+  }
+  const cameraBookmarks = value as Partial<FourCgsCameraBookmarks>;
+  if (cameraBookmarks.schemaVersion !== 1 || cameraBookmarks.coordinateSystem !== 'playcanvas-y-up'
+    || !Array.isArray(cameraBookmarks.bookmarks)) {
+    throw new Error('4CGS metadata.cameraBookmarks 坐标约定或槽位无效。');
+  }
+  return createFourCgsCameraBookmarks(cameraBookmarks.bookmarks);
+}
+
 function validateMetadata(value: unknown): FourCgsMetadata | undefined {
   if (value === undefined) return undefined;
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
@@ -74,9 +128,11 @@ function validateMetadata(value: unknown): FourCgsMetadata | undefined {
   }
   const metadata = value as FourCgsMetadata;
   const sceneTransform = validateSceneTransform(metadata.sceneTransform);
+  const cameraBookmarks = validateCameraBookmarks(metadata.cameraBookmarks);
   return {
     ...metadata,
     ...(sceneTransform ? { sceneTransform } : {}),
+    ...(cameraBookmarks ? { cameraBookmarks } : {}),
   };
 }
 
@@ -118,6 +174,20 @@ function sceneTransformsEqual(first: FourCgsSceneTransform, second: FourCgsScene
     && first.position.every((value, index) => value === second.position[index])
     && first.rotationEulerDegrees.every((value, index) => value === second.rotationEulerDegrees[index])
     && first.scale.every((value, index) => value === second.scale[index]);
+}
+
+function cameraBookmarksEqual(first: FourCgsCameraBookmarks, second: FourCgsCameraBookmarks): boolean {
+  return first.schemaVersion === second.schemaVersion
+    && first.coordinateSystem === second.coordinateSystem
+    && first.bookmarks.every((bookmark, index) => {
+      const other = second.bookmarks[index];
+      return bookmark === null || other === null
+        ? bookmark === other
+        : bookmark.distance === other.distance
+          && bookmark.pitch === other.pitch
+          && bookmark.yaw === other.yaw
+          && bookmark.target.every((value, component) => value === other.target[component]);
+    });
 }
 
 function positiveInteger(value: unknown, label: string): number {
@@ -243,19 +313,24 @@ export function locateFourCgsFrame(segments: readonly FourCgsSegment[], globalFr
   };
 }
 
-// #WDD-gpt 2026-08-16 - 4CGS Save As 只重写清单区并保留全部压缩流原字节，使场景变换可往返而不重新编码 Gaussian。
+// #WDD-gpt 2026-08-19 - 4CGS Save As 只重写清单区并保留全部压缩流原字节，使场景变换与视角书签可往返而不重新编码 Gaussian。
 export async function writeFourCgsFile(
   source: Blob,
   transform?: FourCgsTransformInput,
+  cameraBookmarkInputs?: readonly (FourCgsCameraBookmarkInput | null)[],
 ): Promise<Blob> {
   const { manifest, manifestBytes } = await readFourCgsManifest(source);
-  if (!transform) return source.slice(0, source.size, 'application/x-4cgs');
-  const sceneTransform = createFourCgsSceneTransform(transform);
+  if (!transform && cameraBookmarkInputs === undefined) return source.slice(0, source.size, 'application/x-4cgs');
+  const sceneTransform = transform ? createFourCgsSceneTransform(transform) : undefined;
+  const cameraBookmarks = cameraBookmarkInputs === undefined
+    ? undefined
+    : createFourCgsCameraBookmarks(cameraBookmarkInputs);
   const nextManifest: FourCgsManifest = {
     ...manifest,
     metadata: {
       ...manifest.metadata,
-      sceneTransform,
+      ...(sceneTransform ? { sceneTransform } : {}),
+      ...(cameraBookmarks ? { cameraBookmarks } : {}),
     },
   };
   const nextManifestBytes = new TextEncoder().encode(JSON.stringify(nextManifest));
@@ -265,11 +340,15 @@ export async function writeFourCgsFile(
   new DataView(header.buffer).setUint32(8, nextManifestBytes.byteLength, true);
   const streams = source.slice(FOUR_CGS_HEADER_BYTES + manifestBytes);
   const output = new Blob([header, nextManifestBytes, streams], { type: 'application/x-4cgs' });
-  // #WDD-gpt 2026-08-16 - 写完重新解析并逐项比对 TRS，避免清单可读但变换字段被覆盖或精度丢失。
+  // #WDD-gpt 2026-08-19 - 写完重新解析并逐项比对 TRS 与三个书签，避免清单可读但场景元数据被覆盖或精度丢失。
   const verified = await readFourCgsManifest(output);
-  if (!verified.manifest.metadata?.sceneTransform
-    || !sceneTransformsEqual(verified.manifest.metadata.sceneTransform, sceneTransform)) {
+  if (sceneTransform && (!verified.manifest.metadata?.sceneTransform
+    || !sceneTransformsEqual(verified.manifest.metadata.sceneTransform, sceneTransform))) {
     throw new Error('4CGS 完整场景变换写后校验失败。');
+  }
+  if (cameraBookmarks && (!verified.manifest.metadata?.cameraBookmarks
+    || !cameraBookmarksEqual(verified.manifest.metadata.cameraBookmarks, cameraBookmarks))) {
+    throw new Error('4CGS 视角书签写后校验失败。');
   }
   return output;
 }

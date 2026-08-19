@@ -109,7 +109,11 @@ describe('4CGS container', () => {
       position: [1.25, -2.5, 3.75],
       rotation: [12, 34, -56],
       scale: [0.5, 1.5, 2],
-    });
+    }, [
+      { distance: 3.5, pitch: -12, target: [1, 2, 3], yaw: 45 },
+      null,
+      { distance: 8, pitch: 30, target: [-4, 0.5, 6], yaw: -135 },
+    ]);
     const outputDirectory = await readFourCgsManifest(output);
     expect(outputDirectory.manifest.metadata?.sceneTransform).toEqual({
       schemaVersion: 1,
@@ -120,6 +124,15 @@ describe('4CGS container', () => {
       scale: [0.5, 1.5, 2],
     });
     expect(outputDirectory.manifest.metadata?.producer).toBe('fixture-editor');
+    expect(outputDirectory.manifest.metadata?.cameraBookmarks).toEqual({
+      schemaVersion: 1,
+      coordinateSystem: 'playcanvas-y-up',
+      bookmarks: [
+        { distance: 3.5, pitch: -12, target: [1, 2, 3], yaw: 45 },
+        null,
+        { distance: 8, pitch: 30, target: [-4, 0.5, 6], yaw: -135 },
+      ],
+    });
     expect(new Uint8Array(await output.slice(12 + outputDirectory.manifestBytes).arrayBuffer())).toEqual(sourceStreams);
 
     const secondOutput = await writeFourCgsFile(output, {
@@ -134,6 +147,7 @@ describe('4CGS container', () => {
       scale: [3, 2, 1],
     });
     expect(secondDirectory.manifest.metadata?.producer).toBe('fixture-editor');
+    expect(secondDirectory.manifest.metadata?.cameraBookmarks).toEqual(outputDirectory.manifest.metadata?.cameraBookmarks);
     expect(new Uint8Array(await secondOutput.slice(12 + secondDirectory.manifestBytes).arrayBuffer())).toEqual(sourceStreams);
   });
 
@@ -142,5 +156,14 @@ describe('4CGS container', () => {
     await expect(writeFourCgsFile(fixture(), {
       position: [0, 0, 0], rotation: [0, 0, 0], scale: [1, 0, 1],
     })).rejects.toThrow('三个正有限数值');
+    await expect(writeFourCgsFile(fixture(), undefined, [null, null]))
+      .rejects.toThrow('必须包含三个槽位');
+    await expect(readFourCgsManifest(fixture({
+      cameraBookmarks: {
+        schemaVersion: 1,
+        coordinateSystem: 'playcanvas-y-up',
+        bookmarks: [{ distance: 0, pitch: 0, target: [0, 0, 0], yaw: 0 }, null, null],
+      },
+    }))).rejects.toThrow('distance 必须是正有限数值');
   });
 });

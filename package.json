@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "npm run gs2mesh:wasm && npm run fourcgs:wasm && tsc -b && vite build",
+    "build": "npm run version:verify && npm run gs2mesh:wasm && npm run fourcgs:wasm && tsc -b && vite build && npm run version:verify -- --docs",
     "preview": "vite preview",
     "typecheck": "tsc -b --pretty false",
     "test": "vitest run",
@@ -18,7 +18,8 @@
     "fourcgs:encode-prs": "node scripts/encode-fourcgs-prs-morton.mjs",
     "fourcgs:decode-prs": "node scripts/decode-fourcgs-prs-morton.mjs",
     "fourcgs:decode-v24": "node scripts/decode-fourcgs-prs-morton.mjs --fast",
-    "gallery:verify": "node scripts/verify-fourcgs-gallery.mjs"
+    "gallery:verify": "node scripts/verify-fourcgs-gallery.mjs",
+    "version:verify": "node scripts/verify-release-version.mjs"
   },
   "dependencies": {
     "@mediapipe/tasks-vision": "^1.0.1",

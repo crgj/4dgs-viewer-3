@@ -16,6 +16,7 @@ import type { GaussianCylinderSelectionRegion } from '../runtime/selection/Gauss
 import {
   ViewportRuntime,
   type ViewportEditorTool,
+  type ViewportCameraState,
   type ViewportHistoryState,
   type ViewportMemoryUsage,
   type ViewportResidentRaw4DSegment,
@@ -33,6 +34,7 @@ interface GaussianViewportProps {
   onMemoryChange: (memory: ViewportMemoryUsage) => void;
   onPerformanceChange: (performance: ViewportPerformanceSnapshot) => void;
   onHistoryChange: (state: ViewportHistoryState) => void;
+  onCameraBookmarksChange: (bookmarks: readonly (ViewportCameraState | null)[]) => void;
   onRelightingChange: (state: RelightingState) => void;
   onRuntimeChange: (runtime: ViewportRuntime | null) => void;
   onSelectionChange: (state: ViewportSelectionState) => void;
@@ -72,12 +74,24 @@ interface ActiveRaw4DSequenceSession {
 function raw4DSequenceTimeline(descriptor: Raw4DSequenceDescriptor): {
   readonly keyframes: readonly number[];
   readonly segmentNodes: readonly number[];
+  readonly keyframeTracks: Readonly<Record<'position' | 'rotation' | 'colorDc' | 'scale' | 'opacity', readonly number[]>>;
 } {
   const keyframes = new Set<number>();
+  const keyframeTracks = {
+    position: new Set<number>(),
+    rotation: new Set<number>(),
+    colorDc: new Set<number>(),
+    scale: new Set<number>(),
+    opacity: new Set<number>(),
+  };
   for (const segment of descriptor.segments) {
     const globalOffset = segment.firstFrame - descriptor.firstFrame;
-    for (const frames of Object.values(segment.keyframes)) {
-      for (const localFrame of frames) keyframes.add(globalOffset + localFrame);
+    for (const [track, frames] of Object.entries(segment.keyframes)) {
+      for (const localFrame of frames) {
+        const frame = globalOffset + localFrame;
+        keyframes.add(frame);
+        keyframeTracks[track as keyof typeof keyframeTracks].add(frame);
+      }
     }
   }
   const segmentNodes = descriptor.segments.map((segment) => segment.firstFrame - descriptor.firstFrame);
@@ -85,6 +99,36 @@ function raw4DSequenceTimeline(descriptor: Raw4DSequenceDescriptor): {
   return {
     keyframes: [...keyframes].sort((a, b) => a - b),
     segmentNodes: [...new Set(segmentNodes)].sort((a, b) => a - b),
+    keyframeTracks: {
+      position: [...keyframeTracks.position].sort((a, b) => a - b),
+      rotation: [...keyframeTracks.rotation].sort((a, b) => a - b),
+      colorDc: [...keyframeTracks.colorDc].sort((a, b) => a - b),
+      scale: [...keyframeTracks.scale].sort((a, b) => a - b),
+      opacity: [...keyframeTracks.opacity].sort((a, b) => a - b),
+    },
+  };
+}
+
+function fourCgsSequenceStatus(descriptor: FourCgsDescriptor, segmentIndex: number): NonNullable<ViewportStatus['raw4dSequence']> {
+  const segmentNodes = descriptor.segments.map((segment) => segment.firstFrame - descriptor.firstFrame);
+  segmentNodes.push(descriptor.totalFrames - 1);
+  return {
+    segmentIndex,
+    segmentCount: descriptor.segments.length,
+    boundaryFramesRemoved: 0,
+    permanentTrackCount: descriptor.slotCount,
+    sharedShCoefficientCount: 0,
+    sharedShUpdateStateCount: 0,
+    sharedShSavedBytes: 0,
+    keyframes: [],
+    segmentNodes: [...new Set(segmentNodes)].sort((a, b) => a - b),
+    firstFrame: descriptor.firstFrame,
+    segments: descriptor.segments.map((segment) => ({
+      name: segment.name,
+      firstFrame: segment.firstFrame,
+      lastFrame: segment.lastFrame,
+      pointCount: segment.gaussianCount,
+    })),
   };
 }
 
@@ -96,6 +140,7 @@ export function GaussianViewport({
   onMemoryChange,
   onPerformanceChange,
   onHistoryChange,
+  onCameraBookmarksChange,
   onRelightingChange,
   onRuntimeChange,
   onSelectionChange,
@@ -148,12 +193,14 @@ export function GaussianViewport({
     const segment = session.descriptor.segments[location.segmentIndex];
     const residentSegment = session.residentSegments[location.segmentIndex];
     const gpuReady = runtime.isResidentRaw4DGpuReady(residentSegment);
+    const sequenceStatus = fourCgsSequenceStatus(session.descriptor, location.segmentIndex);
     const mappedStatus = (status: ViewportStatus): ViewportStatus => ({
       ...status,
       format: '4CGS',
       sourceName: session.sourceFile.name,
       objectName: session.sourceFile.name.replace(/\.4cgs$/i, ''),
       totalFrames: session.descriptor.totalFrames,
+      raw4dSequence: sequenceStatus,
       splatCount: status.phase === 'loading' ? segment.gaussianCount : status.splatCount,
       message: status.phase === 'loading'
         ? `正在载入 4CGS ${segment.name}：${status.message ?? ''}`
@@ -164,7 +211,7 @@ export function GaussianViewport({
         phase: 'loading', renderer: '4CGS V2.4', splatCount: segment.gaussianCount,
         progress: 0.98, totalFrames: session.descriptor.totalFrames, fps: 30, shBands: 3,
         sourceName: session.sourceFile.name, objectName: session.sourceFile.name.replace(/\.4cgs$/i, ''),
-        format: '4CGS', message: `正在从系统内存准备 4CGS ${segment.name}`,
+        format: '4CGS', raw4dSequence: sequenceStatus, message: `正在从系统内存准备 4CGS ${segment.name}`,
       });
     }
     try {
@@ -216,6 +263,14 @@ export function GaussianViewport({
       sharedShSavedBytes: session.descriptor.sharedSh.savedBytes,
       keyframes: timeline.keyframes,
       segmentNodes: timeline.segmentNodes,
+      keyframeTracks: timeline.keyframeTracks,
+      firstFrame: session.descriptor.firstFrame,
+      segments: session.descriptor.segments.map((entry) => ({
+        name: entry.name,
+        firstFrame: entry.firstFrame,
+        lastFrame: entry.lastFrame,
+        pointCount: entry.splatCount,
+      })),
     } as const;
     const mappedStatus = (status: ViewportStatus): ViewportStatus => ({
       ...status,
@@ -497,6 +552,8 @@ export function GaussianViewport({
           // #WDD-gpt 2026-08-16 - 通过运行时原子恢复 4CGS TRS，保证首帧实体与检查器使用同一份元数据。
           runtime.restoreSceneTransform(fourCgsSceneTransformToInput(descriptor.sceneTransform));
         }
+        // #WDD-gpt 2026-08-19 - 4CGS 内嵌书签在解码清单后立即恢复；旧文件显式清空三个槽位，禁止沿用上一场景。
+        onCameraBookmarksChange(descriptor.cameraBookmarks?.bookmarks ?? [null, null, null]);
         const extractionStartedAt = performance.now();
         let extractedCount = 0;
         // #WDD-gpt 2026-08-16 - 一次提交全部片段请求，减少六次主线程往返并让后续 Loader 池尽早接手。
@@ -585,7 +642,7 @@ export function GaussianViewport({
       active = false;
       runtime.cancelImport();
     };
-  }, [onStatusChange, runtimeReady, sourceFiles]);
+  }, [onCameraBookmarksChange, onStatusChange, runtimeReady, sourceFiles]);
 
   return <canvas aria-label={viewportLabel} className="viewport-canvas" ref={canvasRef} tabIndex={0} />;
 }

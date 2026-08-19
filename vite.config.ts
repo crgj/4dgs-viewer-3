@@ -1,6 +1,6 @@
 import { fileURLToPath, URL } from 'node:url';
 import { readFileSync } from 'node:fs';
-import { defineConfig } from 'vite';
+import { defineConfig, type Plugin } from 'vite';
 import react from '@vitejs/plugin-react';
 
 // #WDD-gpt 2026-08-16 - 以根目录 VERSION 作为唯一页面版本来源，避免品牌栏与发布文件各自硬编码。
@@ -8,6 +8,28 @@ const appVersion = readFileSync(fileURLToPath(new URL('./VERSION', import.meta.u
 
 if (!/^\d+\.\d+\.\d+$/.test(appVersion)) {
   throw new Error(`Invalid VERSION value: ${JSON.stringify(appVersion)}`);
+}
+
+// #WDD-gpt 2026-08-19 - 让入口 HTML 与独立版本清单也携带根 VERSION，发布后可直接核对主页和资源是否来自同一次构建。
+function releaseVersionPlugin(): Plugin {
+  return {
+    name: 'dong-editor-release-version',
+    transformIndexHtml: {
+      order: 'pre',
+      handler: () => [{
+        tag: 'meta',
+        attrs: { name: 'app-version', content: appVersion },
+        injectTo: 'head',
+      }],
+    },
+    generateBundle() {
+      this.emitFile({
+        type: 'asset',
+        fileName: 'version.json',
+        source: `${JSON.stringify({ version: appVersion }, null, 2)}\n`,
+      });
+    },
+  };
 }
 
 // #WDD-gpt 2026-08-15 - 开启跨源隔离以允许 Codec Worker 使用 SharedArrayBuffer 零拷贝共享。
@@ -19,7 +41,7 @@ const isolationHeaders = {
 
 export default defineConfig({
   base: './',
-  plugins: [react()],
+  plugins: [react(), releaseVersionPlugin()],
   define: {
     __APP_VERSION__: JSON.stringify(appVersion),
   },

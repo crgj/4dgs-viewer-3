@@ -51,6 +51,17 @@ describe('GaussianEditStore', () => {
     expect([1, 3, 7].every((stableId) => edits.isDeleted(stableId))).toBe(true);
   });
 
+  it('round-trips workspace selection and soft-deletion bitsets', () => {
+    const source = new GaussianEditStore(70);
+    source.setDeleted([0, 31, 32, 69]);
+    source.select([2, 34, 68]);
+    const restored = new GaussianEditStore(70);
+    restored.restoreBitsets(source.snapshotBitsets());
+    expect(restored.deletionCount).toBe(4);
+    expect(restored.selectedStableIds()).toEqual([2, 34, 68]);
+    expect(restored.isDeleted(69)).toBe(true);
+  });
+
   it('validates stable IDs and attribute component counts', () => {
     const edits = new GaussianEditStore(4);
     edits.defineAttribute({ name: 'normal', type: 'f32', components: 3 });

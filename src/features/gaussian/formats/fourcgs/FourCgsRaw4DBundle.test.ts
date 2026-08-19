@@ -55,7 +55,8 @@ function fp16Raw4D(name: string, rows: number): File {
   return new File([new TextEncoder().encode(header), body], name);
 }
 
-function compressibleFp16Raw4D(name: string, rows: number): File {
+// #WDD-gpt 2026-08-18 - 同一组 V2.6 测试属性可生成 FP16 RAW4D 或 Float32 PLY4，锁定内存精度转换边界。
+function compressibleRaw4D(name: string, rows: number, encoding: 'float16' | 'float32'): File {
   const properties = [
     'x', 'y', 'z', 'nx', 'ny', 'nz',
     'f_dc_0', 'f_dc_1', 'f_dc_2',
@@ -76,15 +77,19 @@ function compressibleFp16Raw4D(name: string, rows: number): File {
     'comment features_dc_bank_keyframe_stride 1',
     'comment scaling_bank_keyframe_stride 1',
     'comment opacity_bank_keyframe_stride 1',
-    'comment fp16_quantized 1',
+    ...(encoding === 'float16' ? ['comment fp16_quantized 1'] : []),
     `element vertex ${rows}`,
-    ...properties.map((property) => `property ushort ${property}`),
+    ...properties.map((property) => `property ${encoding === 'float16' ? 'ushort' : 'float'} ${property}`),
     'end_header', '',
   ].join('\n');
-  const body = new Uint16Array(rows * properties.length);
+  const body = encoding === 'float16'
+    ? new Uint16Array(rows * properties.length)
+    : new Float32Array(rows * properties.length);
   const index = new Map(properties.map((property, propertyIndex) => [property, propertyIndex]));
   for (let row = 0; row < rows; row += 1) {
-    const set = (property: string, value: number) => { body[row * properties.length + index.get(property)!] = floatToHalf(value); };
+    const set = (property: string, value: number) => {
+      body[row * properties.length + index.get(property)!] = encoding === 'float16' ? floatToHalf(value) : value;
+    };
     const position = [row * 0.002, (row % 5) * 0.003, (row % 7) * -0.002];
     for (const [axis, axisName] of ['x', 'y', 'z'].entries()) {
       set(axisName, position[axis]);
@@ -107,6 +112,10 @@ function compressibleFp16Raw4D(name: string, rows: number): File {
     set('rot_bank_0_w', 1);
   }
   return new File([new TextEncoder().encode(header), body], name);
+}
+
+function compressibleFp16Raw4D(name: string, rows: number): File {
+  return compressibleRaw4D(name, rows, 'float16');
 }
 
 describe('RAW4D 4CGS bundle helpers', () => {
@@ -186,6 +195,39 @@ describe('RAW4D 4CGS bundle helpers', () => {
     expect(manifest.segments[0].gaussianCount).toBe(15);
     expect(raw4dExport.sourceKind).toBe('canonical-memory-or-file-snapshot');
     expect(result.sourceSha256[0]).toMatch(/^[0-9a-f]{64}$/);
+  }, 30_000);
+
+  it('encodes multi-frame Float32 PLY4 memory and expands static fallback tracks', async () => {
+    const source = compressibleRaw4D('float32_memory_take.ply4', 16, 'float32');
+    const asset = await parseRaw4D(source, { sourceName: source.name });
+    const position = asset.position.values[0];
+    const firstPosition = position[1];
+    const multiFrameAsset = {
+      ...asset,
+      totalFrames: 3,
+      position: {
+        ...asset.position,
+        keyframes: [0, 2],
+        values: [...asset.position.values, ...asset.position.values],
+      },
+    };
+    const result = await encodeRaw4DV26BrowserMemory([{
+      name: source.name,
+      asset: multiFrameAsset,
+      deletionWords: new Uint32Array(1),
+    }]);
+    const { manifest } = await readFourCgsManifest(result.blob);
+    const raw4dExport = manifest.metadata?.raw4dExport as Record<string, unknown>;
+
+    expect(asset.sourceEncoding).toBe('float32');
+    expect(position).toBeInstanceOf(Float32Array);
+    expect(position[1]).toBe(firstPosition);
+    expect(result.encodedPointCount).toBe(16);
+    expect(manifest.segments[0].bankCounts).toEqual({ position: 2, rotation: 2, colorDc: 2, scale: 2, opacity: 2 });
+    expect(manifest.segments[0].keyframeStrides).toEqual({ position: 2, rotation: 2, colorDc: 2, scale: 2, opacity: 2 });
+    expect(raw4dExport.sourceScalarEncodings).toEqual(['float32']);
+    expect(raw4dExport.encodedScalarEncoding).toBe('float16');
+    expect(raw4dExport.precisionPolicy).toBe('explicit-float32-to-float16-worker-copy-before-v2.6');
   }, 30_000);
 
   it('round-trips an independently wrapped Scale-axis stream', async () => {

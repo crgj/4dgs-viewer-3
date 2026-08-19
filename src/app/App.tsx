@@ -81,6 +81,20 @@ import { ReleaseNotesDialog } from './components/ReleaseNotesDialog';
 import { MemoryPressureTestDialog } from './components/MemoryPressureTestDialog';
 import { AppNoticeDialog, type AppNoticeTone } from './components/AppNoticeDialog';
 import { FourCgsGalleryDialog } from './components/FourCgsGalleryDialog';
+import { SceneOutliner } from './components/SceneOutliner';
+import { GaussianHistogramPanel } from './components/GaussianHistogramPanel';
+import { WelcomePage } from './components/WelcomePage';
+import { ExportCenterDialog } from './components/ExportCenterDialog';
+import { supportsFourCgsSceneExport, type ExportTarget } from './components/ExportCenterModel';
+import { describeAppError } from './errors/AppError';
+import {
+  clearWorkspaceDraft,
+  loadWorkspaceDraft,
+  saveWorkspaceDraft,
+  workspaceSourceIdentities,
+  workspaceSourcesMatch,
+  type WorkspaceDraft,
+} from './workspace/WorkspaceState';
 import { parseReleaseNotes } from './releaseNotes';
 import type { BrowserMemoryPressureResult } from '../features/gaussian/memory/BrowserMemoryPressureTest';
 import {
@@ -380,12 +394,13 @@ const gaussianRenderModes: Array<{
 ];
 
 type MenuName = 'file' | 'view' | 'plugins' | null;
-type InspectorTab = 'transform' | 'gaussian' | 'performance';
+type InspectorTab = 'scene' | 'transform' | 'gaussian' | 'performance';
 type PluginId = 'smart-alignment' | 'relighting' | 'model-health';
 type PluginStatusTone = 'idle' | 'running' | 'success' | 'error';
 type PluginWindowPosition = { readonly x: number; readonly y: number };
 
 const inspectorTabs: ReadonlyArray<{ readonly id: InspectorTab; readonly labelKey: keyof UiCopy }> = [
+  { id: 'scene', labelKey: 'tabScene' },
   { id: 'transform', labelKey: 'tabTransform' },
   { id: 'gaussian', labelKey: 'tabGaussian' },
   { id: 'performance', labelKey: 'tabPerformance' },
@@ -426,7 +441,7 @@ export function App() {
   const [pluginWindowPosition, setPluginWindowPosition] = useState<PluginWindowPosition>({ x: 0, y: 0 });
   //WDD-gpt 2026-08-15 - 默认收起低频检查器，把启动后的主要空间完整留给4DGS视口。
   const [inspectorPanelVisible, setInspectorPanelVisible] = useState(false);
-  const [inspectorTab, setInspectorTab] = useState<InspectorTab>('performance');
+  const [inspectorTab, setInspectorTab] = useState<InspectorTab>('scene');
   const [language, setLanguage] = useState<UiLanguage>('zh');
   const [sceneName, setSceneName] = useState<string | null>(null);
   const [sourceFiles, setSourceFiles] = useState<readonly File[]>([]);
@@ -447,6 +462,7 @@ export function App() {
   const [sceneTransform, setSceneTransform] = useState<ViewportTransform>(createInitialTransform);
   const [uniformScale, setUniformScale] = useState(true);
   const [exportProgress, setExportProgress] = useState<number | null>(null);
+  const [exportCenterVisible, setExportCenterVisible] = useState(false);
   const [exportMonitor, setExportMonitor] = useState<ExportMonitorState | null>(null);
   const [exportElapsedMs, setExportElapsedMs] = useState(0);
   const [viewportRuntime, setViewportRuntime] = useState<ViewportRuntime | null>(null);
@@ -471,7 +487,17 @@ export function App() {
     readonly message: string;
     readonly title: string;
     readonly tone: AppNoticeTone;
+    readonly details?: string;
+    readonly suggestion?: string;
+    readonly retryLabel?: string;
+    readonly onRetry?: () => void;
   } | null>(null);
+  const [workspaceDraft, setWorkspaceDraft] = useState<WorkspaceDraft | null>(null);
+  const [workspaceSaveState, setWorkspaceSaveState] = useState<'empty' | 'saving' | 'saved' | 'recovery'>('empty');
+  const [workspaceSavedAt, setWorkspaceSavedAt] = useState<number | null>(null);
+  const [workspaceSaveTick, setWorkspaceSaveTick] = useState(0);
+  const [cameraBookmarks, setCameraBookmarks] = useState<readonly (NonNullable<ReturnType<ViewportRuntime['getCameraState']>> | null)[]>([null, null, null]);
+  const [timelineDetailsVisible, setTimelineDetailsVisible] = useState(false);
   const [memoryMode, setMemoryMode] = useState<Gaussian4DMemoryMode>(DEFAULT_GAUSSIAN_4D_MEMORY_MODE);
   const [pendingLocalMaximumMode, setPendingLocalMaximumMode] = useState(false);
   const [releaseNotesVisible, setReleaseNotesVisible] = useState(false);
@@ -491,6 +517,8 @@ export function App() {
     readonly origin: PluginWindowPosition;
   } | null>(null);
   const fileDragDepthRef = useRef(0);
+  const workspaceSaveBusyRef = useRef(false);
+  const restoredWorkspaceSignatureRef = useRef<string | null>(null);
   const smartAlignmentPluginRef = useRef<SmartAlignmentPlugin | null>(null);
   const gs2MeshPluginRef = useRef<GS2MeshPlugin | null>(null);
   if (!smartAlignmentPluginRef.current) smartAlignmentPluginRef.current = new SmartAlignmentPlugin();
@@ -598,11 +626,26 @@ export function App() {
   const gaussianCountLocale = language === 'zh' ? 'zh-CN' : 'en-US';
   const sourceFile = sourceFiles.length === 1 ? sourceFiles[0] : null;
   const localizedStatusMessage = localizeRuntimeMessage(language, status.message);
+  const viewportErrorDescription = status.phase === 'error'
+    ? describeAppError(status.message ?? status.renderer, language, status.renderer)
+    : null;
   const showAppNotice = (message: string, title?: string, tone: AppNoticeTone = 'error') => {
     setAppNotice({
       message,
       title: title ?? (language === 'zh' ? '操作未完成' : 'Operation not completed'),
       tone,
+    });
+  };
+  const showAppError = (error: unknown, context?: string, onRetry?: () => void) => {
+    const description = describeAppError(error, language, context);
+    setAppNotice({
+      message: description.summary,
+      title: description.title,
+      tone: 'error',
+      suggestion: description.suggestion,
+      details: description.details,
+      retryLabel: language === 'zh' ? '重试' : 'Retry',
+      onRetry,
     });
   };
   const pluginStatusById: Readonly<Record<PluginId, PluginStatusTone>> = {
@@ -625,6 +668,116 @@ export function App() {
     smartAlignmentPluginRef.current?.dispose();
     gs2MeshPluginRef.current?.dispose();
   }, []);
+
+  useEffect(() => {
+    let active = true;
+    loadWorkspaceDraft().then((draft) => {
+      if (!active || !draft) return;
+      setWorkspaceDraft(draft);
+      setWorkspaceSavedAt(draft.savedAt);
+      setWorkspaceSaveState('recovery');
+      setInspectorPanelVisible(true);
+      setInspectorTab('scene');
+    }).catch((error) => showAppError(error, 'workspace-load'));
+    return () => { active = false; };
+    // #WDD-gpt 2026-08-18 - 初次挂载只读取一次恢复点，避免界面状态变化反复覆盖用户当前操作。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    if (status.phase !== 'ready' || sourceFiles.length === 0) return;
+    const interval = window.setInterval(() => setWorkspaceSaveTick((value) => value + 1), 8_000);
+    return () => window.clearInterval(interval);
+  }, [sourceFiles.length, status.phase]);
+
+  useEffect(() => {
+    if (!workspaceDraft || !viewportRuntime || status.phase !== 'ready' || sourceFiles.length === 0) return;
+    if (!workspaceSourcesMatch(workspaceDraft.sources, sourceFiles)) {
+      setWorkspaceSaveState('recovery');
+      return;
+    }
+    const signature = workspaceDraft.sources.map((source) => `${source.name}:${source.size}:${source.lastModified}`).join('|');
+    if (restoredWorkspaceSignatureRef.current === signature) return;
+    try {
+      if (workspaceDraft.edits.length > 0) {
+        // #WDD-gpt 2026-08-18 - 重新选择同名文件时先等待运行时接管新的 File 对象，避免旧场景 ready 状态触发一次虚假的编辑快照不匹配错误。
+        try {
+          viewportRuntime.snapshotRaw4DExportMemory(sourceFiles);
+        } catch {
+          return;
+        }
+        viewportRuntime.restoreGaussianEditState(workspaceDraft.edits);
+      }
+      setSceneName(workspaceDraft.sceneName);
+      setCurrentFrame(Math.max(0, Math.min(timelineEndFrame, workspaceDraft.view.currentFrame)));
+      setPlaybackFps(workspaceDraft.view.playbackFps);
+      setRenderMode(workspaceDraft.view.renderMode);
+      setShLevel(workspaceDraft.view.shLevel);
+      setShowGrid(workspaceDraft.view.showGrid);
+      setShowAxes(workspaceDraft.view.showAxes);
+      setShowHeightRuler(workspaceDraft.view.showHeightRuler);
+      setShowGaussianEnvelope(workspaceDraft.view.showGaussianEnvelope);
+      setGaussianVisible(workspaceDraft.view.gaussianVisible);
+      setGS2MeshVisible(workspaceDraft.view.gs2MeshVisible);
+      setSceneTransform(workspaceDraft.view.sceneTransform);
+      setInspectorTab(workspaceDraft.view.inspectorTab);
+      setCameraBookmarks(workspaceDraft.view.cameraBookmarks ?? [null, null, null]);
+      if (workspaceDraft.view.camera) viewportRuntime.setCameraState(workspaceDraft.view.camera);
+      viewportRuntime.setGaussianVisible(workspaceDraft.view.gaussianVisible);
+      viewportRuntime.setGS2MeshVisible(workspaceDraft.view.gs2MeshVisible);
+      restoredWorkspaceSignatureRef.current = signature;
+      setWorkspaceSaveState('saved');
+      setInspectorPanelVisible(true);
+    } catch (error) {
+      showAppError(error, 'workspace-restore');
+    }
+  }, [sourceFiles, status.bufferId, status.phase, timelineEndFrame, viewportRuntime, workspaceDraft]);
+
+  useEffect(() => {
+    if (!viewportRuntime || status.phase !== 'ready' || sourceFiles.length === 0 || workspaceSaveBusyRef.current) return;
+    const timeout = window.setTimeout(() => {
+      workspaceSaveBusyRef.current = true;
+      setWorkspaceSaveState('saving');
+      const savedAt = Date.now();
+      const draft: WorkspaceDraft = {
+        schemaVersion: 1,
+        savedAt,
+        sceneName: displaySceneName,
+        sources: workspaceSourceIdentities(sourceFiles),
+        view: {
+          camera: viewportRuntime.getCameraState(),
+          cameraBookmarks,
+          currentFrame,
+          gaussianVisible,
+          gs2MeshVisible,
+          inspectorTab,
+          playbackFps,
+          renderMode,
+          sceneTransform,
+          shLevel,
+          showAxes,
+          showGaussianEnvelope,
+          showGrid,
+          showHeightRuler,
+        },
+        edits: viewportRuntime.snapshotGaussianEditState(),
+      };
+      saveWorkspaceDraft(draft).then(() => {
+        setWorkspaceDraft(draft);
+        setWorkspaceSavedAt(savedAt);
+        setWorkspaceSaveState('saved');
+      }).catch((error) => {
+        setWorkspaceSaveState('recovery');
+        showAppError(error, 'workspace-save');
+      }).finally(() => { workspaceSaveBusyRef.current = false; });
+    }, 900);
+    return () => window.clearTimeout(timeout);
+  }, [
+    cameraBookmarks, currentFrame, displaySceneName, gaussianVisible, gs2MeshVisible, inspectorTab,
+    playbackFps, renderMode, sceneTransform, selectionState.deletedCount, selectionState.selectedCount,
+    shLevel, showAxes, showGaussianEnvelope, showGrid, showHeightRuler, sourceFiles, status.bufferId,
+    status.phase, viewportRuntime, workspaceSaveTick,
+  ]);
 
   // #WDD-gpt 2026-08-16 - 保存监督框使用主线程时钟持续刷新，即使编码 Worker 正在执行长时间同步压缩也不会看起来卡死。
   useEffect(() => {
@@ -668,6 +821,17 @@ export function App() {
         return;
       }
       if (isTextEntryTarget(event.target)) return;
+      if (event.key === 'Home') {
+        event.preventDefault();
+        viewportRuntime?.frameScene();
+        setIsPlaying(false);
+        return;
+      }
+      if (event.key.toLowerCase() === 'f' && !event.ctrlKey && !event.metaKey && !event.altKey) {
+        event.preventDefault();
+        void focusSelection();
+        return;
+      }
       if (isEditorUndoShortcut(event)) {
         event.preventDefault();
         viewportRuntime?.undo();
@@ -698,7 +862,7 @@ export function App() {
     };
     window.addEventListener('keydown', onKeyDown, { capture: true });
     return () => window.removeEventListener('keydown', onKeyDown, { capture: true });
-  }, [viewportRuntime]);
+  }, [language, selectionScope, viewportRuntime]);
 
   useEffect(() => {
     if (!isPlaying) return;
@@ -921,6 +1085,20 @@ export function App() {
     downloadBlob(blob, filename);
   };
 
+  const openExportCenter = () => {
+    setOpenMenu(null);
+    setIsPlaying(false);
+    if (sourceFiles.length === 0 || status.splatCount <= 0) {
+      showAppNotice(
+        language === 'zh' ? '当前场景没有可导出的高斯数据，请先导入场景。' : 'The scene has no Gaussian data to export. Import a scene first.',
+        language === 'zh' ? '场景为空' : 'Empty scene',
+        'warning',
+      );
+      return;
+    }
+    setExportCenterVisible(true);
+  };
+
   // #WDD-gpt  2026-08-16 - RAW4D 保存时根据软删除位集输出压实文件；编辑中的源数据保持稳定 ID。
   const exportWorkspace = async () => {
     setOpenMenu(null);
@@ -938,7 +1116,7 @@ export function App() {
       return;
     }
     const canonicalDataDirty = viewportRuntime?.hasCanonicalGaussianDataChanges() ?? false;
-    const exportsFourCgs = status.format === 'RAW4D' || status.format === '4CGS';
+    const exportsFourCgs = supportsFourCgsSceneExport(status.format ?? '');
     let fourCgsFileHandle: FileSystemFileHandle | null = null;
     if (exportsFourCgs) {
       if (status.format === '4CGS' && !canonicalDataDirty && !sourceFile) {
@@ -974,14 +1152,11 @@ export function App() {
         fourCgsFileHandle = await window.showSaveFilePicker(createFourCgsSavePickerOptions(`${stem}.4cgs`));
       } catch (error) {
         if (isFilePickerAbort(error)) return;
-        showAppNotice(
-          error instanceof Error ? error.message : String(error),
-          language === 'zh' ? '无法选择 4CGS 保存位置' : 'Cannot choose a 4CGS save location',
-        );
+        showAppError(error, '4cgs-save-permission', () => { void exportWorkspace(); });
         return;
       }
     }
-    if ((status.format === 'RAW4D' && sourceFiles.length > 0)
+    if (((status.format === 'RAW4D' || status.format === 'PLY4') && sourceFiles.length > 0)
       || (status.format === '4CGS' && canonicalDataDirty)) {
       // #WDD-gpt 2026-08-16 - RAW4D 默认导出冻结当前 Canonical RAM 与编辑位集，不再回读拖入时的 File 属性载荷。
       const controller = new AbortController();
@@ -1030,7 +1205,7 @@ export function App() {
             message: '压缩载荷完成，正在写入场景元数据',
           }].slice(-12),
         } : current);
-        const blob = await writeFourCgsFile(result.blob, sceneTransform);
+        const blob = await writeFourCgsFile(result.blob, sceneTransform, cameraBookmarks);
         if (controller.signal.aborted) throw new DOMException('4CGS 保存已取消。', 'AbortError');
         setExportProgress(1);
         const outputFilename = fourCgsFileHandle?.name ?? result.filename;
@@ -1073,15 +1248,12 @@ export function App() {
       if (!sourceFile) return;
       setExportProgress(0.05);
       try {
-        const blob = await writeFourCgsFile(sourceFile, sceneTransform);
+        const blob = await writeFourCgsFile(sourceFile, sceneTransform, cameraBookmarks);
         setExportProgress(1);
         const stem = (sceneName ?? status.objectName ?? 'dong-editor-3').replace(/\.4cgs$/i, '');
         await commitExportBlob(blob, `${stem}.4cgs`, fourCgsFileHandle);
       } catch (error) {
-        showAppNotice(
-          error instanceof Error ? error.message : String(error),
-          language === 'zh' ? '4CGS 保存失败' : '4CGS save failed',
-        );
+        showAppError(error, '4cgs-export', () => { void exportWorkspace(); });
       } finally {
         setExportProgress(null);
       }
@@ -1095,10 +1267,7 @@ export function App() {
         const stem = (sceneName ?? status.objectName ?? 'dong-editor-3').replace(/\.(?:raw4d|ply4)$/i, '');
         downloadBlob(blob, `${stem}.${preservePly4Extension ? 'ply4' : 'raw4d'}`);
       } catch (error) {
-        showAppNotice(
-          error instanceof Error ? error.message : String(error),
-          language === 'zh' ? '场景导出失败' : 'Scene export failed',
-        );
+        showAppError(error, 'scene-export', () => { void exportWorkspace(); });
       } finally {
         setExportProgress(null);
       }
@@ -1273,6 +1442,12 @@ export function App() {
     gs2MeshPluginRef.current?.exportLastResult();
   };
 
+  const runExportTarget = (target: ExportTarget) => {
+    setExportCenterVisible(false);
+    if (target === 'ply-sequence') exportPlySequence();
+    else void exportWorkspace();
+  };
+
   const cancelExport = () => exportAbortRef.current?.abort();
 
   const closeExportMonitor = () => {
@@ -1307,10 +1482,12 @@ export function App() {
     setOriginBakeProgress(null);
     setOriginBakeResult(null);
     setOriginBakeError(null);
+    // #WDD-gpt 2026-08-19 - 打开任何新场景先清空书签；4CGS 解码完成后再以文件内三个槽位恢复。
+    setCameraBookmarks([null, null, null]);
     setActiveGalleryId(null);
     setActivePlugin(null);
     setInspectorPanelVisible(true);
-    setInspectorTab('transform');
+    setInspectorTab('scene');
     setCurrentFrame(0);
     setIsPlaying(false);
     // #WDD-gpt 2026-08-16 - 即使文件名相同也建立新数组，保证再次拖入会取消旧导入并正式重开场景。
@@ -1371,7 +1548,7 @@ export function App() {
   const newWorkspace = () => {
     // #WDD-gpt 2026-08-17 - 新建工作区强制刷新当前地址，确保 Worker、WASM、GPU 与大型场景内存全部从浏览器层重新初始化。
     setOpenMenu(null);
-    window.location.reload();
+    void clearWorkspaceDraft().finally(() => window.location.reload());
   };
 
   const runModelHealth = async (clean: boolean) => {
@@ -1383,10 +1560,7 @@ export function App() {
         : await viewportRuntime.analyzeModelHealth();
       setModelHealthReport(report);
     } catch (error) {
-      showAppNotice(
-        error instanceof Error ? error.message : String(error),
-        language === 'zh' ? '模型健康操作失败' : 'Model health operation failed',
-      );
+      showAppError(error, 'model-health', () => { void runModelHealth(clean); });
     } finally {
       setModelHealthBusy(false);
     }
@@ -1399,7 +1573,39 @@ export function App() {
   }, [currentFrame, playbackFps]);
 
   const frameDigits = Math.max(4, String(timelineEndFrame + 1).length);
-  const frameCounter = `${copy.frameShort} [${String(currentFrame).padStart(frameDigits, '0')}] / ${copy.totalFramesShort} [${String(timelineEndFrame + 1).padStart(frameDigits, '0')}]`;
+  const sourceFrame = (status.raw4dSequence?.firstFrame ?? 0) + currentFrame;
+  const frameCounter = `${copy.frameShort} [${String(currentFrame).padStart(frameDigits, '0')}] / ${copy.totalFramesShort} [${String(timelineEndFrame + 1).padStart(frameDigits, '0')}]${status.raw4dSequence ? ` · ${language === 'zh' ? '源帧' : 'Source'} [${String(sourceFrame).padStart(frameDigits, '0')}]` : ''}`;
+
+  const focusScene = () => {
+    setIsPlaying(false);
+    viewportRuntime?.frameScene();
+  };
+  // #WDD-gpt 2026-08-19 - 快捷键与 Outliner 共用异步聚焦入口，使全局选择可在跨片段取数完成后再构图。
+  const focusSelection = async () => {
+    setIsPlaying(false);
+    try {
+      if (!viewportRuntime || await viewportRuntime.frameSelectedGaussians()) return;
+      const global = selectionScope === 'global';
+      showAppNotice(
+        language === 'zh'
+          ? (global ? '全局范围内没有选中的 Gaussian。' : '当前活动片段没有选中的 Gaussian。')
+          : (global ? 'There are no selected Gaussians in the global scope.' : 'There are no selected Gaussians in the active segment.'),
+        language === 'zh' ? '没有可聚焦的选择' : 'Nothing selected to focus',
+        'warning',
+      );
+    } catch (error) {
+      showAppError(error, language === 'zh' ? '聚焦选中失败' : 'Focus selection failed');
+    }
+  };
+  const saveCameraBookmark = (index: number) => {
+    const camera = viewportRuntime?.getCameraState();
+    if (!camera) return;
+    setCameraBookmarks((current) => current.map((bookmark, bookmarkIndex) => bookmarkIndex === index ? camera : bookmark));
+  };
+  const recallCameraBookmark = (index: number) => {
+    const camera = cameraBookmarks[index];
+    if (camera) viewportRuntime?.transitionCameraState(camera);
+  };
 
   const timelineMarks = useMemo(
     () => [...new Set(Array.from({ length: 5 }, (_, index) => Math.round(timelineEndFrame * index / 4)))],
@@ -1411,10 +1617,15 @@ export function App() {
     () => (status.raw4dSequence?.keyframes ?? []).filter((frame) => !timelineSegmentNodeSet.has(frame)),
     [status.raw4dSequence?.keyframes, timelineSegmentNodeSet],
   );
+  const timelineSegments = status.raw4dSequence?.segments ?? [];
+  const timelineKeyframeTracks = status.raw4dSequence?.keyframeTracks;
+  const activeTimelineSegment = status.raw4dSequence
+    ? timelineSegments[status.raw4dSequence.segmentIndex]
+    : null;
 
   return (
     <main
-      className="studio-shell"
+      className={sourceFiles.length === 0 ? 'studio-shell welcome-mode' : 'studio-shell'}
       data-source-name={status.sourceName ?? ''}
       data-status-phase={status.phase}
       data-raw4d-segments={status.raw4dSequence?.segmentCount ?? 0}
@@ -1477,21 +1688,8 @@ export function App() {
                 <button onClick={newWorkspace} type="button"><span>{copy.newWorkspace}</span></button>
                 {/* #WDD-gpt 2026-08-16 - 文件菜单补齐与顶部按钮一致的导入、导出入口。 */}
                 <button onClick={() => { setOpenMenu(null); fileInputRef.current?.click(); }} type="button"><span>{copy.import}</span></button>
-                {/* #WDD-gpt 2026-08-17 - 导出提供 .4cgs 文件与 .ply 序列二级子菜单，悬停展开。 */}
-                <div className="submenu-anchor">
-                  <button disabled={exportProgress !== null} type="button">
-                    <span>{copy.export}</span>
-                    <b aria-hidden="true">▸</b>
-                  </button>
-                  <div className="dropdown-menu export-submenu">
-                    <button disabled={exportProgress !== null} onClick={() => void exportWorkspace()} type="button">
-                      <span>{copy.exportFourCgsFile}</span>
-                    </button>
-                    <button disabled={exportProgress !== null} onClick={exportPlySequence} type="button">
-                      <span>{copy.exportPlySequence}</span>
-                    </button>
-                  </div>
-                </div>
+                {/* #WDD-gpt 2026-08-18 - 文件菜单只保留一个导出中心入口，格式、范围和检查信息在统一对话框中选择。 */}
+                <button disabled={exportProgress !== null} onClick={openExportCenter} type="button"><span>{copy.export}</span></button>
               </div>
             )}
           </div>
@@ -1584,7 +1782,16 @@ export function App() {
         <div className="scene-document">
           <span className="status-dot cyan" />
           <strong>{displaySceneName}</strong>
-          <span className="unsaved-dot has-tip" data-tip={copy.unsaved} />
+          <span
+            className={`unsaved-dot workspace-${workspaceSaveState} has-tip`}
+            data-tip={workspaceSaveState === 'saved'
+              ? (language === 'zh' ? '工作区已自动保存' : 'Workspace autosaved')
+              : workspaceSaveState === 'saving'
+                ? (language === 'zh' ? '正在自动保存' : 'Autosaving')
+                : workspaceSaveState === 'recovery'
+                  ? (language === 'zh' ? '存在可恢复工作区' : 'Recoverable workspace found')
+                  : copy.unsaved}
+          />
         </div>
 
         <div className="top-actions">
@@ -1595,7 +1802,7 @@ export function App() {
           <button className="quiet-button has-tip" data-tip={copy.chooseImportFile} onClick={() => fileInputRef.current?.click()} type="button">
             <Icon name="folder" />{copy.import}
           </button>
-          <button className="primary-button has-tip" data-tip={copy.exportTip} disabled={exportProgress !== null} onClick={() => void exportWorkspace()} type="button">
+          <button className="primary-button has-tip" data-tip={copy.exportTip} disabled={exportProgress !== null} onClick={openExportCenter} type="button">
             <Icon name="export" />{exportProgress === null ? copy.export : `${copy.savingRaw4D} ${Math.round(exportProgress * 100)}%`}
           </button>
         </div>
@@ -1613,10 +1820,32 @@ export function App() {
       {appNotice && (
         <AppNoticeDialog
           confirmLabel={language === 'zh' ? '确定' : 'OK'}
+          details={appNotice.details}
           message={appNotice.message}
           onClose={() => setAppNotice(null)}
+          onRetry={appNotice.onRetry ? () => {
+            const retry = appNotice.onRetry;
+            setAppNotice(null);
+            retry?.();
+          } : undefined}
+          retryLabel={appNotice.retryLabel}
+          suggestion={appNotice.suggestion}
           title={appNotice.title}
           tone={appNotice.tone}
+        />
+      )}
+
+      {exportCenterVisible && (
+        <ExportCenterDialog
+          deletedCount={statusDeletedCount}
+          format={status.format ?? 'Scene'}
+          frameCount={timelineEndFrame + 1}
+          inputBytes={sourceFiles.reduce((sum, file) => sum + file.size, 0)}
+          language={language}
+          onClose={() => setExportCenterVisible(false)}
+          onExport={runExportTarget}
+          sceneName={displaySceneName}
+          segmentCount={status.raw4dSequence?.segmentCount ?? 1}
         />
       )}
 
@@ -1853,6 +2082,7 @@ export function App() {
             currentFrame={currentFrame}
             memoryPolicy={memoryPolicy}
             onHistoryChange={setHistoryState}
+            onCameraBookmarksChange={setCameraBookmarks}
             onMemoryChange={setMemoryUsage}
             onPerformanceChange={setPerformanceSnapshot}
             onRelightingChange={setRelightingState}
@@ -1874,6 +2104,14 @@ export function App() {
             uniformScale={uniformScale}
             viewportLabel={copy.viewportCanvas}
           />
+          {sourceFiles.length === 0 && (
+            <WelcomePage
+              language={language}
+              onBrowse={() => fileInputRef.current?.click()}
+              onOpenGallery={openFourCgsGallery}
+              recoverySources={workspaceDraft?.sources.map((source) => source.name) ?? []}
+            />
+          )}
           <div className="viewport-toolbar" data-camera-input-block>
             <div aria-label={copy.renderModes} className="render-mode-switch" role="group">
               {gaussianRenderModes.map((mode) => (
@@ -1911,12 +2149,12 @@ export function App() {
             {/* #WDD-gpt 2026-08-16 - 序列摘要并入顶部工具栏，避免单独占用第二行遮挡视口。 */}
             {status.phase === 'ready' && status.raw4dSequence && (
               <div className="raw4d-sequence-badge">
-                <strong>RAW4D × {status.raw4dSequence.segmentCount}</strong>
+                <strong>{status.format} × {status.raw4dSequence.segmentCount}</strong>
                 <span>{copy.sequenceSegment} {status.raw4dSequence.segmentIndex + 1}/{status.raw4dSequence.segmentCount}</span>
-                <span>{copy.sequenceBoundaryMerged} {status.raw4dSequence.boundaryFramesRemoved}</span>
+                {status.format === 'RAW4D' && <span>{copy.sequenceBoundaryMerged} {status.raw4dSequence.boundaryFramesRemoved}</span>}
                 <span>{copy.sequenceTracks} {status.raw4dSequence.permanentTrackCount.toLocaleString(language === 'zh' ? 'zh-CN' : 'en-US')}</span>
-                <span>SH{status.shBands ?? 0} · {status.raw4dSequence.sharedShCoefficientCount}D</span>
-                <span>{copy.sequenceShSeparated} {(Math.max(0, status.raw4dSequence.sharedShSavedBytes) / 1_000_000).toFixed(3)}M</span>
+                <span>SH{status.shBands ?? 0}</span>
+                {status.format === 'RAW4D' && <span>{copy.sequenceShSeparated} {(Math.max(0, status.raw4dSequence.sharedShSavedBytes) / 1_000_000).toFixed(3)}M</span>}
               </div>
             )}
           </div>
@@ -1930,8 +2168,11 @@ export function App() {
           />
           {status.phase === 'error' && (
             <div className="viewport-error">
-              <strong>{copy.viewportFailed}</strong>
-              <span>{localizedStatusMessage}</span>
+              <strong>{viewportErrorDescription?.title ?? copy.viewportFailed}</strong>
+              <span>{viewportErrorDescription?.summary ?? localizedStatusMessage}</span>
+              {viewportErrorDescription?.suggestion && <p>{viewportErrorDescription.suggestion}</p>}
+              {sourceFiles.length > 0 && <button onClick={() => setSourceFiles([...sourceFiles])} type="button">{language === 'zh' ? '重新载入场景' : 'Reload scene'}</button>}
+              {viewportErrorDescription?.details && <details><summary>Technical details</summary><code>{viewportErrorDescription.details}</code></details>}
             </div>
           )}
           {status.phase === 'loading' && (
@@ -2142,6 +2383,36 @@ export function App() {
           </nav>
 
           <div className="inspector-tab-content">
+            {inspectorTab === 'scene' && (
+              <SceneOutliner
+                cameraBookmarks={cameraBookmarks}
+                gaussianVisible={gaussianVisible}
+                gs2MeshVisible={gs2MeshVisible}
+                hasMesh={hasGS2Mesh}
+                language={language}
+                lightCount={relightingState.lights.length}
+                onFocusScene={focusScene}
+                onFocusSelection={focusSelection}
+                onFrameChange={(frame) => { setCurrentFrame(frame); setIsPlaying(false); }}
+                onGaussianVisibleChange={changeGaussianVisible}
+                onMeshVisibleChange={changeGS2MeshVisible}
+                onRecallBookmark={recallCameraBookmark}
+                onSaveBookmark={saveCameraBookmark}
+                onToggleAxes={() => setShowAxes((visible) => !visible)}
+                onToggleEnvelope={() => setShowGaussianEnvelope((visible) => !visible)}
+                onToggleGrid={() => setShowGrid((visible) => !visible)}
+                onToggleRuler={() => setShowHeightRuler((visible) => !visible)}
+                recoverySources={workspaceDraft?.sources.map((source) => source.name) ?? []}
+                sceneName={sourceFiles.length === 0 && workspaceDraft ? workspaceDraft.sceneName : displaySceneName}
+                showAxes={showAxes}
+                showEnvelope={showGaussianEnvelope}
+                showGrid={showGrid}
+                showRuler={showHeightRuler}
+                status={status}
+                workspaceSavedAt={workspaceSavedAt}
+                workspaceState={workspaceSaveState}
+              />
+            )}
             {inspectorTab === 'transform' && (
               <section aria-labelledby="inspector-tab-transform" className="inspector-section" id="inspector-panel-transform" role="tabpanel">
                 {/* #WDD-gpt 2026-08-16 - 变换统一使用世界空间，移除无实际工作流价值的局部/世界重复开关。 */}
@@ -2353,10 +2624,28 @@ export function App() {
             </section>
           </div>
         )}
+        {sourceFiles.length > 0 && status.phase === 'ready' && (
+          <GaussianHistogramPanel
+            bufferId={status.bufferId}
+            currentFrame={currentFrame}
+            deletedCount={selectionState.deletedCount ?? 0}
+            inspectorOpen={inspectorPanelVisible}
+            language={language}
+            onScopeChange={(scope) => {
+              setSelectionScope(scope);
+              setIsPlaying(false);
+            }}
+            onSelectionCreated={() => {
+              setActiveTool('select-rect');
+              setIsPlaying(false);
+            }}
+            runtime={viewportRuntime}
+            scope={selectionScope}
+          />
+        )}
       </section>
 
-
-      <section aria-label={copy.timeline} className="timeline-panel glass-panel" data-camera-input-block>
+      {sourceFiles.length > 0 && <section aria-label={copy.timeline} className="timeline-panel glass-panel" data-camera-input-block>
         <div className="playback-controls">
           <button aria-label={copy.firstFrame} className="has-tip" data-tip={copy.firstFrame} onClick={() => { setCurrentFrame(0); setIsPlaying(false); }} type="button"><Icon name="stepBack" size={15} /></button>
           <button aria-label={copy.previousFrame} className="has-tip" data-tip={copy.previousFrame} onClick={() => { setCurrentFrame((frame) => Math.max(0, frame - 1)); setIsPlaying(false); }} type="button"><span>−1</span></button>
@@ -2369,17 +2658,25 @@ export function App() {
           <div className="timeline-header">
             <div className="timeline-title">
               <span>{copy.masterTimeline}</span>
-              {status.raw4dSequence && (
-                <small><i className="keyframe-swatch" />{copy.timelineKeyframes}<i className="segment-swatch" />{copy.timelineSegments}</small>
-              )}
+              {activeTimelineSegment && <small className="timeline-active-segment">{activeTimelineSegment.name}</small>}
             </div>
             <div className="timeline-readout">
+              {timelineKeyframeTracks && <button aria-pressed={timelineDetailsVisible} className="timeline-details-toggle" onClick={() => setTimelineDetailsVisible((visible) => !visible)} type="button">{timelineDetailsVisible ? (language === 'zh' ? '收起轨道' : 'Hide tracks') : (language === 'zh' ? '属性轨道' : 'Tracks')}</button>}
               <strong>{frameTimecode}</strong>
               {/* #WDD-gpt 2026-08-16 - 播放时逐帧显示零填充当前帧与总帧数，避免只能从时间码反推帧号。 */}
               <span aria-label={frameCounter} className="timeline-frame-counter">{frameCounter}</span>
             </div>
           </div>
           <div className="timeline-track">
+            {status.raw4dSequence && (
+              <div aria-hidden="true" className="timeline-segment-bands">
+                {timelineSegments.map((segment, index) => {
+                  const start = segment.firstFrame - status.raw4dSequence!.firstFrame;
+                  const end = segment.lastFrame - status.raw4dSequence!.firstFrame;
+                  return <i className={index === status.raw4dSequence!.segmentIndex ? 'active' : ''} key={`${segment.name}-${index}`} style={{ left: `${start / Math.max(1, timelineEndFrame) * 100}%`, width: `${Math.max(0.6, (end - start) / Math.max(1, timelineEndFrame) * 100)}%` }} />;
+                })}
+              </div>
+            )}
             <div
               aria-hidden="true"
               className="timeline-frame-ticks"
@@ -2414,6 +2711,19 @@ export function App() {
             />
             <div className="timeline-marks" aria-hidden="true">{timelineMarks.map((frame) => <span key={frame}>{frame}</span>)}</div>
           </div>
+          {timelineDetailsVisible && timelineKeyframeTracks && (
+            <div className="timeline-detail-tracks">
+              {([
+                ['P', timelineKeyframeTracks.position],
+                ['R', timelineKeyframeTracks.rotation],
+                ['S', timelineKeyframeTracks.scale],
+                ['C', timelineKeyframeTracks.colorDc],
+                ['A', timelineKeyframeTracks.opacity],
+              ] as const).map(([label, frames]) => (
+                <div key={label}><b>{label}</b><span>{frames.map((frame) => <i key={frame} style={{ left: `${frame / Math.max(1, timelineEndFrame) * 100}%` }} />)}</span><small>{frames.length}</small></div>
+              ))}
+            </div>
+          )}
         </div>
 
         <div className="timeline-options">
@@ -2428,7 +2738,7 @@ export function App() {
             value={playbackFps}
           />
         </div>
-      </section>
+      </section>}
 
       <footer className="statusbar" data-camera-input-block>
         <span><i className={status.phase === 'ready' ? 'ok' : ''} />{status.phase === 'ready' ? copy.sceneReady : copy.scenePreparing}</span>

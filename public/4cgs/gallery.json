@@ -1,7 +1,25 @@
 {
   "version": 1,
-  "updatedAt": "2026-08-17",
+  "updatedAt": "2026-08-19",
   "items": [
+    {
+      "id": "music",
+      "name": "Music · 手碟演奏序列",
+      "file": "music.4cgs",
+      "snapshot": "thumbnails/music.webp",
+      "description": "红衣演奏者的 150 帧手碟表演高斯序列，覆盖源帧 600–749；适合检查长时播放、手部动作与乐器细节的时序稳定性。",
+      "fileBytes": 41627099,
+      "sourceBytes": 124249026,
+      "frameCount": 150,
+      "frameRange": [600, 749],
+      "segmentCount": 1,
+      "gaussianCount": 219489,
+      "sourceGaussianCount": 219489,
+      "deletedGaussianCount": 0,
+      "codec": "CoRe4D V2.6 · AdaptivePQ / Brotli9",
+      "codecName": "CoRe4D-V2.6-AdaptivePQ-Brotli9-BoundedTemporal-Scale3Way",
+      "tags": ["人物", "手碟", "长序列", "V2.6"]
+    },
     {
       "id": "red",
       "name": "Red · 人物动态序列",

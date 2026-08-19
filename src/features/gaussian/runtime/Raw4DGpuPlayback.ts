@@ -23,7 +23,7 @@ import { createRaw4DGpuMemoryPlan } from './Raw4DGpuMemoryPlan';
 const TEXTURE_WIDTH = 4096;
 const UPLOAD_BATCH_POINTS = 16_384;
 
-// #WDD-gpt 2026-08-16 - WebGL2排序中心必须跟随每次时间变化；低频刷新会让同一帧因跳转历史不同而使用旧帧深度序。
+// #WDD-gpt 2026-08-19 - CPU 深度排序必须使用当前动态帧中心；固定参考中心会在侧视角制造明显的遮挡错误。
 export function raw4DSortCentersNeedRefresh(frame: number, lastFrame: number): boolean {
   return Math.abs(frame - lastFrame) > 1e-6;
 }

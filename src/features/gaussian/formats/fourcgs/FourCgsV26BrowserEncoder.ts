@@ -113,6 +113,7 @@ interface IndexedMemorySource extends Raw4DMemorySnapshot {
 
 interface PreparedV26Source {
   readonly name: string;
+  readonly sourceEncoding: Raw4DAsset['sourceEncoding'];
   readonly descriptor: FourCgsSegment;
   readonly originalPointCount: number;
   readonly compacted: {
@@ -386,16 +387,30 @@ async function compactSegment(
 }
 
 function memoryTrackStride(track: Raw4DTrack, totalFrames: number, sourceName: string): number {
-  if (track.keyframes.length < 2) {
-    if (totalFrames === 1 && track.keyframes.length === 1 && track.keyframes[0] === 0) return 1;
-    throw new FourCgsHighCompressionUnsupportedError(`${sourceName} 的内存轨迹缺少显式关键帧 bank。`);
+  if (track.keyframes.length === 1) {
+    if (track.keyframes[0] !== 0) {
+      throw new FourCgsHighCompressionUnsupportedError(`${sourceName} 的静态内存轨迹必须从第 0 帧开始。`);
+    }
+    return Math.max(1, totalFrames - 1);
   }
+  if (track.keyframes.length < 1) throw new FourCgsHighCompressionUnsupportedError(`${sourceName} 的内存轨迹为空。`);
   const stride = track.keyframes[1] - track.keyframes[0];
   const canonical = raw4DCanonicalKeyframes(totalFrames, stride, track.keyframes.length);
   if (canonical.some((frame, index) => frame !== track.keyframes[index])) {
     throw new FourCgsHighCompressionUnsupportedError(`${sourceName} 的内存关键帧不是 canonical 等步长序列。`);
   }
   return stride;
+}
+
+function memoryTrackBankCount(track: Raw4DTrack, totalFrames: number): number {
+  return track.keyframes.length === 1 && totalFrames > 1 ? 2 : track.keyframes.length;
+}
+
+function memoryTrackColumns(track: Raw4DTrack, totalFrames: number): readonly Raw4DAsset['lifetimeMu'][] {
+  // #WDD-gpt 2026-08-18 - 4CGS 清单需要首尾 canonical bank；静态回退轨迹复用同一 SoA 列，不复制 Canonical RAM。
+  return track.keyframes.length === 1 && totalFrames > 1
+    ? [...track.values, ...track.values]
+    : track.values;
 }
 
 function memoryDescriptor(source: IndexedMemorySource, gaussianCount: number): FourCgsSegment {
@@ -407,11 +422,11 @@ function memoryDescriptor(source: IndexedMemorySource, gaussianCount: number): F
     gaussianCount,
     totalFrames: asset.totalFrames,
     bankCounts: {
-      position: asset.position.keyframes.length,
-      rotation: asset.rotation.keyframes.length,
-      colorDc: asset.colorDc.keyframes.length,
-      scale: asset.scale.keyframes.length,
-      opacity: asset.opacity.keyframes.length,
+      position: memoryTrackBankCount(asset.position, asset.totalFrames),
+      rotation: memoryTrackBankCount(asset.rotation, asset.totalFrames),
+      colorDc: memoryTrackBankCount(asset.colorDc, asset.totalFrames),
+      scale: memoryTrackBankCount(asset.scale, asset.totalFrames),
+      opacity: memoryTrackBankCount(asset.opacity, asset.totalFrames),
     },
     keyframeStrides: {
       position: memoryTrackStride(asset.position, asset.totalFrames, source.name),
@@ -444,12 +459,9 @@ function orderedMemorySources(sources: readonly Raw4DMemorySnapshot[]): readonly
   });
 }
 
-// #WDD-gpt 2026-08-16 - 直接把 SoA Canonical RAM 压实为编码器工作行，避免先重建一份完整临时 RAW4D。
-function compactMemorySegment(source: IndexedMemorySource): PreparedV26Source {
+// #WDD-gpt 2026-08-18 - Float32 PLY4 保持场景 Canonical RAM 原样，只在 Worker 的 V2.6 编码工作副本中显式量化为 FP16。
+async function compactMemorySegment(source: IndexedMemorySource): Promise<PreparedV26Source> {
   const { asset, deletionWords } = source;
-  if (asset.sourceEncoding !== 'float16') {
-    throw new FourCgsHighCompressionUnsupportedError(`${source.name} 的当前内存不是 FP16，V2.6 不会隐式降精度。`);
-  }
   if (asset.shRest.length !== SH_DIMENSIONS) {
     throw new FourCgsHighCompressionUnsupportedError(`${source.name} 需要 ${SH_DIMENSIONS} 个非 DC SH 系数，当前为 ${asset.shRest.length}。`);
   }
@@ -458,25 +470,39 @@ function compactMemorySegment(source: IndexedMemorySource): PreparedV26Source {
   const descriptor = memoryDescriptor(source, asset.splatCount - deleted);
   const propertyNames = fourCgsDecodedPropertyNames(descriptor);
   const columns = [
-    ...asset.position.values,
-    ...asset.rotation.values,
-    ...asset.colorDc.values,
-    ...asset.scale.values,
-    ...asset.opacity.values,
+    ...memoryTrackColumns(asset.position, asset.totalFrames),
+    ...memoryTrackColumns(asset.rotation, asset.totalFrames),
+    ...memoryTrackColumns(asset.colorDc, asset.totalFrames),
+    ...memoryTrackColumns(asset.scale, asset.totalFrames),
+    ...memoryTrackColumns(asset.opacity, asset.totalFrames),
     asset.lifetimeMu,
     asset.lifetimeW,
     ...asset.shRest,
   ];
-  if (columns.length !== propertyNames.length || columns.some((column) => !(column instanceof Uint16Array))) {
+  const sourceArrayType = asset.sourceEncoding === 'float16' ? Uint16Array : Float32Array;
+  if (columns.length !== propertyNames.length || columns.some((column) => !(column instanceof sourceArrayType))) {
     throw new FourCgsHighCompressionUnsupportedError(`${source.name} 的 Canonical RAM 属性布局与 V2.6 不一致。`);
   }
+  const floatToHalf = asset.sourceEncoding === 'float32'
+    ? (await import('../../../../../scripts/fourcgs-prs-codec.mjs')).floatToHalf
+    : null;
   const rows = allocateEncodingRows(descriptor.gaussianCount * propertyNames.length);
   let destination = 0;
   for (let stableId = 0; stableId < asset.splatCount; stableId += 1) {
     if (isDeleted(deletionWords, stableId)) continue;
     const destinationOffset = destination * propertyNames.length;
     for (let property = 0; property < columns.length; property += 1) {
-      rows[destinationOffset + property] = (columns[property] as Uint16Array)[stableId];
+      if (asset.sourceEncoding === 'float16') {
+        rows[destinationOffset + property] = (columns[property] as Uint16Array)[stableId];
+      } else {
+        const value = (columns[property] as Float32Array)[stableId];
+        if (!Number.isFinite(value) || Math.abs(value) > 65_504) {
+          throw new FourCgsHighCompressionUnsupportedError(
+            `${source.name} 的 ${propertyNames[property]}[${stableId}] 无法安全量化为 FP16：${value}。`,
+          );
+        }
+        rows[destinationOffset + property] = floatToHalf!(value);
+      }
     }
     destination += 1;
   }
@@ -490,10 +516,14 @@ function compactMemorySegment(source: IndexedMemorySource): PreparedV26Source {
   })));
   sourceHasher.update(new Uint8Array(rows.buffer));
   const canonicalNames = fourCgsCanonicalRaw4DPropertyNames(descriptor);
+  const sourceScalarBytes = asset.sourceEncoding === 'float16'
+    ? Uint16Array.BYTES_PER_ELEMENT
+    : Float32Array.BYTES_PER_ELEMENT;
   const compactedBytes = fourCgsCanonicalRaw4DHeader(descriptor, canonicalNames).byteLength
-    + descriptor.gaussianCount * canonicalNames.length * Uint16Array.BYTES_PER_ELEMENT;
+    + descriptor.gaussianCount * canonicalNames.length * sourceScalarBytes;
   return {
     name: source.name,
+    sourceEncoding: asset.sourceEncoding,
     descriptor,
     originalPointCount: asset.splatCount,
     compacted: {
@@ -1463,6 +1493,7 @@ export async function encodeRaw4DV26Browser(
     const compacted = await compactSegment(source, deletionWords[source.fileIndex]);
     prepared.push({
       name: source.file.name,
+      sourceEncoding: source.header.scalarEncoding,
       descriptor: segmentDescriptor(source, compacted.segment.count),
       originalPointCount: source.header.vertexCount,
       compacted,
@@ -1480,8 +1511,9 @@ export async function encodeRaw4DV26BrowserMemory(
   const ordered = orderedMemorySources(sources);
   const prepared: PreparedV26Source[] = [];
   for (let index = 0; index < ordered.length; index += 1) {
-    onProgress?.(0.03 + index * 0.18 / ordered.length, `正在从 Canonical RAM 压实 ${index + 1}/${ordered.length}：${ordered[index].name}`);
-    prepared.push(compactMemorySegment(ordered[index]));
+    const precision = ordered[index].asset.sourceEncoding === 'float32' ? '（Float32 → FP16 编码工作副本）' : '';
+    onProgress?.(0.03 + index * 0.18 / ordered.length, `正在从 Canonical RAM 压实 ${index + 1}/${ordered.length}：${ordered[index].name}${precision}`);
+    prepared.push(await compactMemorySegment(ordered[index]));
   }
   return encodePreparedRaw4DV26(prepared, onProgress);
 }
@@ -1768,6 +1800,11 @@ async function encodePreparedRaw4DV26(
       raw4dExport: {
         version: 1,
         sourceNames: prepared.map((source) => source.name),
+        sourceScalarEncodings: prepared.map((source) => source.sourceEncoding),
+        encodedScalarEncoding: 'float16',
+        precisionPolicy: prepared.some((source) => source.sourceEncoding === 'float32')
+          ? 'explicit-float32-to-float16-worker-copy-before-v2.6'
+          : 'preserve-source-float16-bits',
         sourceSha256: compacted.map((value) => value.sourceSha256),
         sourceKind: 'canonical-memory-or-file-snapshot',
         originalPointCount,
