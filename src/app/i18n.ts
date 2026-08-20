@@ -321,7 +321,7 @@ const zh = {
   sequenceTracks: '永久轨迹',
   sequenceShSeparated: 'SH 原始节省',
   unsupportedFile: '不支持的文件',
-  unsupportedFileMessage: '当前支持 .4cgs、.raw4d、.ply4、.sog 和 .ply。',
+  unsupportedFileMessage: '当前支持 .4cgs、.4gs、.raw4d、.ply4、.sog 和 .ply。',
 } as const;
 
 export type UiCopy = { readonly [Key in keyof typeof zh]: string };
@@ -645,7 +645,7 @@ const en: UiCopy = {
   sequenceTracks: 'Permanent tracks',
   sequenceShSeparated: 'Raw SH saved',
   unsupportedFile: 'Unsupported file',
-  unsupportedFileMessage: '.4cgs, .raw4d, .ply4, .sog, and .ply are supported.',
+  unsupportedFileMessage: '.4cgs, .4gs, .raw4d, .ply4, .sog, and .ply are supported.',
 };
 
 export const UI_COPY: Readonly<Record<UiLanguage, UiCopy>> = { zh, en };

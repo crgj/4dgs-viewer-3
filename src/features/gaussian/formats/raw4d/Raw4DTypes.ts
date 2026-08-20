@@ -42,6 +42,7 @@ export interface Raw4DAsset {
   readonly sourceEncoding: Raw4DScalarEncoding;
   readonly splatCount: number;
   readonly totalFrames: number;
+  readonly frameRate?: number;
   readonly shBands: number;
   readonly position: Raw4DTrack;
   readonly rotation: Raw4DTrack;
@@ -52,6 +53,9 @@ export interface Raw4DAsset {
   readonly lifetimeMu: Raw4DScalarArray;
   readonly lifetimeW: Raw4DScalarArray;
   readonly bounds: Raw4DBounds;
+  // #WDD-gpt 2026-08-20 - 直线基元可让每个点用 lifetimeMu±lifetimeW 表示自己的 K=2 位置端点时间；透明度生命周期可预先烘焙进 opacity 轨道。
+  readonly positionTiming?: 'shared-keyframes' | 'per-point-lifetime-endpoints';
+  readonly opacityTiming?: 'lifetime-gated' | 'baked';
   // #WDD-gpt 2026-08-19 - 记录输入点分区和显式关键帧时间，格式差异在读取层归一化后不再进入渲染、编辑和导出逻辑。
   readonly temporalLayout?: Raw4DTemporalLayout;
 }

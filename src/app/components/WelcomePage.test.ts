@@ -16,7 +16,7 @@ describe('WelcomePage', () => {
     expect(markup).toContain('浏览测试相册');
     expect(markup).toContain('scene.4cgs');
     expect(markup).toContain('内存为设备提示');
-    expect(markup).toContain('.4cgs · .raw4d · .ply4 · .sog · .ply');
+    expect(markup).toContain('.4cgs · .4gs · .raw4d · .ply4 · .sog · .ply');
   });
 
   it('wraps gallery paging in both directions', () => {

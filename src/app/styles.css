@@ -1548,12 +1548,14 @@ input:focus-visible {
   display: grid;
   place-items: center;
   overflow: hidden;
+  isolation: isolate;
   border-radius: inherit;
   background: radial-gradient(circle at 50% 38%, rgba(34, 88, 73, 0.16), transparent 42%), #070a0c;
 }
 
 .welcome-page::before {
   position: absolute;
+  z-index: 2;
   top: 0;
   right: 10%;
   left: 10%;
@@ -1562,8 +1564,86 @@ input:focus-visible {
   content: "";
 }
 
+/* #WDD-gpt 2026-08-20 - 在文字粒子下增加低对比度双向旋转星云光场，用冷色旋光和中心暗部构造宇宙纵深。 */
+.welcome-cosmic-light {
+  position: absolute;
+  z-index: 0;
+  inset: -42%;
+  opacity: 0.42;
+  background:
+    conic-gradient(from 18deg at 50% 50%, transparent 0deg, rgba(55, 198, 175, 0.13) 38deg, transparent 88deg, rgba(56, 103, 194, 0.12) 154deg, transparent 218deg, rgba(137, 89, 190, 0.09) 286deg, transparent 360deg),
+    radial-gradient(ellipse at 34% 43%, rgba(55, 212, 175, 0.11), transparent 34%),
+    radial-gradient(ellipse at 68% 57%, rgba(75, 114, 220, 0.1), transparent 37%);
+  filter: blur(44px) saturate(1.16);
+  mask-image: radial-gradient(ellipse at center, #000 10%, rgba(0, 0, 0, 0.82) 55%, transparent 79%);
+  pointer-events: none;
+  transform-origin: center;
+  animation: welcome-cosmic-spin 46s linear infinite;
+  will-change: transform;
+}
+
+.welcome-cosmic-light::before,
+.welcome-cosmic-light::after {
+  position: absolute;
+  content: "";
+  pointer-events: none;
+}
+
+.welcome-cosmic-light::before {
+  inset: 14%;
+  opacity: 0.72;
+  background: conic-gradient(from 208deg at 50% 50%, transparent 0deg, rgba(93, 224, 198, 0.12) 46deg, transparent 112deg, rgba(104, 103, 218, 0.1) 204deg, transparent 278deg, rgba(41, 154, 183, 0.1) 330deg, transparent 360deg);
+  filter: blur(28px);
+  border-radius: 50%;
+  animation: welcome-cosmic-counterspin 67s linear infinite;
+}
+
+.welcome-cosmic-light::after {
+  inset: 29%;
+  border: 1px solid rgba(102, 230, 202, 0.055);
+  border-radius: 50%;
+  background: radial-gradient(circle, transparent 45%, rgba(78, 166, 205, 0.055) 58%, transparent 72%);
+  box-shadow: 0 0 110px rgba(62, 196, 170, 0.055), inset 0 0 90px rgba(96, 105, 210, 0.045);
+  transform: rotateX(62deg) rotateZ(-12deg);
+}
+
+@keyframes welcome-cosmic-spin {
+  0% { transform: rotate(0deg) scale(1); }
+  50% { transform: rotate(180deg) scale(1.045); }
+  100% { transform: rotate(360deg) scale(1); }
+}
+
+@keyframes welcome-cosmic-counterspin {
+  from { transform: rotate(360deg) scale(0.96); }
+  to { transform: rotate(0deg) scale(1.04); }
+}
+
+.welcome-particle-canvas {
+  position: absolute;
+  z-index: 1;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  opacity: 0.98;
+  filter: saturate(1.08);
+  pointer-events: none;
+  user-select: none;
+}
+
+.welcome-page::after {
+  position: absolute;
+  z-index: 2;
+  inset: 0;
+  background:
+    radial-gradient(circle at 50% 48%, transparent 0, rgba(7, 10, 12, 0.08) 42%, rgba(7, 10, 12, 0.48) 100%),
+    linear-gradient(90deg, rgba(7, 10, 12, 0.26), transparent 24%, transparent 76%, rgba(7, 10, 12, 0.26));
+  content: "";
+  pointer-events: none;
+}
+
 .welcome-content {
   position: relative;
+  z-index: 3;
   display: grid;
   width: min(560px, calc(100% - 48px));
   gap: 22px;
@@ -1585,11 +1665,13 @@ input:focus-visible {
   border: 1px dashed rgba(130, 155, 149, 0.28);
   border-radius: 16px;
   color: #dae2e3;
-  background: rgba(255, 255, 255, 0.018);
+  background: rgba(7, 11, 13, 0.88);
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.24), inset 0 1px rgba(255, 255, 255, 0.025);
+  backdrop-filter: blur(5px);
   cursor: pointer;
   transition: border-color 160ms ease, background 160ms ease, transform 160ms ease;
 }
-.welcome-drop-card:hover { border-color: rgba(83, 221, 179, 0.5); background: rgba(72, 208, 167, 0.045); transform: translateY(-1px); }
+.welcome-drop-card:hover { border-color: rgba(83, 221, 179, 0.5); background: rgba(10, 24, 22, 0.94); transform: translateY(-1px); }
 .welcome-drop-card > i { display: grid; width: 34px; height: 34px; margin-bottom: 3px; place-items: center; border: 1px solid rgba(82, 219, 178, 0.28); border-radius: 50%; color: #65dfba; background: rgba(72, 208, 167, 0.06); font: 300 21px/1 Inter, sans-serif; font-style: normal; }
 .welcome-drop-card > strong { font-size: 13px; font-weight: 590; }
 .welcome-drop-card > small { color: #647178; font: 9px "SFMono-Regular", Consolas, monospace; }
@@ -1640,6 +1722,9 @@ input:focus-visible {
 .welcome-gallery-pager > span i { width: 4px; height: 4px; border-radius: 50%; background: #3f494e; transition: width 160ms ease, background 160ms ease; }
 .welcome-gallery-pager > span i.active { width: 11px; border-radius: 4px; background: #4dd5ac; }
 @media (prefers-reduced-motion: reduce) {
+  .welcome-cosmic-light,
+  .welcome-cosmic-light::before { animation: none; }
+  .welcome-particle-canvas { opacity: 0.68; }
   .welcome-gallery-feature b i,
   .welcome-gallery-feature > span:not(.welcome-gallery-placeholder) { animation: none; }
 }

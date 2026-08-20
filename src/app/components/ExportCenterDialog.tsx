@@ -31,8 +31,8 @@ export function ExportCenterDialog(props: ExportCenterDialogProps) {
       title: '.4CGS',
       detail: supportsFourCgsSceneExport(props.format)
         ? (zh
-            ? `从 ${props.format} 编码完整场景与全部片段${props.format === 'PLY4' ? '；Float32 输入会在 Worker 编码副本中量化为 FP16' : ''}`
-            : `Encode the complete ${props.format} scene and all segments${props.format === 'PLY4' ? '; Float32 input is quantized to an FP16 Worker copy' : ''}`)
+            ? `从 ${props.format} 编码完整场景与全部片段${props.format === 'PLY4' || props.format === '4GS' ? '；Float32 输入会在 Worker 编码副本中量化为 FP16' : ''}`
+            : `Encode the complete ${props.format} scene and all segments${props.format === 'PLY4' || props.format === '4GS' ? '; Float32 input is quantized to an FP16 Worker copy' : ''}`)
         : (zh ? `${props.format} 暂不支持编码为 .4cgs` : `${props.format} cannot currently be encoded as .4cgs`),
       disabled: !supportsFourCgsSceneExport(props.format),
     },
@@ -60,8 +60,8 @@ export function ExportCenterDialog(props: ExportCenterDialogProps) {
             </dl>
             <p>{target === 'fourcgs'
               ? (zh
-                  ? `4CGS 会保留完整场景变换；软删除点在重新编码时压实。${props.format === 'PLY4' ? '场景内存保持 Float32，不会被原地改写。' : ''}`
-                  : `4CGS preserves the full scene transform and compacts soft-deleted points when re-encoding.${props.format === 'PLY4' ? ' Scene memory remains Float32 and is not modified in place.' : ''}`)
+                  ? `4CGS 会保留完整场景变换；软删除点在重新编码时压实。${props.format === 'PLY4' || props.format === '4GS' ? '场景内存保持 Float32，不会被原地改写。' : ''}`
+                  : `4CGS preserves the full scene transform and compacts soft-deleted points when re-encoding.${props.format === 'PLY4' || props.format === '4GS' ? ' Scene memory remains Float32 and is not modified in place.' : ''}`)
               : (zh ? '浏览器将请求一个专用文件夹，并暂停播放后逐帧写入。' : 'The browser requests a dedicated folder, pauses playback, and writes each frame.')}</p>
           </div>
         </div>

@@ -147,7 +147,7 @@ export class Raw4DFrameSampler {
   sample(requestedFrame: number): boolean {
     const frame = Math.min(this.asset.totalFrames - 1, Math.max(0, requestedFrame));
     if (frame === this.sampledFrame) return false;
-    this.sampleLinearTrack(this.asset.position, frame, [this.properties.x, this.properties.y, this.properties.z]);
+    this.samplePositionTrack(frame);
     this.sampleRotation(frame);
     this.sampleScale(frame);
     this.sampleLinearTrack(this.asset.colorDc, frame, [this.properties.colorR, this.properties.colorG, this.properties.colorB]);
@@ -158,7 +158,28 @@ export class Raw4DFrameSampler {
 
   samplePosition(requestedFrame: number): void {
     const frame = Math.min(this.asset.totalFrames - 1, Math.max(0, requestedFrame));
-    this.sampleLinearTrack(this.asset.position, frame, [this.properties.x, this.properties.y, this.properties.z]);
+    this.samplePositionTrack(frame);
+  }
+
+  private samplePositionTrack(frame: number): void {
+    if (this.asset.positionTiming !== 'per-point-lifetime-endpoints') {
+      this.sampleLinearTrack(this.asset.position, frame, [this.properties.x, this.properties.y, this.properties.z]);
+      return;
+    }
+    const track = this.asset.position;
+    const destinations = [this.properties.x, this.properties.y, this.properties.z];
+    for (let index = 0; index < this.asset.splatCount; index += 1) {
+      const center = readRaw4DScalar(this.asset.lifetimeMu, index, this.asset.sourceEncoding);
+      const halfWidth = Math.max(0, readRaw4DScalar(this.asset.lifetimeW, index, this.asset.sourceEncoding));
+      const start = center - halfWidth;
+      const end = center + halfWidth;
+      const alpha = end > start ? Math.max(0, Math.min(1, (frame - start) / (end - start))) : 0;
+      for (let component = 0; component < 3; component += 1) {
+        const left = readRaw4DTrack(track, component, index);
+        const right = readRaw4DTrack(track, 3 + component, index);
+        destinations[component][index] = left + (right - left) * alpha;
+      }
+    }
   }
 
   private sampleLinearTrack(track: Raw4DTrack, frame: number, destinations: readonly Float32Array[]): void {
@@ -214,11 +235,14 @@ export class Raw4DFrameSampler {
         readRaw4DScalar(right, index, track.encoding),
         span.alpha,
       );
-      const lifetimeMu = readRaw4DScalar(this.asset.lifetimeMu, index, this.asset.sourceEncoding);
-      const lifetimeW = readRaw4DScalar(this.asset.lifetimeW, index, this.asset.sourceEncoding);
-      const leftGate = stableSigmoid(10 * (frame - (lifetimeMu - lifetimeW)));
-      const rightGate = stableSigmoid(10 * ((lifetimeMu + lifetimeW) - frame));
-      destination[index] = stableSigmoid(logit) * leftGate * rightGate;
+      let gate = 1;
+      if (this.asset.opacityTiming !== 'baked') {
+        const lifetimeMu = readRaw4DScalar(this.asset.lifetimeMu, index, this.asset.sourceEncoding);
+        const lifetimeW = readRaw4DScalar(this.asset.lifetimeW, index, this.asset.sourceEncoding);
+        gate = stableSigmoid(10 * (frame - (lifetimeMu - lifetimeW)))
+          * stableSigmoid(10 * ((lifetimeMu + lifetimeW) - frame));
+      }
+      destination[index] = stableSigmoid(logit) * gate;
     }
   }
 

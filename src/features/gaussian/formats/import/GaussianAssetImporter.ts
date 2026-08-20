@@ -1,4 +1,5 @@
 import { Raw4DAssetLoader } from '../raw4d/Raw4DAssetLoader';
+import { FourGsAssetLoader } from '../fourgs/FourGsAssetLoader';
 import type { GaussianAssetDecodeOptions, GaussianSourceFormat, ImportedGaussianAsset } from './GaussianImportTypes';
 import { decodePlyGaussian } from './PlyGaussianDecoder';
 import { decodeSogGaussian } from './SogGaussianDecoder';
@@ -16,6 +17,7 @@ export function detectGaussianSourceFormat(fileName: string): GaussianSourceForm
   const extension = fileName.split('.').pop()?.toLowerCase();
   if (extension === 'raw4d') return 'RAW4D';
   if (extension === 'ply4') return 'PLY4';
+  if (extension === '4gs') return '4GS';
   if (extension === 'sog') return 'SOG';
   if (extension === 'ply') return 'PLY';
   return null;
@@ -24,6 +26,7 @@ export function detectGaussianSourceFormat(fileName: string): GaussianSourceForm
 export class GaussianAssetImporter {
   // #WDD-gpt 2026-08-16 - 三个 Loader Worker 足以并行六段 RAW4D；继续增加只会放大大数组分配和内存带宽争用。
   private readonly raw4DLoaders: readonly Raw4DAssetLoader[];
+  private readonly fourGsLoader = new FourGsAssetLoader();
   private nextRaw4DLoader = 0;
 
   constructor(raw4DWorkerCount = preferredRaw4DWorkerCount()) {
@@ -37,7 +40,14 @@ export class GaussianAssetImporter {
 
   async load(file: File, options: GaussianAssetDecodeOptions): Promise<ImportedGaussianAsset> {
     const format = detectGaussianSourceFormat(file.name);
-    if (!format) throw new Error('仅支持 .raw4d、.ply4、.sog 和 .ply 文件。');
+    if (!format) throw new Error('仅支持 .4gs、.raw4d、.ply4、.sog 和 .ply 文件。');
+    if (format === '4GS') {
+      const loaded = await this.fourGsLoader.load(file, options.cpuBudgetBytes, {
+        signal: options.signal,
+        onProgress: (progress) => options.onProgress?.(progress),
+      });
+      return { ...loaded, format };
+    }
     if (format === 'PLY') return decodePlyGaussian(file, options);
     if (format === 'SOG') return decodeSogGaussian(file, options);
     const loader = this.raw4DLoaders[this.nextRaw4DLoader];
@@ -51,6 +61,7 @@ export class GaussianAssetImporter {
   }
 
   destroy(): void {
+    this.fourGsLoader.destroy();
     for (const loader of this.raw4DLoaders) loader.destroy();
   }
 }

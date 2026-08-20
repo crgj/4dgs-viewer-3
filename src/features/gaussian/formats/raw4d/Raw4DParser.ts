@@ -574,6 +574,8 @@ export async function parseRaw4D(source: Raw4DSource, options: Raw4DParseOptions
     sourceEncoding: header.scalarEncoding,
     splatCount: header.pointCount,
     totalFrames: header.totalFrames,
+    frameRate: Number.isFinite(Number(header.comments.get('frame_rate')))
+      ? Number(header.comments.get('frame_rate')) : undefined,
     shBands: shBandsFromCount(shRest.length),
     position,
     rotation,
@@ -584,6 +586,9 @@ export async function parseRaw4D(source: Raw4DSource, options: Raw4DParseOptions
     lifetimeMu: storages.get('lifetime_mu')!,
     lifetimeW: storages.get('lifetime_w')!,
     bounds: calculateBounds(position),
+    positionTiming: header.comments.get('position_timing') === 'per-point-lifetime-endpoints'
+      ? 'per-point-lifetime-endpoints' : undefined,
+    opacityTiming: header.comments.get('opacity_timing') === 'baked' ? 'baked' : undefined,
     temporalLayout: {
       schemaVersion: 1,
       interpolation: { position: 'linear', rotation: 'slerp', colorDc: 'linear', scale: 'linear', opacity: 'linear' },

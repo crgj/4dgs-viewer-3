@@ -11,6 +11,7 @@ import {
   type FourCgsGalleryItem,
 } from '../fourCgsGallery';
 import type { UiLanguage } from '../i18n';
+import { WelcomeParticleField } from './WelcomeParticleField';
 
 interface WelcomePageProps {
   readonly language: UiLanguage;
@@ -232,6 +233,8 @@ export function WelcomePage({ language, onBrowse, onOpenGallery, recoverySources
 
   return (
     <section aria-label={zh ? '欢迎使用 Dong Editor 3' : 'Welcome to Dong Editor 3'} className="welcome-page" data-camera-input-block>
+      <div aria-hidden="true" className="welcome-cosmic-light" />
+      <WelcomeParticleField />
       <div className="welcome-content">
         <header>
           <span>DONG EDITOR 3</span>
@@ -241,7 +244,7 @@ export function WelcomePage({ language, onBrowse, onOpenGallery, recoverySources
         <button className="welcome-drop-card" onClick={onBrowse} type="button">
           <i aria-hidden="true">＋</i>
           <strong>{recoverySources.length > 0 ? (zh ? '重新选择文件并恢复' : 'Reopen files to recover') : (zh ? '拖入文件，或点击选择' : 'Drop a file, or click to browse')}</strong>
-          <small>.4cgs · .raw4d · .ply4 · .sog · .ply</small>
+          <small>.4cgs · .4gs · .raw4d · .ply4 · .sog · .ply</small>
         </button>
         <WelcomeGalleryDeck items={galleryItems} language={language} onOpen={onOpenGallery} />
         {recoverySources.length > 0 && (

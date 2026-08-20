@@ -93,6 +93,8 @@ function createHeader(asset: Raw4DAsset, columns: readonly Raw4DExportColumn[], 
     'format binary_little_endian 1.0',
     `comment total_frames ${asset.totalFrames}`,
   ];
+  if (asset.positionTiming === 'per-point-lifetime-endpoints') lines.push('comment position_timing per-point-lifetime-endpoints');
+  if (asset.opacityTiming === 'baked') lines.push('comment opacity_timing baked');
   for (const [key, , , comment] of TRACK_LAYOUTS) {
     lines.push(`comment ${comment} ${keyframeStride(asset[key], asset.totalFrames)}`);
   }

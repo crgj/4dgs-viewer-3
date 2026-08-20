@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { parseRaw4D } from '../raw4d/Raw4DParser';
 import type { FourCgsSegment } from './FourCgsTypes';
 import {
   createFourCgsCanonicalRaw4D,
@@ -16,6 +17,9 @@ const segment: FourCgsSegment = {
   totalFrames: 11,
   bankCounts: { position: 5, rotation: 3, colorDc: 3, scale: 3, opacity: 3 },
   keyframeStrides: { position: 3, rotation: 5, colorDc: 5, scale: 5, opacity: 5 },
+  frameRate: 30,
+  positionTiming: 'per-point-lifetime-endpoints',
+  opacityTiming: 'baked',
 };
 
 describe('4CGS canonical RAW4D output', () => {
@@ -41,15 +45,27 @@ describe('4CGS canonical RAW4D output', () => {
     expect([at(1, 'nx'), at(1, 'ny'), at(1, 'nz')]).toEqual([0, 0, 0]);
   });
 
-  it('writes all six source timing comments and keeps the irregular final keyframe semantics', () => {
+  it('writes all source timing comments and restores per-point timing modes through canonical RAW4D', async () => {
     expect(fourCgsRaw4DKeyframeStrides(segment)).toEqual(segment.keyframeStrides);
     const names = fourCgsDecodedPropertyNames(segment);
-    const output = createFourCgsCanonicalRaw4D(segment, names, new Uint16Array(segment.gaussianCount * names.length));
+    const decodedRows = new Uint16Array(segment.gaussianCount * names.length);
+    names.forEach((name, property) => {
+      if (!/^rot_bank_\d+_w$/.test(name)) return;
+      for (let row = 0; row < segment.gaussianCount; row += 1) decodedRows[row * names.length + property] = 0x3c00;
+    });
+    const output = createFourCgsCanonicalRaw4D(segment, names, decodedRows);
     const fullText = new TextDecoder().decode(output.subarray(0, Math.min(output.length, 32_000)));
     expect(fullText).toContain('format binary_little_endian 1.0');
     expect(fullText).toContain('comment xyz_bank_keyframe_stride 3');
     expect(fullText).toContain('comment scaling_bank_keyframe_stride 5');
+    expect(fullText).toContain('comment frame_rate 30');
+    expect(fullText).toContain('comment position_timing per-point-lifetime-endpoints');
+    expect(fullText).toContain('comment opacity_timing baked');
     expect(fullText).toContain('property ushort x');
     expect(fullText.indexOf('property ushort x')).toBeLessThan(fullText.indexOf('property ushort xyz_bank_0_x'));
+    const restored = await parseRaw4D(new Blob([output.slice().buffer as ArrayBuffer]), { sourceName: 'restored.raw4d' });
+    expect(restored.frameRate).toBe(30);
+    expect(restored.positionTiming).toBe('per-point-lifetime-endpoints');
+    expect(restored.opacityTiming).toBe('baked');
   });
 });

@@ -1211,7 +1211,7 @@ export function App() {
         );
         return;
       }
-      const stem = (sceneName ?? status.objectName ?? 'dong-editor-3').replace(/\.(?:4cgs|raw4d|ply4)$/i, '');
+      const stem = (sceneName ?? status.objectName ?? 'dong-editor-3').replace(/\.(?:4cgs|4gs|raw4d|ply4)$/i, '');
       try {
         // #WDD-gpt 2026-08-17 - 4CGS 是单文件，使用另存为窗口选择目录和文件名，而非申请整个目录权限。
         fourCgsFileHandle = await window.showSaveFilePicker(createFourCgsSavePickerOptions(`${stem}.4cgs`));
@@ -1221,7 +1221,7 @@ export function App() {
         return;
       }
     }
-    if (((status.format === 'RAW4D' || status.format === 'PLY4') && sourceFiles.length > 0)
+    if (((status.format === 'RAW4D' || status.format === 'PLY4' || status.format === '4GS') && sourceFiles.length > 0)
       || (status.format === '4CGS' && canonicalDataDirty)) {
       // #WDD-gpt 2026-08-16 - RAW4D 默认导出冻结当前 Canonical RAM 与编辑位集，不再回读拖入时的 File 属性载荷。
       const controller = new AbortController();
@@ -1242,7 +1242,7 @@ export function App() {
       try {
         if (!viewportRuntime) throw new Error('视口编辑状态尚未就绪。');
         // #WDD-gpt 2026-08-17 - 4CGS 原点烘焙后必须从已修改 Canonical RAM 重编码；未修改容器仍保留下面的无损快速另存路径。
-        const memorySnapshots = status.format === '4CGS'
+        const memorySnapshots = status.format === '4CGS' || status.format === '4GS'
           ? viewportRuntime.snapshotResidentSequenceExportMemory()
           : viewportRuntime.snapshotRaw4DExportMemory(sourceFiles);
         const result = await encodeRaw4DMemoryAsFourCgs(memorySnapshots, (progress) => {
@@ -1523,7 +1523,7 @@ export function App() {
   const openSourceFiles = (incoming: readonly File[]) => {
     const files = [...incoming];
     if (files.length === 0) return;
-    const supported = files.every((file) => /\.(4cgs|raw4d|ply4|sog|ply)$/i.test(file.name));
+    const supported = files.every((file) => /\.(4cgs|4gs|raw4d|ply4|sog|ply)$/i.test(file.name));
     const validMultiRaw4D = files.length === 1 || files.every((file) => /\.(?:raw4d|ply4)$/i.test(file.name));
     if (!supported || !validMultiRaw4D) {
       setStatus({
@@ -1721,7 +1721,7 @@ export function App() {
         </div>
       )}
       <input
-        accept=".4cgs,.raw4d,.ply4,.sog,.ply"
+        accept=".4cgs,.4gs,.raw4d,.ply4,.sog,.ply"
         aria-label={copy.chooseImportFile}
         className="visually-hidden"
         onChange={handleFileSelection}

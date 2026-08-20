@@ -2100,7 +2100,7 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
       throw new Error('三维视口尚未初始化完成。');
     }
     const detectedFormat = detectGaussianSourceFormat(file.name);
-    if (!detectedFormat) throw new Error('仅支持 .raw4d、.ply4、.sog 和 .ply 文件。');
+    if (!detectedFormat) throw new Error('仅支持 .4gs、.raw4d、.ply4、.sog 和 .ply 文件。');
     this.cancelGaussianSelectionRun();
     if (!this.gaussianSelectionSequence) this.publishSelectionState(INITIAL_VIEWPORT_SELECTION_STATE);
     this.cancelImport();
@@ -2848,7 +2848,7 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
       splatCount: residentAsset.value.splatCount,
       totalFrames: residentAsset.value.totalFrames,
       keyframeCount: raw4DAssetKeyframeCount(residentAsset.value),
-      fps: 30,
+      fps: residentAsset.value.frameRate ?? 30,
       shBands: residentAsset.value.shBands,
       sourceName: residentAsset.value.sourceName,
       objectName: residentAsset.value.sourceName.replace(/\.[^.]+$/, ''),

@@ -2,7 +2,7 @@ import type { Raw4DAsset } from '../raw4d/Raw4DTypes';
 
 // #WDD-gpt 2026-08-16 - 统一描述所有前端 Gaussian 导入结果，使格式差异停留在解码边界。
 
-export type GaussianSourceFormat = 'RAW4D' | 'PLY4' | 'SOG' | 'PLY';
+export type GaussianSourceFormat = 'RAW4D' | 'PLY4' | '4GS' | 'SOG' | 'PLY';
 
 export interface GaussianImportProgress {
   readonly ratio: number;

@@ -114,6 +114,7 @@ interface IndexedMemorySource extends Raw4DMemorySnapshot {
 interface PreparedV26Source {
   readonly name: string;
   readonly sourceEncoding: Raw4DAsset['sourceEncoding'];
+  readonly sourceShBands: number;
   readonly descriptor: FourCgsSegment;
   readonly originalPointCount: number;
   readonly temporalLayout?: Raw4DTemporalLayout;
@@ -435,11 +436,12 @@ function memoryTrackColumns(track: Raw4DTrack, totalFrames: number): readonly Ra
 function memoryDescriptor(source: IndexedMemorySource, gaussianCount: number): FourCgsSegment {
   const { asset } = source;
   return {
-    name: source.name.replace(/\.(?:raw4d|ply4)$/i, ''),
+    name: source.name.replace(/\.(?:raw4d|ply4|4gs)$/i, ''),
     firstFrame: source.range.firstFrame,
     lastFrame: source.range.lastFrame,
     gaussianCount,
     totalFrames: asset.totalFrames,
+    frameRate: asset.frameRate,
     bankCounts: {
       position: memoryTrackBankCount(asset.position, asset.totalFrames),
       rotation: memoryTrackBankCount(asset.rotation, asset.totalFrames),
@@ -454,6 +456,8 @@ function memoryDescriptor(source: IndexedMemorySource, gaussianCount: number): F
       scale: memoryTrackStride(asset.scale, asset.totalFrames, source.name),
       opacity: memoryTrackStride(asset.opacity, asset.totalFrames, source.name),
     },
+    positionTiming: asset.positionTiming,
+    opacityTiming: asset.opacityTiming,
   };
 }
 
@@ -481,13 +485,18 @@ function orderedMemorySources(sources: readonly Raw4DMemorySnapshot[]): readonly
 // #WDD-gpt 2026-08-18 - Float32 PLY4 保持场景 Canonical RAM 原样，只在 Worker 的 V2.6 编码工作副本中显式量化为 FP16。
 async function compactMemorySegment(source: IndexedMemorySource): Promise<PreparedV26Source> {
   const { asset, deletionWords } = source;
-  if (asset.shRest.length !== SH_DIMENSIONS) {
-    throw new FourCgsHighCompressionUnsupportedError(`${source.name} 需要 ${SH_DIMENSIONS} 个非 DC SH 系数，当前为 ${asset.shRest.length}。`);
+  if (![0, 9, 24, SH_DIMENSIONS].includes(asset.shRest.length)) {
+    throw new FourCgsHighCompressionUnsupportedError(`${source.name} 的非 DC SH 系数数量 ${asset.shRest.length} 不对应 SH0/SH1/SH2/SH3。`);
   }
   const deleted = countDeleted(deletionWords, asset.splatCount);
   if (deleted === asset.splatCount) throw new Error(`${source.name} 的高斯点已全部删除，无法导出空片段。`);
   const descriptor = memoryDescriptor(source, asset.splatCount - deleted);
   const propertyNames = fourCgsDecodedPropertyNames(descriptor);
+  // #WDD-gpt 2026-08-20 - 4CGS V2.6 固定使用 SH3 载荷；低阶 4GS 仅在编码副本补零，不扩大或改写场景 Canonical RAM。
+  const shZero = asset.sourceEncoding === 'float16'
+    ? new Uint16Array(asset.splatCount)
+    : new Float32Array(asset.splatCount);
+  const paddedShRest = Array.from({ length: SH_DIMENSIONS }, (_, index) => asset.shRest[index] ?? shZero);
   const columns = [
     ...memoryTrackColumns(asset.position, asset.totalFrames),
     ...memoryTrackColumns(asset.rotation, asset.totalFrames),
@@ -496,7 +505,7 @@ async function compactMemorySegment(source: IndexedMemorySource): Promise<Prepar
     ...memoryTrackColumns(asset.opacity, asset.totalFrames),
     asset.lifetimeMu,
     asset.lifetimeW,
-    ...asset.shRest,
+    ...paddedShRest,
   ];
   const sourceArrayType = asset.sourceEncoding === 'float16' ? Uint16Array : Float32Array;
   if (columns.length !== propertyNames.length || columns.some((column) => !(column instanceof sourceArrayType))) {
@@ -543,6 +552,7 @@ async function compactMemorySegment(source: IndexedMemorySource): Promise<Prepar
   return {
     name: source.name,
     sourceEncoding: asset.sourceEncoding,
+    sourceShBands: asset.shBands,
     descriptor,
     originalPointCount: asset.splatCount,
     temporalLayout: compactTemporalLayout(asset.temporalLayout, deletionWords),
@@ -1518,6 +1528,7 @@ export async function encodeRaw4DV26Browser(
     prepared.push({
       name: source.file.name,
       sourceEncoding: source.header.scalarEncoding,
+      sourceShBands: 3,
       descriptor: segmentDescriptor(source, compacted.segment.count),
       originalPointCount: source.header.vertexCount,
       compacted,
@@ -1826,6 +1837,7 @@ async function encodePreparedRaw4DV26(
         version: 1,
         sourceNames: prepared.map((source) => source.name),
         sourceScalarEncodings: prepared.map((source) => source.sourceEncoding),
+        sourceShBands: prepared.map((source) => source.sourceShBands),
         encodedScalarEncoding: 'float16',
         precisionPolicy: prepared.some((source) => source.sourceEncoding === 'float32')
           ? 'explicit-float32-to-float16-worker-copy-before-v2.6'

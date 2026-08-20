@@ -26,6 +26,7 @@ describe('PLY Gaussian decoder', () => {
   it('detects all supported source formats', () => {
     expect(detectGaussianSourceFormat('a.raw4d')).toBe('RAW4D');
     expect(detectGaussianSourceFormat('a.PLY4')).toBe('PLY4');
+    expect(detectGaussianSourceFormat('scene.4gs')).toBe('4GS');
     expect(detectGaussianSourceFormat('a.sog')).toBe('SOG');
     expect(detectGaussianSourceFormat('a.ply')).toBe('PLY');
     expect(detectGaussianSourceFormat('a.obj')).toBeNull();

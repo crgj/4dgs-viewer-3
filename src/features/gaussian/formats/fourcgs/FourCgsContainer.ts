@@ -224,9 +224,20 @@ function validateSegment(value: unknown, index: number): FourCgsSegment {
   if (typeof segment.name !== 'string' || !segment.bankCounts) throw new Error(`4CGS 第 ${index + 1} 段缺少名称或属性银行。`);
   positiveInteger(segment.gaussianCount, `${segment.name}.gaussianCount`);
   positiveInteger(segment.totalFrames, `${segment.name}.totalFrames`);
+  if (segment.frameRate !== undefined) finiteNumber(segment.frameRate, `${segment.name}.frameRate`, true);
   for (const key of ['position', 'rotation', 'colorDc', 'scale', 'opacity'] as const) {
     positiveInteger(segment.bankCounts[key], `${segment.name}.bankCounts.${key}`);
     if (segment.keyframeStrides) positiveInteger(segment.keyframeStrides[key], `${segment.name}.keyframeStrides.${key}`);
+  }
+  if (segment.positionTiming !== undefined
+    && segment.positionTiming !== 'shared-keyframes'
+    && segment.positionTiming !== 'per-point-lifetime-endpoints') {
+    throw new Error(`4CGS ${segment.name}.positionTiming 无效。`);
+  }
+  if (segment.opacityTiming !== undefined
+    && segment.opacityTiming !== 'lifetime-gated'
+    && segment.opacityTiming !== 'baked') {
+    throw new Error(`4CGS ${segment.name}.opacityTiming 无效。`);
   }
   if (!Number.isSafeInteger(segment.firstFrame) || !Number.isSafeInteger(segment.lastFrame) || segment.lastFrame! < segment.firstFrame!) {
     throw new Error(`4CGS ${segment.name} 帧范围无效。`);

@@ -109,7 +109,9 @@ export class Raw4DResource extends GSplatResourceBase {
       color[colorOffset + 2] = float2Half(readRaw4DTrack(this.asset.colorDc, 2, index) * SH_C0 + 0.5);
       const mu = readRaw4DScalar(this.asset.lifetimeMu, index, this.asset.sourceEncoding);
       const width = readRaw4DScalar(this.asset.lifetimeW, index, this.asset.sourceEncoding);
-      const gate = sigmoid(10 * (0 - (mu - width))) * sigmoid(10 * ((mu + width) - 0));
+      const gate = this.asset.opacityTiming === 'baked'
+        ? 1
+        : sigmoid(10 * (0 - (mu - width))) * sigmoid(10 * ((mu + width) - 0));
       color[colorOffset + 3] = float2Half(sigmoid(readRaw4DTrack(this.asset.opacity, 0, index)) * gate);
 
       const transformOffset = index * 4;

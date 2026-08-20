@@ -19,6 +19,7 @@ describe('ExportCenterDialog', () => {
     }));
 
     expect(supportsFourCgsSceneExport('PLY4')).toBe(true);
+    expect(supportsFourCgsSceneExport('4GS')).toBe(true);
     expect(markup.match(/role="radio"/g)).toHaveLength(2);
     expect(markup).toContain('.4CGS');
     expect(markup).toContain('PLY 序列');

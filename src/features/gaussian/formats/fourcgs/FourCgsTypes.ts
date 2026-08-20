@@ -14,8 +14,11 @@ export interface FourCgsSegment {
   readonly lastFrame: number;
   readonly gaussianCount: number;
   readonly totalFrames: number;
+  readonly frameRate?: number;
   readonly bankCounts: FourCgsBankCounts;
   readonly keyframeStrides?: FourCgsKeyframeStrides;
+  readonly positionTiming?: 'shared-keyframes' | 'per-point-lifetime-endpoints';
+  readonly opacityTiming?: 'lifetime-gated' | 'baked';
 }
 
 export interface FourCgsStreamEntry {

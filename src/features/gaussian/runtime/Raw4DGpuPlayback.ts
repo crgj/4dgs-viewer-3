@@ -44,6 +44,8 @@ uniform vec4 dongRaw4dTrackKeys;
 uniform vec4 dongRaw4dTrackStrides;
 uniform vec2 dongRaw4dOpacityTrack;
 uniform float dongRaw4dAllMode;
+uniform float dongRaw4dPerPointPositionTime;
+uniform float dongRaw4dOpacityLifetimeBaked;
 
 struct DongTrackSpan {
     int left;
@@ -135,6 +137,16 @@ vec4 dongSlerp(vec4 left, vec4 right, float alpha) {
 void modifySplatCenter(inout vec3 center) {
     DongTrackSpan span = dongTrackSpan(dongRaw4dTrackKeys.x, dongRaw4dTrackStrides.x);
     int keyCount = int(dongRaw4dTrackKeys.x + 0.5);
+    if (dongRaw4dPerPointPositionTime > 0.5) {
+        vec2 lifetime = texelFetch(dongRaw4dLifetimeTex, dongTextureUv(splat.index), 0).xy;
+        float startFrame = lifetime.x - lifetime.y;
+        float endFrame = lifetime.x + lifetime.y;
+        span.left = 0;
+        span.right = min(1, keyCount - 1);
+        span.alpha = endFrame > startFrame
+            ? clamp((dongRaw4dFrame - startFrame) / (endFrame - startFrame), 0.0, 1.0)
+            : 0.0;
+    }
     vec3 position = mix(
         dongLoadPosition(keyCount, span.left).xyz,
         dongLoadPosition(keyCount, span.right).xyz,
@@ -184,8 +196,9 @@ void modifySplatColor(vec3 center, inout vec4 color) {
     );
     vec2 lifetime = texelFetch(dongRaw4dLifetimeTex, dongTextureUv(splat.index), 0).xy;
     float frame = clamp(dongRaw4dFrame, 0.0, dongRaw4dTotalFrames - 1.0);
-    float gate = dongSigmoid(10.0 * (frame - (lifetime.x - lifetime.y)))
-        * dongSigmoid(10.0 * ((lifetime.x + lifetime.y) - frame));
+    float gate = dongRaw4dOpacityLifetimeBaked > 0.5 ? 1.0
+        : dongSigmoid(10.0 * (frame - (lifetime.x - lifetime.y)))
+            * dongSigmoid(10.0 * ((lifetime.x + lifetime.y) - frame));
     float deleted = texelFetch(dongRaw4dDeleteMaskTex, dongTextureUv(splat.index), 0).r;
     float selected = texelFetch(dongRaw4dSelectionMaskTex, dongTextureUv(splat.index), 0).r;
     color.rgb = mix(color.rgb, vec3(1.0, 0.58, 0.08), step(0.5, selected) * 0.82);
@@ -282,6 +295,8 @@ uniform dongRaw4dTrackKeys: vec4f;
 uniform dongRaw4dTrackStrides: vec4f;
 uniform dongRaw4dOpacityTrack: vec2f;
 uniform dongRaw4dAllMode: f32;
+uniform dongRaw4dPerPointPositionTime: f32;
+uniform dongRaw4dOpacityLifetimeBaked: f32;
 
 struct DongTrackSpan {
     left: i32,
@@ -331,6 +346,10 @@ fn dongLoadOpacity(keyCount: i32, key: i32) -> f32 {
     return values[u32(key - (key / 4) * 4)];
 }
 
+fn dongLoadLifetime() -> vec2f {
+    return textureLoad(dongRaw4dLifetimeTex, dongTextureUv(splat.index), 0).xy;
+}
+
 fn dongSigmoid(value: f32) -> f32 {
     if (bitcast<u32>(value) == 0xff800000u) { return 0.0; }
     return 1.0 / (1.0 + exp(-clamp(value, -20.0, 20.0)));
@@ -370,8 +389,16 @@ fn dongSlerp(leftValue: vec4f, rightValue: vec4f, alpha: f32) -> vec4f {
 }
 
 fn modifySplatCenter(center: ptr<function, vec3f>) {
-    let span = dongTrackSpan(uniform.dongRaw4dTrackKeys.x, uniform.dongRaw4dTrackStrides.x);
+    var span = dongTrackSpan(uniform.dongRaw4dTrackKeys.x, uniform.dongRaw4dTrackStrides.x);
     let keyCount = i32(uniform.dongRaw4dTrackKeys.x + 0.5);
+    if (uniform.dongRaw4dPerPointPositionTime > 0.5) {
+        let lifetime = dongLoadLifetime();
+        let startFrame = lifetime.x - lifetime.y;
+        let endFrame = lifetime.x + lifetime.y;
+        span.left = 0;
+        span.right = min(1, keyCount - 1);
+        span.alpha = select(0.0, clamp((uniform.dongRaw4dFrame - startFrame) / (endFrame - startFrame), 0.0, 1.0), endFrame > startFrame);
+    }
     let position = mix(dongLoadPosition(keyCount, span.left).xyz, dongLoadPosition(keyCount, span.right).xyz, span.alpha);
     *center = (uniform.matrix_model * vec4f(position, 1.0)).xyz;
 }
@@ -409,10 +436,13 @@ fn modifySplatColor(center: vec3f, color: ptr<function, vec4f>) {
         dongLoadOpacity(opacityKeys, opacitySpan.right),
         opacitySpan.alpha
     );
-    let lifetime = textureLoad(dongRaw4dLifetimeTex, dongTextureUv(splat.index), 0).xy;
+    let lifetime = dongLoadLifetime();
     let frame = clamp(uniform.dongRaw4dFrame, 0.0, uniform.dongRaw4dTotalFrames - 1.0);
-    let gate = dongSigmoid(10.0 * (frame - (lifetime.x - lifetime.y)))
-        * dongSigmoid(10.0 * ((lifetime.x + lifetime.y) - frame));
+    let gate = select(
+        dongSigmoid(10.0 * (frame - (lifetime.x - lifetime.y))) * dongSigmoid(10.0 * ((lifetime.x + lifetime.y) - frame)),
+        1.0,
+        uniform.dongRaw4dOpacityLifetimeBaked > 0.5,
+    );
     let deleted = textureLoad(dongRaw4dDeleteMaskTex, dongTextureUv(splat.index), 0).x;
     let selected = textureLoad(dongRaw4dSelectionMaskTex, dongTextureUv(splat.index), 0).x;
     (*color).rgb = mix((*color).rgb, vec3f(1.0, 0.58, 0.08), step(0.5, selected) * 0.82);
@@ -452,6 +482,10 @@ fn dongLoadOpacity(keyCount: i32, key: i32) -> f32 {
     let linearIndex = splat.index * u32(groupCount) + u32(key / 4);
     let values = textureLoad(dongRaw4dOpacityTex, dongTextureUv(linearIndex), 0);
     return values[u32(key - (key / 4) * 4)];
+}
+
+fn dongLoadLifetime() -> vec2f {
+    return textureLoad(dongRaw4dLifetimeTex, dongTextureUv(splat.index), 0).xy;
 }`;
 
 const streamingTextureLoadersWGSL = `fn dongResolveSlot(keys: vec4f, key: i32) -> u32 {
@@ -486,6 +520,10 @@ fn dongLoadScale(keyCount: i32, key: i32) -> vec4f {
 
 fn dongLoadOpacity(keyCount: i32, key: i32) -> f32 {
     return dongLoadStreamingTrack(dongRaw4dOpacityTex, uniform.dongRaw4dOpacitySlotKeys, key).x;
+}
+
+fn dongLoadLifetime() -> vec2f {
+    return textureLoad(dongRaw4dLifetimeTex, dongTextureUv(splat.index), 0).xy;
 }`;
 
 const modifierStreamingWGSL = modifierWGSL
@@ -512,15 +550,19 @@ export function createRaw4DStorageModifierWGSL(half: boolean): string {
     : `let index = u32(uniform.dongRaw4dScalarOffsets.x) + slot * u32(uniform.dongRaw4dScalarStride) + splat.index;
     return dongRaw4dScalarData[index];`;
   const lifetimeLoad = half
-    ? `let muIndex = u32(uniform.dongRaw4dScalarOffsets.y) + splat.index;
+    ? `fn dongLoadLifetime() -> vec2f {
+    let muIndex = u32(uniform.dongRaw4dScalarOffsets.y) + splat.index;
     let widthIndex = u32(uniform.dongRaw4dScalarOffsets.z) + splat.index;
     let muPair = unpack2x16float(dongRaw4dScalarData[muIndex / 2u]);
     let widthPair = unpack2x16float(dongRaw4dScalarData[widthIndex / 2u]);
-    let lifetime = vec2f(muPair[muIndex % 2u], widthPair[widthIndex % 2u]);`
-    : `let lifetime = vec2f(
+    return vec2f(muPair[muIndex % 2u], widthPair[widthIndex % 2u]);
+}`
+    : `fn dongLoadLifetime() -> vec2f {
+    return vec2f(
         dongRaw4dScalarData[u32(uniform.dongRaw4dScalarOffsets.y) + splat.index],
         dongRaw4dScalarData[u32(uniform.dongRaw4dScalarOffsets.z) + splat.index]
-    );`;
+    );
+}`;
   const declarations = `var<storage, read> dongRaw4dPositionData: array<${vectorType}>;
 var<storage, read> dongRaw4dVectorData: array<${vectorType}>;
 var<storage, read> dongRaw4dScalarData: array<${scalarType}>;
@@ -570,11 +612,12 @@ fn dongLoadScale(keyCount: i32, key: i32) -> vec4f {
 fn dongLoadOpacity(keyCount: i32, key: i32) -> f32 {
     let slot = dongResolveSlot(uniform.dongRaw4dOpacitySlotKeys, key);
     ${scalarLoad}
-}`;
+}
+
+${lifetimeLoad}`;
   return modifierWGSL
     .replace(textureDeclarations, declarations)
-    .replace(textureLoaders, loaders)
-    .replace('let lifetime = textureLoad(dongRaw4dLifetimeTex, dongTextureUv(splat.index), 0).xy;', lifetimeLoad);
+    .replace(textureLoaders, loaders);
 }
 
 const modifierStorageFloatWGSL = createRaw4DStorageModifierWGSL(false);
@@ -1195,6 +1238,8 @@ export class Raw4DGpuPlayback {
       trackStride(this.asset.opacity),
     ]));
     component.setParameter('dongRaw4dAllMode', 0);
+    component.setParameter('dongRaw4dPerPointPositionTime', this.asset.positionTiming === 'per-point-lifetime-endpoints' ? 1 : 0);
+    component.setParameter('dongRaw4dOpacityLifetimeBaked', this.asset.opacityTiming === 'baked' ? 1 : 0);
   }
 
   private ensureStorageFrame(frame: number): void {
