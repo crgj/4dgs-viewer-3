@@ -4799,3 +4799,167 @@ button.outliner-row:hover,
     width: 276px;
   }
 }
+
+/* #WDD-gpt 2026-08-19 - 手机与窄屏切换为纯播放布局：只保留相册、两种渲染方式、时间轴和总点数。 */
+.studio-shell.mobile-player-mode {
+  grid-template-rows: 52px minmax(0, 1fr) 58px 32px;
+}
+
+.studio-shell.mobile-player-mode.welcome-mode {
+  grid-template-rows: 52px minmax(0, 1fr) 32px;
+}
+
+.mobile-player-mode .topbar {
+  height: 40px;
+  margin: 6px 8px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  padding: 0 7px 0 10px;
+}
+
+.mobile-player-mode .brand {
+  min-width: 0;
+  padding: 0;
+}
+
+.mobile-player-mode .brand strong {
+  overflow: hidden;
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mobile-player-mode .menu-bar {
+  display: flex;
+  justify-self: end;
+  margin: 0;
+  padding: 0;
+  border-left: 0;
+}
+
+.mobile-player-mode .menu-trigger {
+  height: 30px;
+  padding: 0 12px;
+  border: 1px solid rgba(66, 220, 174, 0.15);
+  color: #a8ead6;
+  background: rgba(36, 201, 151, 0.07);
+  font-size: 12px;
+}
+
+.mobile-player-mode .workspace {
+  margin: 0 8px;
+}
+
+.mobile-player-mode .viewport-toolbar {
+  top: 10px;
+  right: auto;
+  left: 50%;
+  transform: translateX(-50%);
+}
+
+.mobile-player-mode .render-mode-switch {
+  padding: 3px;
+  border-radius: 10px;
+  background: rgba(12, 15, 18, 0.82);
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.32);
+  backdrop-filter: blur(14px);
+}
+
+.mobile-player-mode .render-mode-button {
+  min-width: 68px;
+  height: 30px;
+  padding: 0 10px;
+  font-size: 12px;
+}
+
+.mobile-player-mode .timeline-panel {
+  grid-template-columns: 38px minmax(0, 1fr) 38px;
+  gap: 8px;
+  margin: 4px 8px;
+  padding: 0 9px;
+  border-radius: 13px;
+}
+
+.mobile-player-mode .playback-controls {
+  justify-content: center;
+}
+
+.mobile-player-mode .playback-controls > button:not(.play-button) {
+  display: none;
+}
+
+.mobile-player-mode .playback-controls .play-button {
+  width: 32px;
+  height: 32px;
+  border-radius: 10px;
+}
+
+.mobile-player-mode .timeline-header {
+  height: 18px;
+}
+
+.mobile-player-mode .timeline-title,
+.mobile-player-mode .timeline-readout > strong,
+.mobile-player-mode .timeline-details-toggle,
+.mobile-player-mode .timeline-marks,
+.mobile-player-mode .timeline-segment-bands,
+.mobile-player-mode .timeline-frame-ticks,
+.mobile-player-mode .timeline-annotations,
+.mobile-player-mode .timeline-detail-tracks,
+.mobile-player-mode .fps-select {
+  display: none;
+}
+
+.mobile-player-mode .timeline-readout {
+  width: 100%;
+  justify-content: center;
+}
+
+.mobile-player-mode .timeline-frame-counter {
+  color: #aeb8ba !important;
+  font-size: 10px !important;
+}
+
+.mobile-player-mode .timeline-track {
+  height: 19px;
+}
+
+.mobile-player-mode .timeline-track input {
+  height: 18px;
+  touch-action: pan-x;
+}
+
+.mobile-player-mode .timeline-options {
+  justify-content: center;
+}
+
+.mobile-player-mode .timeline-options .loop-button {
+  display: inline-flex;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border-color: rgba(255, 255, 255, 0.07);
+}
+
+.mobile-player-mode .timeline-options .loop-button span {
+  display: none;
+}
+
+.mobile-player-mode .statusbar {
+  justify-content: center;
+  padding: 0 8px;
+}
+
+.mobile-player-mode .statusbar .gaussian-status-summary {
+  justify-content: center;
+}
+
+.mobile-player-mode .gaussian-status-summary > div {
+  height: 25px;
+  border: 0;
+  background: transparent;
+}
+
+.mobile-player-mode .gaussian-status-summary dt,
+.mobile-player-mode .gaussian-status-summary dd {
+  font-size: 12px;
+}

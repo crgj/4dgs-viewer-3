@@ -34,10 +34,12 @@ interface GaussianViewportProps {
   activeTool: ViewportEditorTool;
   brushRadius: number;
   currentFrame: number;
+  frameReadyRequestId: number;
   memoryPolicy: Gaussian4DMemoryPolicy;
   onMemoryChange: (memory: ViewportMemoryUsage) => void;
   onPerformanceChange: (performance: ViewportPerformanceSnapshot) => void;
   onHistoryChange: (state: ViewportHistoryState) => void;
+  onFrameRenderReady: (requestId: number, sorted: boolean) => void;
   onCameraBookmarksChange: (bookmarks: readonly (ViewportCameraState | null)[]) => void;
   onRelightingChange: (state: RelightingState) => void;
   onRuntimeChange: (runtime: ViewportRuntime | null) => void;
@@ -140,10 +142,12 @@ export function GaussianViewport({
   activeTool,
   brushRadius,
   currentFrame,
+  frameReadyRequestId,
   memoryPolicy,
   onMemoryChange,
   onPerformanceChange,
   onHistoryChange,
+  onFrameRenderReady,
   onCameraBookmarksChange,
   onRelightingChange,
   onRuntimeChange,
@@ -174,6 +178,8 @@ export function GaussianViewport({
   const raw4DSequenceLoadGenerationRef = useRef(0);
   const raw4DSequenceLoadingSegmentRef = useRef<number | null>(null);
   const pendingFrameRef = useRef(currentFrame);
+  const frameApplicationRef = useRef<Promise<void>>(Promise.resolve());
+  const frameReadyGenerationRef = useRef(0);
   const activateFourCgsFrameRef = useRef<(frame: number) => Promise<void>>(async () => undefined);
   const activateRaw4DSequenceFrameRef = useRef<(frame: number) => Promise<void>>(async () => undefined);
   const renderModeRef = useRef(renderMode);
@@ -433,8 +439,9 @@ export function GaussianViewport({
   }, [memoryPolicy, runtimeReady]);
 
   useEffect(() => {
+    let application: Promise<void>;
     if (fourCgsSessionRef.current) {
-      void activateFourCgsFrameRef.current(currentFrame).catch((error: unknown) => {
+      application = activateFourCgsFrameRef.current(currentFrame).catch((error: unknown) => {
         onStatusChange({
           phase: 'error', renderer: '4CGS 段切换失败', splatCount: 0,
           message: error instanceof Error ? error.message : String(error),
@@ -443,7 +450,7 @@ export function GaussianViewport({
         });
       });
     } else if (raw4DSequenceSessionRef.current) {
-      void activateRaw4DSequenceFrameRef.current(currentFrame).catch((error: unknown) => {
+      application = activateRaw4DSequenceFrameRef.current(currentFrame).catch((error: unknown) => {
         onStatusChange({
           phase: 'error', renderer: 'RAW4D 段切换失败', splatCount: 0,
           message: error instanceof Error ? error.message : String(error),
@@ -453,8 +460,24 @@ export function GaussianViewport({
       });
     } else {
       runtimeRef.current?.setFrame(currentFrame);
+      application = Promise.resolve();
     }
+    frameApplicationRef.current = application;
   }, [currentFrame, onStatusChange]);
+
+  useEffect(() => {
+    if (frameReadyRequestId <= 0) return;
+    const runtime = runtimeRef.current;
+    if (!runtime) return;
+    const generation = ++frameReadyGenerationRef.current;
+    const application = frameApplicationRef.current;
+    // #WDD-gpt 2026-08-19 - 分段切换先完成解码与首帧提交，再等待最新排序；旧请求不得恢复新一轮播放。
+    void application
+      .then(() => runtime.waitForGaussianFrameReady())
+      .then((sorted) => {
+        if (generation === frameReadyGenerationRef.current) onFrameRenderReady(frameReadyRequestId, sorted);
+      });
+  }, [frameReadyRequestId, onFrameRenderReady]);
 
   useEffect(() => {
     const runtime = runtimeRef.current;

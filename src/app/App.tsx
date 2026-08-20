@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import changeLogMarkdown from '../../CHANGELOG.md?raw';
 import { formatBytes } from '../core/format/formatBytes';
 import {
@@ -427,6 +427,8 @@ const pluginStatusLabelKeys: Readonly<Record<PluginStatusTone, keyof UiCopy>> = 
 };
 
 export function App() {
+  const [mobilePlayerMode, setMobilePlayerMode] = useState(() => initialRuntimeProfile.name === 'mobile-compatible'
+    || (typeof window !== 'undefined' && window.matchMedia('(max-width: 720px)').matches));
   const [activeTool, setActiveTool] = useState<ViewportEditorTool>('select');
   const [selectionState, setSelectionState] = useState<ViewportSelectionState>(INITIAL_VIEWPORT_SELECTION_STATE);
   const [selectionScope, setSelectionScope] = useState<ViewportSelectionScope>('visible');
@@ -452,6 +454,8 @@ export function App() {
   const [currentFrame, setCurrentFrame] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
   const [isLooping, setIsLooping] = useState(true);
+  const [loopSortWaiting, setLoopSortWaiting] = useState(false);
+  const [frameReadyRequestId, setFrameReadyRequestId] = useState(0);
   // #WDD-gpt 2026-08-16 - 播放速率独立于文件元数据并默认 30 FPS，允许用户按检查需求降速或加速。
   const [playbackFps, setPlaybackFps] = useState(30);
   const [renderMode, setRenderMode] = useState<GaussianRenderMode>('gaussian');
@@ -521,6 +525,8 @@ export function App() {
   } | null>(null);
   const fileDragDepthRef = useRef(0);
   const workspaceSaveBusyRef = useRef(false);
+  const loopRestartPendingRef = useRef(false);
+  const loopRestartRequestIdRef = useRef(0);
   const restoredWorkspaceSignatureRef = useRef<string | null>(null);
   const smartAlignmentPluginRef = useRef<SmartAlignmentPlugin | null>(null);
   const gs2MeshPluginRef = useRef<GS2MeshPlugin | null>(null);
@@ -532,6 +538,48 @@ export function App() {
   );
   const timelineEndFrame = Math.max(0, (status.totalFrames ?? 121) - 1);
   const copy = UI_COPY[language];
+  useEffect(() => {
+    const media = window.matchMedia('(max-width: 720px)');
+    const detectedMobile = initialRuntimeProfile.name === 'mobile-compatible';
+    const updateMode = () => setMobilePlayerMode(detectedMobile || media.matches);
+    updateMode();
+    media.addEventListener('change', updateMode);
+    return () => media.removeEventListener('change', updateMode);
+  }, []);
+
+  useEffect(() => {
+    if (!mobilePlayerMode) return;
+    // #WDD-gpt 2026-08-19 - 手机端收敛为播放器：隐藏编辑能力的同时关闭不可见的辅助绘制，避免白耗 GPU 与触控命中区域。
+    setInspectorPanelVisible(false);
+    setActivePlugin(null);
+    setActiveTool('select');
+    setShowGrid(false);
+    setShowAxes(false);
+    setShowHeightRuler(false);
+    setShowGaussianEnvelope(false);
+    setTimelineDetailsVisible(false);
+    if (renderMode !== 'gaussian' && renderMode !== 'point') setRenderMode('gaussian');
+  }, [mobilePlayerMode, renderMode]);
+
+  const handleFrameRenderReady = useCallback((requestId: number, sorted: boolean) => {
+    if (!loopRestartPendingRef.current || requestId !== loopRestartRequestIdRef.current) return;
+    if (!sorted) {
+      // 超时不放行未排序帧；重新等待下一次引擎 ready，而不是退回固定延时播放。
+      const retryId = loopRestartRequestIdRef.current + 1;
+      loopRestartRequestIdRef.current = retryId;
+      setFrameReadyRequestId(retryId);
+      return;
+    }
+    loopRestartPendingRef.current = false;
+    setLoopSortWaiting(false);
+    setIsPlaying(true);
+  }, []);
+  const stopPlayback = useCallback(() => {
+    loopRestartPendingRef.current = false;
+    loopRestartRequestIdRef.current += 1;
+    setLoopSortWaiting(false);
+    setIsPlaying(false);
+  }, []);
   // #WDD-gpt 2026-08-16 - 极限内存预设必须在网页内二次确认，避免低配置设备因误触直接进入高驻留预算。
   const requestMemoryMode = (nextMode: Gaussian4DMemoryMode) => {
     if (nextMode === 'local-maximum' && memoryMode !== 'local-maximum') {
@@ -884,6 +932,17 @@ export function App() {
       if (!isLooping && absoluteFrame >= timelineEndFrame) {
         setCurrentFrame(timelineEndFrame);
         setIsPlaying(false);
+        return;
+      }
+      if (isLooping && absoluteFrame >= frameCount) {
+        // #WDD-gpt 2026-08-19 - 循环边界先暂停在第 0 帧，等 PlayCanvas 确认新中心已排序并提交后再恢复时钟。
+        loopRestartPendingRef.current = true;
+        const requestId = loopRestartRequestIdRef.current + 1;
+        loopRestartRequestIdRef.current = requestId;
+        setIsPlaying(false);
+        setLoopSortWaiting(true);
+        setCurrentFrame(0);
+        setFrameReadyRequestId(requestId);
         return;
       }
       const nextFrame = isLooping ? absoluteFrame % frameCount : Math.min(absoluteFrame, timelineEndFrame);
@@ -1489,10 +1548,13 @@ export function App() {
     setCameraBookmarks([null, null, null]);
     setActiveGalleryId(null);
     setActivePlugin(null);
-    setInspectorPanelVisible(true);
+    setInspectorPanelVisible(!mobilePlayerMode);
     setInspectorTab('scene');
     setCurrentFrame(0);
     setIsPlaying(false);
+    setLoopSortWaiting(false);
+    loopRestartPendingRef.current = false;
+    loopRestartRequestIdRef.current += 1;
     // #WDD-gpt 2026-08-16 - 即使文件名相同也建立新数组，保证再次拖入会取消旧导入并正式重开场景。
     setSourceFiles(files);
   };
@@ -1628,7 +1690,7 @@ export function App() {
 
   return (
     <main
-      className={sourceFiles.length === 0 ? 'studio-shell welcome-mode' : 'studio-shell'}
+      className={`${sourceFiles.length === 0 ? 'studio-shell welcome-mode' : 'studio-shell'}${mobilePlayerMode ? ' mobile-player-mode' : ''}`}
       data-source-name={status.sourceName ?? ''}
       data-status-phase={status.phase}
       data-raw4d-segments={status.raw4dSequence?.segmentCount ?? 0}
@@ -1684,7 +1746,7 @@ export function App() {
         </div>
 
         <nav aria-label={copy.mainMenu} className="menu-bar" onClick={(event) => event.stopPropagation()}>
-          <div className="menu-anchor">
+          {!mobilePlayerMode && <div className="menu-anchor">
             <button className={openMenu === 'file' ? 'menu-trigger active' : 'menu-trigger'} onClick={(event) => toggleMenu(event, 'file')} type="button">{copy.file}</button>
             {openMenu === 'file' && (
               <div className="dropdown-menu">
@@ -1695,8 +1757,8 @@ export function App() {
                 <button disabled={exportProgress !== null} onClick={openExportCenter} type="button"><span>{copy.export}</span></button>
               </div>
             )}
-          </div>
-          <div className="menu-anchor">
+          </div>}
+          {!mobilePlayerMode && <div className="menu-anchor">
             <button className={openMenu === 'view' ? 'menu-trigger active' : 'menu-trigger'} onClick={(event) => toggleMenu(event, 'view')} type="button">{copy.view}</button>
             {openMenu === 'view' && (
               <div className="dropdown-menu">
@@ -1706,12 +1768,12 @@ export function App() {
                 <button onClick={() => setShowHeightRuler((visible) => !visible)} type="button"><span>{copy.heightRuler}</span><b>{showHeightRuler ? '✓' : ''}</b></button>
               </div>
             )}
-          </div>
+          </div>}
           {/* #WDD-gpt 2026-08-17 - 相册作为主菜单一级入口展示，不再占用右侧快捷操作区或藏在文件子菜单。 */}
           <button className="menu-trigger" onClick={openFourCgsGallery} type="button">
             {language === 'zh' ? '相册' : 'Gallery'}
           </button>
-          <div className="menu-anchor">
+          {!mobilePlayerMode && <div className="menu-anchor">
             <button
               aria-expanded={openMenu === 'plugins'}
               aria-haspopup="menu"
@@ -1750,10 +1812,10 @@ export function App() {
                 </div>
               </div>
             )}
-          </div>
+          </div>}
         </nav>
 
-        <div aria-label={copy.editHistory} className="history-toolbar" onClick={(event) => event.stopPropagation()} role="toolbar">
+        {!mobilePlayerMode && <div aria-label={copy.editHistory} className="history-toolbar" onClick={(event) => event.stopPropagation()} role="toolbar">
           <button
             aria-label={copy.undo}
             className="has-tip"
@@ -1780,9 +1842,9 @@ export function App() {
           >
             <Icon name="redo" size={16} />
           </button>
-        </div>
+        </div>}
 
-        <div className="scene-document">
+        {!mobilePlayerMode && <div className="scene-document">
           <span className="status-dot cyan" />
           <strong>{displaySceneName}</strong>
           <span
@@ -1795,9 +1857,9 @@ export function App() {
                   ? (language === 'zh' ? '存在可恢复工作区' : 'Recoverable workspace found')
                   : copy.unsaved}
           />
-        </div>
+        </div>}
 
-        <div className="top-actions">
+        {!mobilePlayerMode && <div className="top-actions">
           <div aria-label={copy.language} className="language-switch" role="group">
             <button aria-pressed={language === 'zh'} className="has-tip" data-tip={copy.chinese} onClick={() => setLanguage('zh')} type="button">中</button>
             <button aria-pressed={language === 'en'} className="has-tip" data-tip={copy.english} onClick={() => setLanguage('en')} type="button">EN</button>
@@ -1808,7 +1870,7 @@ export function App() {
           <button className="primary-button has-tip" data-tip={copy.exportTip} disabled={exportProgress !== null} onClick={openExportCenter} type="button">
             <Icon name="export" />{exportProgress === null ? copy.export : `${copy.savingRaw4D} ${Math.round(exportProgress * 100)}%`}
           </button>
-        </div>
+        </div>}
       </header>
 
       {releaseNotesVisible && (
@@ -2083,7 +2145,9 @@ export function App() {
             activeTool={activeTool}
             brushRadius={selectionBrushRadius}
             currentFrame={currentFrame}
+            frameReadyRequestId={frameReadyRequestId}
             memoryPolicy={memoryPolicy}
+            onFrameRenderReady={handleFrameRenderReady}
             onHistoryChange={setHistoryState}
             onCameraBookmarksChange={setCameraBookmarks}
             onMemoryChange={setMemoryUsage}
@@ -2101,7 +2165,7 @@ export function App() {
             showHeightRuler={showHeightRuler}
             showGaussianEnvelope={showGaussianEnvelope}
             showGrid={showGrid}
-            showGuides
+            showGuides={!mobilePlayerMode}
             sourceFiles={sourceFiles}
             transform={sceneTransform}
             uniformScale={uniformScale}
@@ -2117,7 +2181,7 @@ export function App() {
           )}
           <div className="viewport-toolbar" data-camera-input-block>
             <div aria-label={copy.renderModes} className="render-mode-switch" role="group">
-              {gaussianRenderModes.map((mode) => (
+              {gaussianRenderModes.filter((mode) => !mobilePlayerMode || mode.id === 'gaussian' || mode.id === 'point').map((mode) => (
                 <button
                   aria-pressed={renderMode === mode.id}
                   className={renderMode === mode.id ? 'render-mode-button active has-tip' : 'render-mode-button has-tip'}
@@ -2131,7 +2195,7 @@ export function App() {
                 </button>
               ))}
             </div>
-            <div aria-label="SH display level" className="sh-level-switch" role="group">
+            {!mobilePlayerMode && <div aria-label="SH display level" className="sh-level-switch" role="group">
               {[0, 1, 2, 3].map((level) => (
                 <button
                   aria-pressed={shLevel === level}
@@ -2143,14 +2207,14 @@ export function App() {
                   type="button"
                 >SH{level}</button>
               ))}
-            </div>
-            <div className="guide-switches">
+            </div>}
+            {!mobilePlayerMode && <div className="guide-switches">
               <button aria-pressed={showGrid} className={showGrid ? 'active' : ''} onClick={() => setShowGrid((visible) => !visible)} type="button">{copy.grid}</button>
               <button aria-pressed={showAxes} className={showAxes ? 'active' : ''} onClick={() => setShowAxes((visible) => !visible)} type="button">{copy.axes}</button>
               <button aria-pressed={showHeightRuler} className={showHeightRuler ? 'active' : ''} onClick={() => setShowHeightRuler((visible) => !visible)} type="button">{copy.heightRuler}</button>
-            </div>
+            </div>}
             {/* #WDD-gpt 2026-08-16 - 序列摘要并入顶部工具栏，避免单独占用第二行遮挡视口。 */}
-            {status.phase === 'ready' && status.raw4dSequence && (
+            {!mobilePlayerMode && status.phase === 'ready' && status.raw4dSequence && (
               <div className="raw4d-sequence-badge">
                 <strong>{status.format} × {status.raw4dSequence.segmentCount}</strong>
                 <span>{copy.sequenceSegment} {status.raw4dSequence.segmentIndex + 1}/{status.raw4dSequence.segmentCount}</span>
@@ -2161,14 +2225,14 @@ export function App() {
               </div>
             )}
           </div>
-          <div className="camera-help" data-camera-input-block>{copy.cameraMoveHint}</div>
+          {!mobilePlayerMode && <div className="camera-help" data-camera-input-block>{copy.cameraMoveHint}</div>}
           {/* #WDD-gpt 2026-08-16 - 使用实时 3D 投影导航立方体同步相机姿态，并隔离主视口的鼠标输入。 */}
-          <ViewCube3D
+          {!mobilePlayerMode && <ViewCube3D
             inspectorOpen={inspectorPanelVisible}
             labels={cameraViewLabels}
             runtime={viewportRuntime}
             title={copy.cameraCubeTip}
-          />
+          />}
           {status.phase === 'error' && (
             <div className="viewport-error">
               <strong>{viewportErrorDescription?.title ?? copy.viewportFailed}</strong>
@@ -2188,7 +2252,7 @@ export function App() {
           )}
         </section>
 
-        <aside className="toolrail operation-toolrail glass-panel" aria-label={copy.operationTools} data-camera-input-block>
+        {!mobilePlayerMode && <aside className="toolrail operation-toolrail glass-panel" aria-label={copy.operationTools} data-camera-input-block>
           {operationTools.map((tool) => (
             <button
               aria-label={copy[tool.labelKey]}
@@ -2204,10 +2268,10 @@ export function App() {
               <kbd>{tool.shortcut}</kbd>
             </button>
           ))}
-        </aside>
+        </aside>}
 
         {/* #WDD-gpt  2026-08-16 - 选择形态默认收成操作栏下方单列，点中后才在右侧展开参数详情。 */}
-        <aside className="toolrail selection-toolrail glass-panel" aria-label={copy.selectionPanel} data-camera-input-block>
+        {!mobilePlayerMode && <aside className="toolrail selection-toolrail glass-panel" aria-label={copy.selectionPanel} data-camera-input-block>
           {selectionTools.map((tool) => (
             <button
               aria-label={copy[tool.labelKey]}
@@ -2223,9 +2287,9 @@ export function App() {
               <kbd>{tool.shortcut}</kbd>
             </button>
           ))}
-        </aside>
+        </aside>}
 
-        {activeSelectionDescriptor && (
+        {!mobilePlayerMode && activeSelectionDescriptor && (
           <aside
             aria-label={`${copy.selectionPanel}: ${copy[activeSelectionDescriptor.labelKey]}`}
             className={`selection-detail-panel glass-panel ${selectionState.phase}`}
@@ -2365,7 +2429,7 @@ export function App() {
           </aside>
         )}
 
-        {inspectorPanelVisible && <aside aria-label={copy.inspector} className="panel inspector-panel glass-panel" data-camera-input-block>
+        {!mobilePlayerMode && inspectorPanelVisible && <aside aria-label={copy.inspector} className="panel inspector-panel glass-panel" data-camera-input-block>
           {/* #WDD-gpt 2026-08-15 - 检查器按职责分页，避免属性长列表挤压性能图表。 */}
           <nav aria-label={copy.inspectorTabs} className="inspector-tabs" role="tablist">
             {inspectorTabs.map((tab) => (
@@ -2631,7 +2695,7 @@ export function App() {
             </section>
           </div>
         )}
-        {sourceFiles.length > 0 && status.phase === 'ready' && (
+        {!mobilePlayerMode && sourceFiles.length > 0 && status.phase === 'ready' && (
           <GaussianHistogramPanel
             bufferId={status.bufferId}
             currentFrame={currentFrame}
@@ -2654,11 +2718,25 @@ export function App() {
 
       {sourceFiles.length > 0 && <section aria-label={copy.timeline} className="timeline-panel glass-panel" data-camera-input-block>
         <div className="playback-controls">
-          <button aria-label={copy.firstFrame} className="has-tip" data-tip={copy.firstFrame} onClick={() => { setCurrentFrame(0); setIsPlaying(false); }} type="button"><Icon name="stepBack" size={15} /></button>
-          <button aria-label={copy.previousFrame} className="has-tip" data-tip={copy.previousFrame} onClick={() => { setCurrentFrame((frame) => Math.max(0, frame - 1)); setIsPlaying(false); }} type="button"><span>−1</span></button>
-          <button aria-label={isPlaying ? copy.pause : copy.play} className="play-button has-tip" data-tip={isPlaying ? copy.pause : copy.play} onClick={() => setIsPlaying((playing) => !playing)} type="button"><Icon name={isPlaying ? 'pause' : 'play'} size={16} /></button>
-          <button aria-label={copy.nextFrame} className="has-tip" data-tip={copy.nextFrame} onClick={() => { setCurrentFrame((frame) => Math.min(timelineEndFrame, frame + 1)); setIsPlaying(false); }} type="button"><span>+1</span></button>
-          <button aria-label={copy.lastFrame} className="has-tip" data-tip={copy.lastFrame} onClick={() => { setCurrentFrame(timelineEndFrame); setIsPlaying(false); }} type="button"><Icon name="stepForward" size={15} /></button>
+          <button aria-label={copy.firstFrame} className="has-tip" data-tip={copy.firstFrame} onClick={() => { setCurrentFrame(0); stopPlayback(); }} type="button"><Icon name="stepBack" size={15} /></button>
+          <button aria-label={copy.previousFrame} className="has-tip" data-tip={copy.previousFrame} onClick={() => { setCurrentFrame((frame) => Math.max(0, frame - 1)); stopPlayback(); }} type="button"><span>−1</span></button>
+          <button
+            aria-label={isPlaying || loopSortWaiting ? copy.pause : copy.play}
+            className="play-button has-tip"
+            data-tip={isPlaying || loopSortWaiting ? copy.pause : copy.play}
+            onClick={() => {
+              if (loopSortWaiting) {
+                loopRestartPendingRef.current = false;
+                loopRestartRequestIdRef.current += 1;
+                setLoopSortWaiting(false);
+                return;
+              }
+              setIsPlaying((playing) => !playing);
+            }}
+            type="button"
+          ><Icon name={isPlaying || loopSortWaiting ? 'pause' : 'play'} size={16} /></button>
+          <button aria-label={copy.nextFrame} className="has-tip" data-tip={copy.nextFrame} onClick={() => { setCurrentFrame((frame) => Math.min(timelineEndFrame, frame + 1)); stopPlayback(); }} type="button"><span>+1</span></button>
+          <button aria-label={copy.lastFrame} className="has-tip" data-tip={copy.lastFrame} onClick={() => { setCurrentFrame(timelineEndFrame); stopPlayback(); }} type="button"><Icon name="stepForward" size={15} /></button>
         </div>
 
         <div className="timeline-main">
@@ -2711,7 +2789,7 @@ export function App() {
               aria-label={copy.currentFrame}
               max={timelineEndFrame}
               min="0"
-              onChange={(event) => { setCurrentFrame(Number(event.target.value)); setIsPlaying(false); }}
+              onChange={(event) => { setCurrentFrame(Number(event.target.value)); stopPlayback(); }}
               style={{ '--timeline-progress': `${(currentFrame / Math.max(1, timelineEndFrame)) * 100}%` } as React.CSSProperties}
               type="range"
               value={currentFrame}
@@ -2748,14 +2826,14 @@ export function App() {
       </section>}
 
       <footer className="statusbar" data-camera-input-block>
-        <span><i className={status.phase === 'ready' ? 'ok' : ''} />{status.phase === 'ready' ? copy.sceneReady : copy.scenePreparing}</span>
+        {!mobilePlayerMode && <span><i className={status.phase === 'ready' ? 'ok' : ''} />{status.phase === 'ready' ? copy.sceneReady : copy.scenePreparing}</span>}
         {/* #WDD-gpt 2026-08-16 - 左下角同时展示全局有效点、当前活动片段显示点和全局软删除点。 */}
         <dl aria-label={copy.gaussianStatusSummary} className="gaussian-status-summary">
-          <div><dt>{copy.activeGaussianStatus}</dt><dd>{statusActiveCount.toLocaleString(gaussianCountLocale)}</dd></div>
-          <div><dt>{copy.currentFrameGaussianStatus}</dt><dd>{statusCurrentFrameDisplayedCount.toLocaleString(gaussianCountLocale)}</dd></div>
-          <div className={statusDeletedCount > 0 ? 'deleted' : ''}><dt>{copy.deletedGaussianStatus}</dt><dd>{statusDeletedCount.toLocaleString(gaussianCountLocale)}</dd></div>
+          <div><dt>{mobilePlayerMode ? (language === 'zh' ? '高斯总数' : 'Gaussians') : copy.activeGaussianStatus}</dt><dd>{statusActiveCount.toLocaleString(gaussianCountLocale)}</dd></div>
+          {!mobilePlayerMode && <div><dt>{copy.currentFrameGaussianStatus}</dt><dd>{statusCurrentFrameDisplayedCount.toLocaleString(gaussianCountLocale)}</dd></div>}
+          {!mobilePlayerMode && <div className={statusDeletedCount > 0 ? 'deleted' : ''}><dt>{copy.deletedGaussianStatus}</dt><dd>{statusDeletedCount.toLocaleString(gaussianCountLocale)}</dd></div>}
         </dl>
-        <span
+        {!mobilePlayerMode && <span
           aria-label={`${copy.memoryUsage}: JS ${formatBytes(memoryUsage.jsHeapBytes)}, 4D ${formatBytes(memoryUsage.managedCpuBytes)}, GPU ${formatBytes(memoryUsage.gpuBytes)}`}
           className="memory-usage has-tip"
           data-tip={`${copy.jsHeapLabel} ${formatBytes(memoryUsage.jsHeapBytes)} / ${formatBytes(memoryUsage.jsHeapLimitBytes)} · ${copy.dataMemoryLabel} ${formatBytes(memoryUsage.managedCpuBytes)} / ${formatBytes(memoryUsage.cpuBudgetBytes)} · ${copy.gpuVramLabel} ${formatBytes(memoryUsage.gpuBytes)} / ${formatBytes(memoryUsage.gpuBudgetBytes)}`}
@@ -2764,7 +2842,7 @@ export function App() {
           <em>JS {formatBytes(memoryUsage.jsHeapBytes)}</em>
           <em>4D {formatBytes(memoryUsage.managedCpuBytes)}</em>
           <em>GPU {formatBytes(memoryUsage.gpuBytes)}</em>
-        </span>
+        </span>}
       </footer>
     </main>
   );

@@ -779,6 +779,41 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
     this.activeRaw4D?.setFrame(frame);
   }
 
+  // #WDD-gpt 2026-08-19 - 循环回到首帧时以引擎真实 frame:ready 信号作为继续播放门槛，避免 Worker 排序尚未提交就推进下一帧。
+  waitForGaussianFrameReady(timeoutMs = 4_000): Promise<boolean> {
+    const app = this.app;
+    const camera = this.camera?.camera;
+    const gsplatSystem = app?.systems.gsplat;
+    if (!app || !camera || !gsplatSystem || !this.activeRaw4D) return Promise.resolve(true);
+
+    return new Promise((resolve) => {
+      let armed = false;
+      let settled = false;
+      const finish = (ready: boolean) => {
+        if (settled) return;
+        settled = true;
+        window.cancelAnimationFrame(armFrame);
+        window.clearTimeout(timeout);
+        handle.off();
+        resolve(ready);
+      };
+      const handle = gsplatSystem.on('frame:ready', (
+        eventCamera: typeof camera,
+        _layer: Layer,
+        ready: boolean,
+        loadingCount: number,
+      ) => {
+        if (!armed || eventCamera !== camera) return;
+        if (ready && loadingCount === 0) finish(true);
+      });
+      // 至少让一次 PlayCanvas 更新看到新的 centersVersion，再接受后续 ready=true。
+      const armFrame = window.requestAnimationFrame(() => {
+        armed = true;
+      });
+      const timeout = window.setTimeout(() => finish(false), Math.max(250, timeoutMs));
+    });
+  }
+
   setGridVisible(visible: boolean): void {
     this.gridVisible = visible;
     this.guides?.setGridVisible(visible);
