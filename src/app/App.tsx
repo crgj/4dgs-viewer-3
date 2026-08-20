@@ -674,6 +674,9 @@ export function App() {
   const statusActiveCount = Math.max(0, (selectionState.pointCount ?? status.splatCount) - statusDeletedCount);
   const statusCurrentFrameDisplayedCount = selectionState.currentFrameDisplayedCount
     ?? Math.max(0, status.splatCount - Math.min(status.splatCount, statusDeletedCount));
+  const statusKeyframeCount = status.keyframeCount
+    ?? status.raw4dSequence?.keyframes.length
+    ?? (status.splatCount > 0 ? 1 : 0);
   const gaussianCountLocale = language === 'zh' ? 'zh-CN' : 'en-US';
   const sourceFile = sourceFiles.length === 1 ? sourceFiles[0] : null;
   const localizedStatusMessage = localizeRuntimeMessage(language, status.message);
@@ -2827,11 +2830,12 @@ export function App() {
 
       <footer className="statusbar" data-camera-input-block>
         {!mobilePlayerMode && <span><i className={status.phase === 'ready' ? 'ok' : ''} />{status.phase === 'ready' ? copy.sceneReady : copy.scenePreparing}</span>}
-        {/* #WDD-gpt 2026-08-16 - 左下角同时展示全局有效点、当前活动片段显示点和全局软删除点。 */}
+        {/* #WDD-gpt 2026-08-20 - 左下角统计补充所有属性合并后的唯一关键帧数；手机播放器仍只保留高斯总数。 */}
         <dl aria-label={copy.gaussianStatusSummary} className="gaussian-status-summary">
           <div><dt>{mobilePlayerMode ? (language === 'zh' ? '高斯总数' : 'Gaussians') : copy.activeGaussianStatus}</dt><dd>{statusActiveCount.toLocaleString(gaussianCountLocale)}</dd></div>
           {!mobilePlayerMode && <div><dt>{copy.currentFrameGaussianStatus}</dt><dd>{statusCurrentFrameDisplayedCount.toLocaleString(gaussianCountLocale)}</dd></div>}
           {!mobilePlayerMode && <div className={statusDeletedCount > 0 ? 'deleted' : ''}><dt>{copy.deletedGaussianStatus}</dt><dd>{statusDeletedCount.toLocaleString(gaussianCountLocale)}</dd></div>}
+          {!mobilePlayerMode && <div className="keyframes"><dt>{copy.keyframeCountStatus}</dt><dd>{statusKeyframeCount.toLocaleString(gaussianCountLocale)}</dd></div>}
         </dl>
         {!mobilePlayerMode && <span
           aria-label={`${copy.memoryUsage}: JS ${formatBytes(memoryUsage.jsHeapBytes)}, 4D ${formatBytes(memoryUsage.managedCpuBytes)}, GPU ${formatBytes(memoryUsage.gpuBytes)}`}

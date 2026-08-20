@@ -26,6 +26,12 @@ function header(totalFrames: number, vertexCount = 3): Raw4DHeader {
     totalFrames,
     scalarEncoding: 'float16',
     propertyNames,
+    pointCount: vertexCount,
+    payloadBytes: vertexCount * propertyNames.length * 2,
+    elements: [{
+      name: 'vertex', dataOffset: 100, recordBytes: propertyNames.length * 2,
+      count: vertexCount, scalarEncoding: 'float16', propertyNames,
+    }],
     comments: new Map([
       ['total_frames', String(totalFrames)],
       ['xyz_bank_keyframe_stride', '30'],

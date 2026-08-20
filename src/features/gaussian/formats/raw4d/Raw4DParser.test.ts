@@ -3,6 +3,7 @@ import { Raw4DFrameSampler } from '../../runtime/Raw4DFrameSampler';
 import { Raw4DWasmExtractor } from './Raw4DWasmExtractor';
 import { canImportRaw4D, parseRaw4D, readRaw4DHeader } from './Raw4DParser';
 import { readRaw4DScalar } from './Raw4DValues';
+import { raw4DCanonicalKeyframes } from './Raw4DSchema';
 
 const properties = [
   'x', 'y', 'z', 'nx', 'ny', 'nz',
@@ -129,7 +130,78 @@ function legacyOptionalBankRaw4D(): Blob {
   return new Blob([new TextEncoder().encode(header), body]);
 }
 
+function syntheticSplitRaw4D(): Blob {
+  const staticProperties = [
+    'x', 'y', 'z', 'nx', 'ny', 'nz',
+    'f_dc_0', 'f_dc_1', 'f_dc_2',
+    'f_rest_0', 'f_rest_1', 'f_rest_2', 'f_rest_3', 'f_rest_4', 'f_rest_5', 'f_rest_6', 'f_rest_7', 'f_rest_8',
+    'opacity', 'scale_0', 'scale_1', 'scale_2', 'lifetime_mu', 'lifetime_w',
+    'rot_0', 'rot_1', 'rot_2', 'rot_3',
+  ];
+  const header = [
+    'ply', 'format binary_little_endian 1.0',
+    'comment total_frames 3', 'comment xyz_bank_keyframe_stride 2',
+    'comment rot_bank_keyframe_stride 2', 'comment features_dc_bank_keyframe_stride 2',
+    'comment scaling_bank_keyframe_stride 2', 'comment opacity_bank_keyframe_stride 2',
+    'element vertex 1', ...properties.map((name) => `property float ${name}`),
+    'element vertex_static 1', ...staticProperties.map((name) => `property float ${name}`),
+    'end_header', '',
+  ].join('\n');
+  const dynamic = new Map<string, number>([
+    ['lifetime_mu', 1], ['lifetime_w', 100],
+    ['x', 0], ['y', 1], ['z', 2],
+    ['xyz_bank_0_x', 0], ['xyz_bank_0_y', 1], ['xyz_bank_0_z', 2],
+    ['xyz_bank_1_x', 10], ['xyz_bank_1_y', 3], ['xyz_bank_1_z', 4],
+    ['rot_bank_0_w', 1], ['rot_bank_1_w', 1],
+  ]);
+  const constant = new Map<string, number>([
+    ['x', 20], ['y', 21], ['z', 22], ['rot_0', 1], ['lifetime_mu', 40], ['lifetime_w', 200],
+    ['f_dc_0', 0.1], ['f_dc_1', 0.2], ['f_dc_2', 0.3],
+  ]);
+  const body = new ArrayBuffer((properties.length + staticProperties.length) * 4);
+  const view = new DataView(body);
+  let offset = 0;
+  for (const name of properties) {
+    view.setFloat32(offset, dynamic.get(name) ?? 0, true);
+    offset += 4;
+  }
+  for (const name of staticProperties) {
+    view.setFloat32(offset, constant.get(name) ?? 0, true);
+    offset += 4;
+  }
+  return new Blob([new TextEncoder().encode(header), body]);
+}
+
 describe('RAW4D parser', () => {
+  it('treats a long all-linear clip as exactly two explicit endpoint keyframes', () => {
+    // #WDD-gpt 2026-08-20 - 长生命周期线性格式只改变读取映射；统一轨道仍是首帧/末帧两个显式时间点。
+    expect(raw4DCanonicalKeyframes(10_001, 10_000, 2)).toEqual([0, 10_000]);
+  });
+
+  it('normalizes dynamic and static elements into one stable-ID timeline with virtual equal endpoints', async () => {
+    const source = syntheticSplitRaw4D();
+    const header = await readRaw4DHeader(source);
+    const asset = await parseRaw4D(source, { sourceName: 'split.raw4d' });
+    const sampler = new Raw4DFrameSampler(asset);
+
+    expect(header.vertexCount).toBe(1);
+    expect(header.pointCount).toBe(2);
+    expect(header.elements.map((element) => [element.name, element.count])).toEqual([
+      ['vertex', 1], ['vertex_static', 1],
+    ]);
+    expect(source.size).toBe(header.dataOffset + header.payloadBytes);
+    expect(asset.splatCount).toBe(2);
+    expect(asset.temporalLayout?.pointGroups[1].trackKeyframes.position).toEqual([0, 2]);
+    expect(asset.position.values[0][1]).toBe(20);
+    expect(asset.position.values[3][1]).toBe(20);
+    expect(asset.rotation.values[0][1]).toBe(1);
+    expect(asset.rotation.values[4][1]).toBe(1);
+    sampler.sample(1);
+    expect(sampler.properties.x[0]).toBeCloseTo(5);
+    expect(sampler.properties.x[1]).toBe(20);
+    expect(asset.lifetimeMu[1]).toBe(40);
+  });
+
   it('reads binary PLY metadata and all independent keyframe banks', async () => {
     const source = syntheticRaw4D();
     const header = await readRaw4DHeader(source);

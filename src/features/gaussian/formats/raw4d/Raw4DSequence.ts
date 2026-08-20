@@ -88,7 +88,8 @@ export function buildRaw4DSequenceSegments(sources: readonly Raw4DSequenceSource
       firstFrame,
       lastFrame,
       totalFrames: source.header.totalFrames,
-      splatCount: source.header.vertexCount,
+      // #WDD-gpt 2026-08-19 - 序列点数包含动态和静态分区，跨片段稳定 ID 不再遗漏 vertex_static。
+      splatCount: source.header.pointCount,
       shBands: shBandsFromCount(coefficientCount),
       shCoefficientCount: coefficientCount,
       keyframes: {

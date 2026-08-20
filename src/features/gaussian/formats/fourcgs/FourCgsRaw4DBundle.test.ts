@@ -150,6 +150,7 @@ describe('RAW4D 4CGS bundle helpers', () => {
     const restoredHeader = await readRaw4DHeader(new Blob([restored.slice().buffer as ArrayBuffer]));
 
     expect(manifest.segments[0].gaussianCount).toBe(2);
+    expect(manifest.metadata?.editorBuild?.version).toBe(__APP_VERSION__);
     expect(restoredHeader.vertexCount).toBe(2);
     expect(result.originalPointCount).toBe(3);
     expect(result.encodedPointCount).toBe(2);
@@ -193,7 +194,9 @@ describe('RAW4D 4CGS bundle helpers', () => {
     expect(result.encodedPointCount).toBe(15);
     expect(result.deletedPointCount).toBe(1);
     expect(manifest.segments[0].gaussianCount).toBe(15);
+    expect(manifest.metadata?.editorBuild?.version).toBe(__APP_VERSION__);
     expect(raw4dExport.sourceKind).toBe('canonical-memory-or-file-snapshot');
+    expect((raw4dExport.temporalLayouts as Array<{ schemaVersion: number }>)[0].schemaVersion).toBe(1);
     expect(result.sourceSha256[0]).toMatch(/^[0-9a-f]{64}$/);
   }, 30_000);
 

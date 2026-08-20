@@ -27,6 +27,7 @@ describe('UI localization', () => {
     expect(UI_COPY.zh.activeGaussianStatus).toBe('活跃高斯');
     expect(UI_COPY.zh.currentFrameGaussianStatus).toBe('当前帧显示');
     expect(UI_COPY.zh.deletedGaussianStatus).toBe('已删除高斯');
+    expect(UI_COPY.zh.keyframeCountStatus).toBe('关键帧');
     expect(UI_COPY.zh.modeLocalMaximum).toBe('高内存・高显存 · 32GB / 12GB');
     expect(UI_COPY.zh.releaseNotes).toBe('更新信息');
     expect(UI_COPY.zh.browserNotExposed).toBe('浏览器未开放');

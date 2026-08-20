@@ -55,7 +55,15 @@ export interface FourCgsCameraBookmarks {
   ];
 }
 
+// #WDD-gpt 2026-08-20 - 4CGS 文件记录实际写入它的 Dong Editor 构建版本，便于格式问题追溯。
+export interface FourCgsEditorBuild {
+  readonly schemaVersion: 1;
+  readonly product: 'Dong Editor 3';
+  readonly version: string;
+}
+
 export interface FourCgsMetadata {
+  readonly editorBuild?: FourCgsEditorBuild;
   readonly sceneTransform?: FourCgsSceneTransform;
   readonly cameraBookmarks?: FourCgsCameraBookmarks;
   readonly raw4dBundle?: {

@@ -4,8 +4,10 @@ import {
   locateFourCgsFrame,
 } from '../../gaussian/formats/fourcgs/FourCgsContainer';
 import { FourCgsDecoderClient } from '../../gaussian/formats/fourcgs/FourCgsDecoderClient';
+import { fourCgsRaw4DKeyframeStrides } from '../../gaussian/formats/fourcgs/FourCgsRaw4D';
 import type { FourCgsDescriptor } from '../../gaussian/formats/fourcgs/FourCgsTypes';
 import { locateRaw4DSequenceFrame } from '../../gaussian/formats/raw4d/Raw4DSequence';
+import { raw4DCanonicalKeyframes } from '../../gaussian/formats/raw4d/Raw4DSchema';
 import { Raw4DSequenceClient } from '../../gaussian/formats/raw4d/Raw4DSequenceClient';
 import type { Raw4DSequenceDescriptor } from '../../gaussian/formats/raw4d/Raw4DSequenceTypes';
 import type { GaussianRenderMode } from '../../gaussian/runtime/GaussianRenderMode';
@@ -118,6 +120,22 @@ function raw4DSequenceTimeline(descriptor: Raw4DSequenceDescriptor): {
 function fourCgsSequenceStatus(descriptor: FourCgsDescriptor, segmentIndex: number): NonNullable<ViewportStatus['raw4dSequence']> {
   const segmentNodes = descriptor.segments.map((segment) => segment.firstFrame - descriptor.firstFrame);
   segmentNodes.push(descriptor.totalFrames - 1);
+  const keyframes = new Set<number>();
+  const keyframeTracks = {
+    position: new Set<number>(), rotation: new Set<number>(), colorDc: new Set<number>(),
+    scale: new Set<number>(), opacity: new Set<number>(),
+  };
+  for (const segment of descriptor.segments) {
+    const offset = segment.firstFrame - descriptor.firstFrame;
+    const strides = fourCgsRaw4DKeyframeStrides(segment);
+    for (const track of Object.keys(segment.bankCounts) as Array<keyof typeof segment.bankCounts>) {
+      for (const localFrame of raw4DCanonicalKeyframes(segment.totalFrames, strides[track], segment.bankCounts[track])) {
+        const frame = offset + localFrame;
+        keyframes.add(frame);
+        keyframeTracks[track].add(frame);
+      }
+    }
+  }
   return {
     segmentIndex,
     segmentCount: descriptor.segments.length,
@@ -126,8 +144,16 @@ function fourCgsSequenceStatus(descriptor: FourCgsDescriptor, segmentIndex: numb
     sharedShCoefficientCount: 0,
     sharedShUpdateStateCount: 0,
     sharedShSavedBytes: 0,
-    keyframes: [],
+    // #WDD-gpt 2026-08-20 - 从 4CGS 每段 bank/stride 还原真实唯一关键帧，供时间轴和场景统计共用。
+    keyframes: [...keyframes].sort((a, b) => a - b),
     segmentNodes: [...new Set(segmentNodes)].sort((a, b) => a - b),
+    keyframeTracks: {
+      position: [...keyframeTracks.position].sort((a, b) => a - b),
+      rotation: [...keyframeTracks.rotation].sort((a, b) => a - b),
+      colorDc: [...keyframeTracks.colorDc].sort((a, b) => a - b),
+      scale: [...keyframeTracks.scale].sort((a, b) => a - b),
+      opacity: [...keyframeTracks.opacity].sort((a, b) => a - b),
+    },
     firstFrame: descriptor.firstFrame,
     segments: descriptor.segments.map((segment) => ({
       name: segment.name,
@@ -215,6 +241,7 @@ export function GaussianViewport({
       sourceName: session.sourceFile.name,
       objectName: session.sourceFile.name.replace(/\.4cgs$/i, ''),
       totalFrames: session.descriptor.totalFrames,
+      keyframeCount: sequenceStatus.keyframes.length,
       raw4dSequence: sequenceStatus,
       splatCount: status.phase === 'loading' ? segment.gaussianCount : status.splatCount,
       message: status.phase === 'loading'
@@ -224,7 +251,7 @@ export function GaussianViewport({
     if (!gpuReady) {
       onStatusChange({
         phase: 'loading', renderer: '4CGS V2.4', splatCount: segment.gaussianCount,
-        progress: 0.98, totalFrames: session.descriptor.totalFrames, fps: 30, shBands: 3,
+        progress: 0.98, totalFrames: session.descriptor.totalFrames, keyframeCount: sequenceStatus.keyframes.length, fps: 30, shBands: 3,
         sourceName: session.sourceFile.name, objectName: session.sourceFile.name.replace(/\.4cgs$/i, ''),
         format: '4CGS', raw4dSequence: sequenceStatus, message: `正在从系统内存准备 4CGS ${segment.name}`,
       });
@@ -292,6 +319,7 @@ export function GaussianViewport({
       sourceName: session.descriptor.sourceName,
       objectName: session.descriptor.sourceName,
       totalFrames: session.descriptor.totalFrames,
+      keyframeCount: sequenceStatus.keyframes.length,
       format: 'RAW4D',
       raw4dSequence: sequenceStatus,
       message: status.phase === 'loading'
@@ -301,7 +329,7 @@ export function GaussianViewport({
     if (!gpuReady) {
       onStatusChange({
         phase: 'loading', renderer: 'RAW4D 多段序列', splatCount: segment.splatCount,
-        progress: 0.96, totalFrames: session.descriptor.totalFrames, fps: 30, shBands: segment.shBands,
+        progress: 0.96, totalFrames: session.descriptor.totalFrames, keyframeCount: sequenceStatus.keyframes.length, fps: 30, shBands: segment.shBands,
         sourceName: session.descriptor.sourceName, objectName: session.descriptor.sourceName,
         format: 'RAW4D', raw4dSequence: sequenceStatus,
         message: `正在准备第 ${location.segmentIndex + 1}/${session.descriptor.segments.length} 段 ${segment.name}`,

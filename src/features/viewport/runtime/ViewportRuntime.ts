@@ -162,6 +162,7 @@ export interface ViewportStatus {
   message?: string;
   progress?: number;
   totalFrames?: number;
+  keyframeCount?: number;
   fps?: number;
   shBands?: number;
   sourceName?: string;
@@ -191,6 +192,17 @@ export interface ViewportStatus {
     }[];
     readonly keyframeTracks?: Readonly<Record<'position' | 'rotation' | 'colorDc' | 'scale' | 'opacity', readonly number[]>>;
   };
+}
+
+function raw4DAssetKeyframeCount(asset: Raw4DAsset): number {
+  // #WDD-gpt 2026-08-20 - 统计所有时序属性的唯一时间节点，而不是把五种属性 bank 数量相加造成重复计数。
+  return new Set([
+    ...asset.position.keyframes,
+    ...asset.rotation.keyframes,
+    ...asset.colorDc.keyframes,
+    ...asset.scale.keyframes,
+    ...asset.opacity.keyframes,
+  ]).size;
 }
 
 export type ViewportGaussianEditSnapshot = GaussianEditBitsetSnapshot;
@@ -2616,7 +2628,7 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
     const asset = gpuEntry.resident.loaded.asset;
     return {
       phase: 'ready', renderer: this.rendererLabel, splatCount: asset.splatCount,
-      totalFrames: asset.totalFrames, fps: 30, shBands: asset.shBands,
+      totalFrames: asset.totalFrames, keyframeCount: raw4DAssetKeyframeCount(asset), fps: 30, shBands: asset.shBands,
       sourceName: asset.sourceName, objectName: asset.sourceName.replace(/\.[^.]+$/, ''),
       format: 'RAW4D', bufferId: gpuEntry.resident.loaded.bufferId,
       sourceToResidentRatio: gpuEntry.resident.loaded.sourceToResidentRatio,
@@ -2835,6 +2847,7 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
       renderer: this.rendererLabel,
       splatCount: residentAsset.value.splatCount,
       totalFrames: residentAsset.value.totalFrames,
+      keyframeCount: raw4DAssetKeyframeCount(residentAsset.value),
       fps: 30,
       shBands: residentAsset.value.shBands,
       sourceName: residentAsset.value.sourceName,
@@ -2854,6 +2867,7 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
       renderer: this.rendererLabel,
       splatCount: 0,
       totalFrames: 1,
+      keyframeCount: 0,
       fps: 30,
       shBands: 0,
     };

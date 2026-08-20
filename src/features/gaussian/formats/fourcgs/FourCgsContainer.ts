@@ -1,6 +1,7 @@
 import type {
   FourCgsCameraBookmark,
   FourCgsCameraBookmarks,
+  FourCgsEditorBuild,
   FourCgsFrameLocation,
   FourCgsManifest,
   FourCgsMetadata,
@@ -25,6 +26,11 @@ export interface FourCgsCameraBookmarkInput {
   readonly pitch: number;
   readonly target: readonly [number, number, number];
   readonly yaw: number;
+}
+
+// #WDD-gpt 2026-08-20 - 所有浏览器 4CGS 写入路径复用根 VERSION 注入值，禁止编码器各自硬编码版本号。
+export function createFourCgsEditorBuild(): FourCgsEditorBuild {
+  return { schemaVersion: 1, product: 'Dong Editor 3', version: __APP_VERSION__ };
 }
 
 function finiteVector3(value: unknown, label: string, positive = false): [number, number, number] {
@@ -121,16 +127,31 @@ function validateCameraBookmarks(value: unknown): FourCgsCameraBookmarks | undef
   return createFourCgsCameraBookmarks(cameraBookmarks.bookmarks);
 }
 
+function validateEditorBuild(value: unknown): FourCgsEditorBuild | undefined {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('4CGS metadata.editorBuild 无效。');
+  }
+  const build = value as Partial<FourCgsEditorBuild>;
+  if (build.schemaVersion !== 1 || build.product !== 'Dong Editor 3'
+    || typeof build.version !== 'string' || !/^\d+\.\d+\.\d+$/.test(build.version)) {
+    throw new Error('4CGS metadata.editorBuild 版本信息不受支持。');
+  }
+  return { schemaVersion: 1, product: 'Dong Editor 3', version: build.version };
+}
+
 function validateMetadata(value: unknown): FourCgsMetadata | undefined {
   if (value === undefined) return undefined;
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     throw new Error('4CGS metadata 必须是对象。');
   }
   const metadata = value as FourCgsMetadata;
+  const editorBuild = validateEditorBuild(metadata.editorBuild);
   const sceneTransform = validateSceneTransform(metadata.sceneTransform);
   const cameraBookmarks = validateCameraBookmarks(metadata.cameraBookmarks);
   return {
     ...metadata,
+    ...(editorBuild ? { editorBuild } : {}),
     ...(sceneTransform ? { sceneTransform } : {}),
     ...(cameraBookmarks ? { cameraBookmarks } : {}),
   };
@@ -320,7 +341,7 @@ export async function writeFourCgsFile(
   cameraBookmarkInputs?: readonly (FourCgsCameraBookmarkInput | null)[],
 ): Promise<Blob> {
   const { manifest, manifestBytes } = await readFourCgsManifest(source);
-  if (!transform && cameraBookmarkInputs === undefined) return source.slice(0, source.size, 'application/x-4cgs');
+  const editorBuild = createFourCgsEditorBuild();
   const sceneTransform = transform ? createFourCgsSceneTransform(transform) : undefined;
   const cameraBookmarks = cameraBookmarkInputs === undefined
     ? undefined
@@ -329,6 +350,7 @@ export async function writeFourCgsFile(
     ...manifest,
     metadata: {
       ...manifest.metadata,
+      editorBuild,
       ...(sceneTransform ? { sceneTransform } : {}),
       ...(cameraBookmarks ? { cameraBookmarks } : {}),
     },
@@ -342,6 +364,10 @@ export async function writeFourCgsFile(
   const output = new Blob([header, nextManifestBytes, streams], { type: 'application/x-4cgs' });
   // #WDD-gpt 2026-08-19 - 写完重新解析并逐项比对 TRS 与三个书签，避免清单可读但场景元数据被覆盖或精度丢失。
   const verified = await readFourCgsManifest(output);
+  if (verified.manifest.metadata?.editorBuild?.version !== editorBuild.version
+    || verified.manifest.metadata.editorBuild.product !== editorBuild.product) {
+    throw new Error('4CGS 编辑器版本写后校验失败。');
+  }
   if (sceneTransform && (!verified.manifest.metadata?.sceneTransform
     || !sceneTransformsEqual(verified.manifest.metadata.sceneTransform, sceneTransform))) {
     throw new Error('4CGS 完整场景变换写后校验失败。');

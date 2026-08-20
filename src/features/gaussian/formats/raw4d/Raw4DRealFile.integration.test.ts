@@ -92,6 +92,7 @@ describe.skipIf(!sourcePath)('RAW4D real-file memory integration', () => {
       expect(manifest.segments[0].gaussianCount).toBe(asset.splatCount);
       expect(raw4dExport.sourceScalarEncodings).toEqual([asset.sourceEncoding]);
       expect(raw4dExport.encodedScalarEncoding).toBe('float16');
+      expect(raw4dExport.temporalLayouts).toEqual([asset.temporalLayout]);
       if (process.env.RAW4D_REAL_4CGS_OUTPUT) {
         await writeFile(process.env.RAW4D_REAL_4CGS_OUTPUT, Buffer.from(await result.blob.arrayBuffer()));
       }

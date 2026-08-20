@@ -2,7 +2,7 @@ import { Buffer } from 'buffer';
 import { sha256 as nobleSha256 } from '@noble/hashes/sha2.js';
 import { bytesToHex } from '@noble/hashes/utils.js';
 import { zlibSync } from 'fflate';
-import { FOUR_CGS_HEADER_BYTES, FOUR_CGS_MAGIC, readFourCgsManifest } from './FourCgsContainer';
+import { createFourCgsEditorBuild, FOUR_CGS_HEADER_BYTES, FOUR_CGS_MAGIC, readFourCgsManifest } from './FourCgsContainer';
 import {
   fourCgsCanonicalRaw4DHeader,
   fourCgsCanonicalRaw4DPropertyNames,
@@ -19,7 +19,7 @@ import {
   raw4DCanonicalKeyframes,
   raw4DTrackStride,
 } from '../raw4d/Raw4DSchema';
-import type { Raw4DAsset, Raw4DHeader, Raw4DMemorySnapshot, Raw4DTrack } from '../raw4d/Raw4DTypes';
+import type { Raw4DAsset, Raw4DHeader, Raw4DMemorySnapshot, Raw4DTemporalLayout, Raw4DTrack } from '../raw4d/Raw4DTypes';
 
 const SH_DIMENSIONS = 45;
 const SH_CODEBOOK_SIZE = 256;
@@ -116,6 +116,7 @@ interface PreparedV26Source {
   readonly sourceEncoding: Raw4DAsset['sourceEncoding'];
   readonly descriptor: FourCgsSegment;
   readonly originalPointCount: number;
+  readonly temporalLayout?: Raw4DTemporalLayout;
   readonly compacted: {
     readonly segment: BrowserSegment;
     readonly sourceSha256: string;
@@ -177,6 +178,24 @@ function allocateEncodingRows(length: number): Uint16Array {
 
 function isDeleted(words: Uint32Array, stableId: number): boolean {
   return Boolean(words[stableId >>> 5] & (1 << (stableId & 31)));
+}
+
+function compactTemporalLayout(
+  layout: Raw4DTemporalLayout | undefined,
+  deletionWords: Uint32Array,
+): Raw4DTemporalLayout | undefined {
+  if (!layout) return undefined;
+  let firstPoint = 0;
+  const pointGroups = layout.pointGroups.map((group) => {
+    let pointCount = 0;
+    for (let local = 0; local < group.pointCount; local += 1) {
+      if (!isDeleted(deletionWords, group.firstPoint + local)) pointCount += 1;
+    }
+    const compacted = { ...group, firstPoint, pointCount };
+    firstPoint += pointCount;
+    return compacted;
+  }).filter((group) => group.pointCount > 0);
+  return { ...layout, pointGroups };
 }
 
 function bankCount(segment: BrowserSegment, prefix: string): number {
@@ -526,6 +545,7 @@ async function compactMemorySegment(source: IndexedMemorySource): Promise<Prepar
     sourceEncoding: asset.sourceEncoding,
     descriptor,
     originalPointCount: asset.splatCount,
+    temporalLayout: compactTemporalLayout(asset.temporalLayout, deletionWords),
     compacted: {
       segment: {
         path: source.name,
@@ -1480,7 +1500,11 @@ export async function encodeRaw4DV26Browser(
       if (!/\.(?:raw4d|ply4)$/i.test(file.name)) throw new FourCgsHighCompressionUnsupportedError(`${file.name} 不是 RAW4D/PLY4 文件。`);
       const header = await readRaw4DHeader(file);
       if (header.scalarEncoding !== 'float16') throw new FourCgsHighCompressionUnsupportedError(`${file.name} 不是 FP16 RAW4D；当前高压缩编码器不会隐式改变源精度。`);
-      if (file.size !== header.dataOffset + header.vertexCount * header.recordBytes) {
+      // #WDD-gpt 2026-08-19 - split RAW4D 必须先经统一 Canonical 内存适配，禁止旧单行宽 File 快径误读 vertex_static。
+      if (header.elements.length > 1) {
+        throw new FourCgsHighCompressionUnsupportedError(`${file.name} 包含动态/静态分区；请使用已载入场景的 Canonical 内存导出 4CGS。`);
+      }
+      if (file.size !== header.dataOffset + header.payloadBytes) {
         throw new FourCgsHighCompressionUnsupportedError(`${file.name} 的 RAW4D 载荷长度与头不一致。`);
       }
       return { fileIndex, file, header, range: sourceFrameRange(file.name, header.totalFrames) };
@@ -1797,6 +1821,7 @@ async function encodePreparedRaw4DV26(
     matches: layout.matches,
     streams: streams.map((stream) => stream.entry),
     metadata: {
+      editorBuild: createFourCgsEditorBuild(),
       raw4dExport: {
         version: 1,
         sourceNames: prepared.map((source) => source.name),
@@ -1807,6 +1832,8 @@ async function encodePreparedRaw4DV26(
           : 'preserve-source-float16-bits',
         sourceSha256: compacted.map((value) => value.sourceSha256),
         sourceKind: 'canonical-memory-or-file-snapshot',
+        // #WDD-gpt 2026-08-19 - 4CGS V2 容器保留统一 K=2 静态端点/动态关键帧布局，后续只需替换输入读取适配器。
+        temporalLayouts: prepared.map((source) => source.temporalLayout ?? null),
         originalPointCount,
         encodedPointCount,
         deletedPointCount,

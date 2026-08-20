@@ -72,12 +72,15 @@ describe('4CGS container', () => {
     expect(locateFourCgsFrame(segments, 79)).toEqual({ segmentIndex: 2, localFrame: 19, sourceFrame: 259 });
   });
 
-  it('validates and writes an exact-byte Save As container', async () => {
+  it('writes Save As metadata while preserving every compressed stream byte', async () => {
     const source = fixture();
-    const { manifest } = await readFourCgsManifest(source);
+    const { manifest, manifestBytes } = await readFourCgsManifest(source);
     expect(manifest.codecName).toBe('fixture-v24');
     const output = await writeFourCgsFile(source);
-    expect(new Uint8Array(await output.arrayBuffer())).toEqual(new Uint8Array(await source.arrayBuffer()));
+    const outputDirectory = await readFourCgsManifest(output);
+    expect(outputDirectory.manifest.metadata?.editorBuild?.version).toBe(__APP_VERSION__);
+    expect(new Uint8Array(await output.slice(12 + outputDirectory.manifestBytes).arrayBuffer()))
+      .toEqual(new Uint8Array(await source.slice(12 + manifestBytes).arrayBuffer()));
   });
 
   it('accepts the V2.6 three-way Scale streams used by parallel encoding', async () => {
@@ -94,11 +97,16 @@ describe('4CGS container', () => {
 
   it('accepts a self-contained bundle encoded from the current dragged RAW4D files', async () => {
     const source = raw4DBundleFixture();
-    const { manifest } = await readFourCgsManifest(source);
+    const { manifest, manifestBytes } = await readFourCgsManifest(source);
     expect(manifest.codecName).toBe(RAW4D_BUNDLE_CODEC_NAME);
     expect(manifest.metadata?.raw4dBundle?.sourceNames).toEqual(['first.raw4d', 'second.raw4d']);
-    expect(new Uint8Array(await (await writeFourCgsFile(source)).arrayBuffer()))
-      .toEqual(new Uint8Array(await source.arrayBuffer()));
+    const output = await writeFourCgsFile(source);
+    const outputDirectory = await readFourCgsManifest(output);
+    expect(outputDirectory.manifest.metadata?.editorBuild).toEqual({
+      schemaVersion: 1, product: 'Dong Editor 3', version: __APP_VERSION__,
+    });
+    expect(new Uint8Array(await output.slice(12 + outputDirectory.manifestBytes).arrayBuffer()))
+      .toEqual(new Uint8Array(await source.slice(12 + manifestBytes).arrayBuffer()));
   });
 
   it('round-trips the complete scene transform while preserving compressed stream bytes', async () => {
@@ -124,6 +132,7 @@ describe('4CGS container', () => {
       scale: [0.5, 1.5, 2],
     });
     expect(outputDirectory.manifest.metadata?.producer).toBe('fixture-editor');
+    expect(outputDirectory.manifest.metadata?.editorBuild?.version).toBe(__APP_VERSION__);
     expect(outputDirectory.manifest.metadata?.cameraBookmarks).toEqual({
       schemaVersion: 1,
       coordinateSystem: 'playcanvas-y-up',
@@ -153,6 +162,9 @@ describe('4CGS container', () => {
 
   it('rejects malformed metadata and non-positive transform scales', async () => {
     await expect(readFourCgsManifest(fixture('invalid metadata'))).rejects.toThrow('metadata 必须是对象');
+    await expect(readFourCgsManifest(fixture({
+      editorBuild: { schemaVersion: 1, product: 'Dong Editor 3', version: 'invalid' },
+    }))).rejects.toThrow('editorBuild 版本信息不受支持');
     await expect(writeFourCgsFile(fixture(), {
       position: [0, 0, 0], rotation: [0, 0, 0], scale: [1, 0, 1],
     })).rejects.toThrow('三个正有限数值');

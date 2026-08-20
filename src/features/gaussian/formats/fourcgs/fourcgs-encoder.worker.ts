@@ -2,7 +2,7 @@
 
 import { sha256 as nobleSha256 } from '@noble/hashes/sha2.js';
 import { bytesToHex } from '@noble/hashes/utils.js';
-import { FOUR_CGS_HEADER_BYTES, FOUR_CGS_MAGIC, readFourCgsManifest } from './FourCgsContainer';
+import { createFourCgsEditorBuild, FOUR_CGS_HEADER_BYTES, FOUR_CGS_MAGIC, readFourCgsManifest } from './FourCgsContainer';
 import {
   RAW4D_BUNDLE_CODEC_NAME,
   RAW4D_BUNDLE_CHUNK_BYTES,
@@ -113,7 +113,7 @@ function singleSegment(source: SourceInfo): FourCgsSegment {
     name: source.name.replace(/\.(?:raw4d|ply4)$/i, ''),
     firstFrame,
     lastFrame,
-    gaussianCount: source.header.vertexCount,
+    gaussianCount: source.header.pointCount,
     totalFrames: source.header.totalFrames,
     bankCounts: bankCounts(source.header),
     keyframeStrides: keyframeStrides(source.header),
@@ -176,14 +176,14 @@ export async function encodeRaw4DBundle(
     if (!/\.(?:raw4d|ply4)$/i.test(file.name)) throw new Error(`${file.name} 不是 RAW4D/PLY4 文件。`);
     const header = await readRaw4DHeader(file);
     if (header.scalarEncoding !== 'float16') throw new Error(`${file.name} 不是已量化 FP16 RAW4D，当前稳定编码档拒绝隐式降精度。`);
-    if (file.size !== header.dataOffset + header.vertexCount * header.recordBytes) throw new Error(`${file.name} 的 RAW4D 载荷长度不一致。`);
+    if (file.size !== header.dataOffset + header.payloadBytes) throw new Error(`${file.name} 的 RAW4D 载荷长度不一致。`);
     const words = deletionWords[fileIndex].length === 0
-      ? new Uint32Array(Math.ceil(header.vertexCount / 32))
+      ? new Uint32Array(Math.ceil(header.pointCount / 32))
       : deletionWords[fileIndex];
-    const deletedPointCount = countDeleted(words, header.vertexCount);
-    if (deletedPointCount === header.vertexCount) throw new Error(`${file.name} 的高斯点已全部删除，无法导出空片段。`);
+    const deletedPointCount = countDeleted(words, header.pointCount);
+    if (deletedPointCount === header.pointCount) throw new Error(`${file.name} 的高斯点已全部删除，无法导出空片段。`);
     if (deletedPointCount === 0) {
-      return { fileIndex, name: file.name, file, header, originalVertexCount: header.vertexCount, deletedPointCount };
+      return { fileIndex, name: file.name, file, header, originalVertexCount: header.pointCount, deletedPointCount };
     }
     onProgress?.(0.015, `正在压实 ${file.name}：去掉 ${deletedPointCount.toLocaleString()} 个已删除高斯`);
     const compacted = await exportCompactedRaw4DSource(file, words);
@@ -193,7 +193,7 @@ export async function encodeRaw4DBundle(
       name: file.name,
       file: compacted,
       header: compactedHeader,
-      originalVertexCount: header.vertexCount,
+      originalVertexCount: header.pointCount,
       deletedPointCount,
     };
   }));
@@ -255,6 +255,7 @@ export async function encodeRaw4DBundle(
     prs: { mode: 'raw4d-lossless-bundle' },
     sourceBytes,
     metadata: {
+      editorBuild: createFourCgsEditorBuild(),
       raw4dBundle: {
         version: 1,
         chunkBytes: RAW4D_BUNDLE_CHUNK_BYTES,

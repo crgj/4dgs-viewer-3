@@ -16,6 +16,22 @@ export interface Raw4DTrack {
   readonly values: readonly Raw4DScalarArray[];
 }
 
+export type Raw4DInterpolation = 'linear' | 'slerp';
+
+export interface Raw4DTemporalPointGroup {
+  readonly id: string;
+  readonly firstPoint: number;
+  readonly pointCount: number;
+  readonly sourceElement: 'vertex' | 'vertex_static' | 'normalized';
+  readonly trackKeyframes: Readonly<Record<'position' | 'rotation' | 'colorDc' | 'scale' | 'opacity', readonly number[]>>;
+}
+
+export interface Raw4DTemporalLayout {
+  readonly schemaVersion: 1;
+  readonly interpolation: Readonly<Record<'position' | 'colorDc' | 'scale' | 'opacity', 'linear'> & { readonly rotation: 'slerp' }>;
+  readonly pointGroups: readonly Raw4DTemporalPointGroup[];
+}
+
 export interface Raw4DBounds {
   readonly min: readonly [number, number, number];
   readonly max: readonly [number, number, number];
@@ -36,6 +52,8 @@ export interface Raw4DAsset {
   readonly lifetimeMu: Raw4DScalarArray;
   readonly lifetimeW: Raw4DScalarArray;
   readonly bounds: Raw4DBounds;
+  // #WDD-gpt 2026-08-19 - 记录输入点分区和显式关键帧时间，格式差异在读取层归一化后不再进入渲染、编辑和导出逻辑。
+  readonly temporalLayout?: Raw4DTemporalLayout;
 }
 
 // #WDD-gpt 2026-08-16 - 4CGS 保存冻结 Canonical RAM 与删除位集，不再回读最初拖入的 File 作为属性真值。
@@ -80,4 +98,17 @@ export interface Raw4DHeader {
   readonly scalarEncoding: Raw4DScalarEncoding;
   readonly propertyNames: readonly string[];
   readonly comments: ReadonlyMap<string, string>;
+  // #WDD-gpt 2026-08-19 - 保留旧 vertex 字段供现有单 element 调用方使用，同时暴露可扩展的 element 表给新版读取适配器。
+  readonly pointCount: number;
+  readonly payloadBytes: number;
+  readonly elements: readonly Raw4DElementHeader[];
+}
+
+export interface Raw4DElementHeader {
+  readonly name: 'vertex' | 'vertex_static';
+  readonly dataOffset: number;
+  readonly recordBytes: number;
+  readonly count: number;
+  readonly scalarEncoding: Raw4DScalarEncoding;
+  readonly propertyNames: readonly string[];
 }

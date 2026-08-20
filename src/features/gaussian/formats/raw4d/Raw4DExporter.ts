@@ -167,20 +167,35 @@ export async function exportCompactedRaw4DSource(
   options: Raw4DExportOptions = {},
 ): Promise<Blob> {
   const header = await readRaw4DHeader(source);
+  const pointOffsets = new Map<string, number>([
+    ['vertex', 0],
+    ['vertex_static', header.vertexCount],
+  ]);
+  const keptByElement = new Map<string, number>();
   let keptCount = 0;
-  for (let stableId = 0; stableId < header.vertexCount; stableId += 1) {
-    if (!isDeleted(deletionWords, stableId)) keptCount += 1;
+  for (const element of header.elements) {
+    const pointOffset = pointOffsets.get(element.name)!;
+    let elementKept = 0;
+    for (let localId = 0; localId < element.count; localId += 1) {
+      if (!isDeleted(deletionWords, pointOffset + localId)) elementKept += 1;
+    }
+    keptByElement.set(element.name, elementKept);
+    keptCount += elementKept;
   }
   if (keptCount === 0) throw new Error('RAW4D export cannot create an empty asset.');
 
   const sourceHeaderBytes = new Uint8Array(await source.slice(0, header.dataOffset).arrayBuffer());
   const sourceHeader = new TextDecoder('ascii').decode(sourceHeaderBytes);
-  const compactedHeader = sourceHeader.replace(
-    /(^element\s+vertex\s+)\d+(\s*$)/m,
-    `$1${keptCount}$2`,
-  );
-  if (compactedHeader === sourceHeader && keptCount !== header.vertexCount) {
-    throw new Error('RAW4D export could not update the vertex count.');
+  let compactedHeader = sourceHeader;
+  for (const element of header.elements) {
+    const next = compactedHeader.replace(
+      new RegExp(`(^element\\s+${element.name}\\s+)\\d+(\\s*$)`, 'm'),
+      `$1${keptByElement.get(element.name)!}$2`,
+    );
+    if (next === compactedHeader && keptByElement.get(element.name) !== element.count) {
+      throw new Error(`RAW4D export could not update the ${element.name} count.`);
+    }
+    compactedHeader = next;
   }
   const encodedHeader = new TextEncoder().encode(compactedHeader);
   const headerCopy = new Uint8Array(encodedHeader.byteLength);
@@ -188,24 +203,28 @@ export async function exportCompactedRaw4DSource(
   const parts: BlobPart[] = [headerCopy.buffer];
   const chunkRows = Math.max(256, Math.floor(options.chunkRows ?? 4096));
   let writtenPoints = 0;
-  for (let firstRow = 0; firstRow < header.vertexCount; firstRow += chunkRows) {
-    const rowCount = Math.min(chunkRows, header.vertexCount - firstRow);
-    const chunk = new Uint8Array(await source.slice(
-      header.dataOffset + firstRow * header.recordBytes,
-      header.dataOffset + (firstRow + rowCount) * header.recordBytes,
-    ).arrayBuffer());
-    const compacted = new Uint8Array(rowCount * header.recordBytes);
-    let outputOffset = 0;
-    for (let row = 0; row < rowCount; row += 1) {
-      if (isDeleted(deletionWords, firstRow + row)) continue;
-      const inputOffset = row * header.recordBytes;
-      compacted.set(chunk.subarray(inputOffset, inputOffset + header.recordBytes), outputOffset);
-      outputOffset += header.recordBytes;
-      writtenPoints += 1;
+  // #WDD-gpt 2026-08-19 - 动态/静态 element 分别按原始记录宽度压实，删除位集继续使用“动态在前、静态在后”的统一稳定 ID。
+  for (const element of header.elements) {
+    const pointOffset = pointOffsets.get(element.name)!;
+    for (let firstRow = 0; firstRow < element.count; firstRow += chunkRows) {
+      const rowCount = Math.min(chunkRows, element.count - firstRow);
+      const chunk = new Uint8Array(await source.slice(
+        element.dataOffset + firstRow * element.recordBytes,
+        element.dataOffset + (firstRow + rowCount) * element.recordBytes,
+      ).arrayBuffer());
+      const compacted = new Uint8Array(rowCount * element.recordBytes);
+      let outputOffset = 0;
+      for (let row = 0; row < rowCount; row += 1) {
+        if (isDeleted(deletionWords, pointOffset + firstRow + row)) continue;
+        const inputOffset = row * element.recordBytes;
+        compacted.set(chunk.subarray(inputOffset, inputOffset + element.recordBytes), outputOffset);
+        outputOffset += element.recordBytes;
+        writtenPoints += 1;
+      }
+      if (outputOffset > 0) parts.push(compacted.buffer.slice(0, outputOffset));
+      options.onProgress?.({ ratio: writtenPoints / keptCount, writtenPoints, totalPoints: keptCount });
+      await yieldToBrowser();
     }
-    if (outputOffset > 0) parts.push(compacted.buffer.slice(0, outputOffset));
-    options.onProgress?.({ ratio: writtenPoints / keptCount, writtenPoints, totalPoints: keptCount });
-    await yieldToBrowser();
   }
   return new Blob(parts, { type: 'application/octet-stream' });
 }
