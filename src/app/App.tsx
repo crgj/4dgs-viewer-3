@@ -8,10 +8,10 @@ import {
   isViewportBrowseShortcut,
 } from '../features/editor/tools/EditorKeyboardShortcuts';
 import {
-  DEFAULT_GAUSSIAN_4D_MEMORY_MODE,
   createGaussian4DMemoryPolicy,
   type Gaussian4DMemoryMode,
 } from '../features/gaussian/memory/Gaussian4DMemoryPolicy';
+import { detectGaussianRuntimeProfile } from '../features/gaussian/memory/GaussianRuntimeProfile';
 import type { GaussianRenderMode } from '../features/gaussian/runtime/GaussianRenderMode';
 import { writeFourCgsFile } from '../features/gaussian/formats/fourcgs/FourCgsContainer';
 import {
@@ -343,7 +343,8 @@ const initialStatus: ViewportStatus = {
   splatCount: 0,
 };
 
-const initialMemoryPolicy = createGaussian4DMemoryPolicy(DEFAULT_GAUSSIAN_4D_MEMORY_MODE);
+const initialRuntimeProfile = detectGaussianRuntimeProfile();
+const initialMemoryPolicy = createGaussian4DMemoryPolicy(initialRuntimeProfile.defaultMemoryMode);
 const releaseNotes = parseReleaseNotes(changeLogMarkdown);
 
 const initialMemoryUsage: ViewportMemoryUsage = {
@@ -454,7 +455,8 @@ export function App() {
   // #WDD-gpt 2026-08-16 - 播放速率独立于文件元数据并默认 30 FPS，允许用户按检查需求降速或加速。
   const [playbackFps, setPlaybackFps] = useState(30);
   const [renderMode, setRenderMode] = useState<GaussianRenderMode>('gaussian');
-  const [shLevel, setShLevel] = useState(3);
+  // #WDD-gpt 2026-08-19 - 手机首屏默认 SH0，先保证低功耗 GPU 稳定出图；用户仍可在渲染栏手动提高级别。
+  const [shLevel, setShLevel] = useState(initialRuntimeProfile.name === 'mobile-compatible' ? 0 : 3);
   const [showGrid, setShowGrid] = useState(true);
   const [showAxes, setShowAxes] = useState(true);
   const [showHeightRuler, setShowHeightRuler] = useState(false);
@@ -498,7 +500,8 @@ export function App() {
   const [workspaceSaveTick, setWorkspaceSaveTick] = useState(0);
   const [cameraBookmarks, setCameraBookmarks] = useState<readonly (NonNullable<ReturnType<ViewportRuntime['getCameraState']>> | null)[]>([null, null, null]);
   const [timelineDetailsVisible, setTimelineDetailsVisible] = useState(false);
-  const [memoryMode, setMemoryMode] = useState<Gaussian4DMemoryMode>(DEFAULT_GAUSSIAN_4D_MEMORY_MODE);
+  // #WDD-gpt 2026-08-19 - 桌面继续默认高内存档，手机首屏自动切入低驻留兼容档，避免先崩溃再要求用户手动切换。
+  const [memoryMode, setMemoryMode] = useState<Gaussian4DMemoryMode>(initialRuntimeProfile.defaultMemoryMode);
   const [pendingLocalMaximumMode, setPendingLocalMaximumMode] = useState(false);
   const [releaseNotesVisible, setReleaseNotesVisible] = useState(false);
   const [memoryPressureDialogVisible, setMemoryPressureDialogVisible] = useState(false);
@@ -2497,6 +2500,7 @@ export function App() {
                     value={memoryMode}
                   >
                     <option value="auto">{copy.modeAuto}</option>
+                    <option value="mobile">{copy.modeMobile}</option>
                     <option value="compatible">{copy.modeCompatible}</option>
                     <option value="balanced">{copy.modeBalanced}</option>
                     <option value="performance">{copy.modePerformance}</option>
@@ -2506,6 +2510,9 @@ export function App() {
                 </label>
                 {memoryMode === 'auto' && (
                   <p className="memory-auto-note">{copy.autoBudgetNote}</p>
+                )}
+                {memoryMode === 'mobile' && (
+                  <p className="memory-auto-note">{copy.mobileBudgetNote}</p>
                 )}
                 {memoryMode === 'local-maximum' && (
                   <p className="memory-auto-note local-maximum-active">{copy.localMaximumActiveNote}</p>
@@ -2526,7 +2533,7 @@ export function App() {
                 <dl className="property-list memory-details">
                   <div><dt>{copy.transport}</dt><dd>{memoryUsage.transport === 'shared-array-buffer' ? 'SharedArrayBuffer' : 'Transferable'}</dd></div>
                   <div><dt>{copy.loaderWorker}</dt><dd>{status.decodeBackend === 'wasm' ? 'WASM + TypedArray' : status.decodeBackend === 'fp16-bits' ? 'FP16 Bits + TypedArray' : status.decodeBackend === 'image-codebook' ? 'Image Codebook' : status.decodeBackend ? 'TypedArray' : '--'}</dd></div>
-                  <div><dt>{copy.gpuDecode}</dt><dd>{status.gpuBackend === 'storage-buffer' ? 'StorageBuffer · WGSL' : status.gpuBackend === 'texture' ? 'Texture · WGSL' : '--'}</dd></div>
+                  <div><dt>{copy.gpuDecode}</dt><dd>{status.gpuBackend === 'storage-buffer' ? 'StorageBuffer · WGSL' : status.gpuBackend === 'streaming-texture' ? 'WebGL2 · 滑动关键帧' : status.gpuBackend === 'texture' ? 'Texture · GLSL' : '--'}</dd></div>
                   <div><dt>{copy.bufferId}</dt><dd className="buffer-id has-tip" data-tip={status.bufferId ?? '--'}>{status.bufferId ?? '--'}</dd></div>
                   <div><dt>{copy.sourceResident}</dt><dd>{status.sourceToResidentRatio ? `${status.sourceToResidentRatio.toFixed(2)}×` : '--'}</dd></div>
                 </dl>

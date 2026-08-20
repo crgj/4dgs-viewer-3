@@ -1,4 +1,4 @@
-export type Gaussian4DMemoryMode = 'auto' | 'compatible' | 'balanced' | 'performance' | 'local-maximum' | 'custom';
+export type Gaussian4DMemoryMode = 'auto' | 'mobile' | 'compatible' | 'balanced' | 'performance' | 'local-maximum' | 'custom';
 
 // #WDD-gpt 2026-08-16 - 工作站版本默认直接启用高 RAM/VRAM 预算；用户仍可在性能面板切换到较低预设。
 export const DEFAULT_GAUSSIAN_4D_MEMORY_MODE: Gaussian4DMemoryMode = 'local-maximum';
@@ -30,6 +30,14 @@ interface PerformanceWithMemory extends Performance {
 export const GAUSSIAN_4D_MEMORY_POLICIES: Readonly<
   Record<Exclude<Gaussian4DMemoryMode, 'auto' | 'custom'>, Gaussian4DMemoryPolicy>
 > = {
+  // #WDD-gpt 2026-08-19 - 手机档限制并行解码和 GPU 驻留窗口，避免移动浏览器因工作站预算直接丢失 WebGL 上下文。
+  mobile: {
+    mode: 'mobile',
+    cpuBudgetBytes: 768 * MIB,
+    gpuBudgetBytes: 192 * MIB,
+    gpuChunkBytes: 16 * MIB,
+    preloadAllKeyframes: false,
+  },
   compatible: {
     mode: 'compatible',
     cpuBudgetBytes: GIB,

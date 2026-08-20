@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   fourCgsSceneTransformToInput,
   locateFourCgsFrame,
@@ -10,6 +10,10 @@ import { Raw4DSequenceClient } from '../../gaussian/formats/raw4d/Raw4DSequenceC
 import type { Raw4DSequenceDescriptor } from '../../gaussian/formats/raw4d/Raw4DSequenceTypes';
 import type { GaussianRenderMode } from '../../gaussian/runtime/GaussianRenderMode';
 import type { Gaussian4DMemoryPolicy } from '../../gaussian/memory/Gaussian4DMemoryPolicy';
+import {
+  detectGaussianRuntimeProfile,
+  resolveGaussianRuntimeProfile,
+} from '../../gaussian/memory/GaussianRuntimeProfile';
 import type { RelightingState } from '../../../plugins/relighting/RelightingTypes';
 import type { ViewportPerformanceSnapshot } from '../runtime/ViewportPerformanceMonitor';
 import type { GaussianCylinderSelectionRegion } from '../runtime/selection/GaussianCylinderSelection';
@@ -174,6 +178,11 @@ export function GaussianViewport({
   const activateRaw4DSequenceFrameRef = useRef<(frame: number) => Promise<void>>(async () => undefined);
   const renderModeRef = useRef(renderMode);
   const [runtimeReady, setRuntimeReady] = useState(false);
+  const [runtimeGeneration, setRuntimeGeneration] = useState(0);
+  const [detectedRuntimeProfile] = useState(detectGaussianRuntimeProfile);
+  const runtimeProfile = useMemo(() => memoryPolicy.mode === 'mobile'
+    ? resolveGaussianRuntimeProfile({ mobileHint: true })
+    : detectedRuntimeProfile, [detectedRuntimeProfile, memoryPolicy.mode]);
   renderModeRef.current = renderMode;
   pendingFrameRef.current = currentFrame;
 
@@ -319,10 +328,13 @@ export function GaussianViewport({
       return;
     }
 
+    // #WDD-gpt 2026-08-19 - 桌面/手机渲染档切换时先提交未就绪状态，确保现有场景随后按新 GraphicsDevice 重新上传。
+    setRuntimeReady(false);
     const runtime = new ViewportRuntime(canvas, {
       showGuides,
       preserveDrawingBuffer,
       memoryPolicy,
+      runtimeProfile,
       onTransformChange,
       onRelightingChange,
       onSelectionChange,
@@ -337,6 +349,7 @@ export function GaussianViewport({
         if (active) {
           onStatusChange(status);
           setRuntimeReady(true);
+          setRuntimeGeneration((generation) => generation + 1);
           onHistoryChange(runtime.getHistoryState());
           onRuntimeChange(runtime);
         }
@@ -365,7 +378,7 @@ export function GaussianViewport({
       runtime.destroy();
       runtimeRef.current = null;
     };
-  }, [onHistoryChange, onRelightingChange, onRuntimeChange, onSelectionChange, onStatusChange, onTransformChange, preserveDrawingBuffer, showGuides]);
+  }, [onHistoryChange, onRelightingChange, onRuntimeChange, onSelectionChange, onStatusChange, onTransformChange, preserveDrawingBuffer, runtimeProfile, showGuides]);
 
   useEffect(() => {
     runtimeRef.current?.setEditorTool(activeTool);
@@ -642,7 +655,7 @@ export function GaussianViewport({
       active = false;
       runtime.cancelImport();
     };
-  }, [onCameraBookmarksChange, onStatusChange, runtimeReady, sourceFiles]);
+  }, [onCameraBookmarksChange, onStatusChange, runtimeGeneration, runtimeReady, sourceFiles]);
 
   return <canvas aria-label={viewportLabel} className="viewport-canvas" ref={canvasRef} tabIndex={0} />;
 }

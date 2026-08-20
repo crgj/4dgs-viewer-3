@@ -23,6 +23,7 @@ const PREFETCH_GPU_WORK_BYTES_PER_SPLAT = 192;
 export interface Raw4DGaussianCreateOptions {
   readonly enabled?: boolean;
   readonly edits?: GaussianEditStore;
+  readonly streamTextureKeyframes?: boolean;
 }
 
 // #WDD-gpt 2026-08-16 - 预取窗口按完整渲染峰值估算，而不是只统计显式纹理，给 Sort/WorkBuffer 留出逐点余量。
@@ -42,7 +43,7 @@ export interface Raw4DGaussian {
   readonly bounds: Raw4DBounds;
   readonly splatCount: number;
   readonly totalFrames: number;
-  readonly gpuBackend: 'storage-buffer' | 'texture';
+  readonly gpuBackend: 'storage-buffer' | 'texture' | 'streaming-texture';
   readonly externalGpuByteSize: number;
   deleteStableIds(stableIds: readonly number[], deleted?: boolean): void;
   selectStableIds(stableIds: readonly number[], mode?: GaussianSelectionMode): void;
@@ -87,6 +88,7 @@ export async function createRaw4DGaussian(
       edits,
       app.graphicsDevice,
       gpuPool,
+      { streamTextureKeyframes: options.streamTextureKeyframes },
     );
   } catch (error) {
     entity.destroy();
@@ -131,6 +133,7 @@ export async function createRaw4DGaussian(
       }
       gpuPlayback = await Raw4DGpuPlayback.create(
         entity, resource, sampler, asset, edits, app.graphicsDevice, gpuPool,
+        { streamTextureKeyframes: options.streamTextureKeyframes },
       );
       gpuPlayback.setFrame(currentFrame);
     },

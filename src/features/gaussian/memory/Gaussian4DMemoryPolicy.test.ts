@@ -37,4 +37,12 @@ describe('4D Gaussian memory policy', () => {
     expect(policy.gpuBudgetBytes).toBe(12 * 1024 ** 3);
     expect(policy.preloadAllKeyframes).toBe(true);
   });
+
+  it('provides a bounded mobile preset without future-segment preloading', () => {
+    const policy = createGaussian4DMemoryPolicy('mobile');
+    expect(policy.cpuBudgetBytes).toBe(768 * 1024 ** 2);
+    expect(policy.gpuBudgetBytes).toBe(192 * 1024 ** 2);
+    expect(policy.gpuChunkBytes).toBe(16 * 1024 ** 2);
+    expect(policy.preloadAllKeyframes).toBe(false);
+  });
 });

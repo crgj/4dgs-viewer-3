@@ -105,6 +105,7 @@ interface PerformanceWithPageMemory extends Performance {
 
 const memoryModeLabelKeys: Readonly<Record<Gaussian4DMemoryMode, keyof typeof UI_COPY.zh>> = {
   auto: 'modeAuto',
+  mobile: 'modeMobile',
   compatible: 'modeCompatible',
   balanced: 'modeBalanced',
   performance: 'modePerformance',

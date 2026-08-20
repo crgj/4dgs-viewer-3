@@ -8,6 +8,7 @@ import {
   ASPECT_AUTO,
   ASPECT_MANUAL,
   Color,
+  DEVICETYPE_WEBGL2,
   DEVICETYPE_WEBGPU,
   Entity,
   Gizmo,
@@ -66,6 +67,7 @@ import {
   type Gaussian4DMemoryMode,
   type Gaussian4DMemoryPolicy,
 } from '../../gaussian/memory/Gaussian4DMemoryPolicy';
+import type { GaussianRuntimeProfile } from '../../gaussian/memory/GaussianRuntimeProfile';
 import { chooseRaw4DGpuEviction } from '../../gaussian/memory/Raw4DGpuResidencyPolicy';
 import {
   createRaw4DGaussian,
@@ -168,7 +170,7 @@ export interface ViewportStatus {
   bufferId?: string;
   sourceToResidentRatio?: number;
   memoryTransport?: 'shared-array-buffer' | 'transferable';
-  gpuBackend?: 'storage-buffer' | 'texture';
+  gpuBackend?: 'storage-buffer' | 'texture' | 'streaming-texture';
   decodeBackend?: 'wasm' | 'fp16-bits' | 'typed-array' | 'image-codebook';
   raw4dSequence?: {
     readonly segmentIndex: number;
@@ -399,6 +401,7 @@ interface ViewportRuntimeOptions {
   showGuides?: boolean;
   preserveDrawingBuffer?: boolean;
   memoryPolicy?: Gaussian4DMemoryPolicy;
+  runtimeProfile?: GaussianRuntimeProfile;
   onTransformChange?: (transform: ViewportTransform) => void;
   onRelightingChange?: (state: RelightingState) => void;
   onSelectionChange?: (state: ViewportSelectionState) => void;
@@ -440,6 +443,7 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
   private activeFormat: GaussianSourceFormat | null = null;
   private importController: AbortController | null = null;
   private rendererLabel = '正在初始化';
+  private memoryPolicy: Gaussian4DMemoryPolicy | null = null;
   private pendingFrame = 0;
   private renderMode: GaussianRenderMode = 'gaussian';
   private shLevel = 3;
@@ -510,9 +514,12 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
   }
 
   async initialize(): Promise<ViewportStatus> {
-    //WDD-gpt 2026-08-14 - 优先 WebGPU，并保留 PlayCanvas 自动追加的 WebGL2 回退路径。
+    const runtimeProfile = this.options.runtimeProfile;
+    // #WDD-gpt 2026-08-19 - 手机兼容档显式使用 WebGL2，避开移动 WebGPU 驱动差异；桌面仍优先 WebGPU 并保留 WebGL2 回退。
     const graphicsDeviceOptions = {
-      deviceTypes: [DEVICETYPE_WEBGPU],
+      deviceTypes: runtimeProfile?.forceWebGL2
+        ? [DEVICETYPE_WEBGL2]
+        : [DEVICETYPE_WEBGPU, DEVICETYPE_WEBGL2],
       antialias: false,
       // #WDD-gpt 2026-08-15 - 仅独立压缩渲染器开启帧缓冲保留，正式页面维持默认性能路径。
       preserveDrawingBuffer: this.options.preserveDrawingBuffer ?? false,
@@ -525,14 +532,15 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
       throw new Error('Viewport initialization was cancelled.');
     }
 
-    graphicsDevice.maxPixelRatio = Math.min(window.devicePixelRatio || 1, 2);
+    graphicsDevice.maxPixelRatio = Math.min(
+      window.devicePixelRatio || 1,
+      runtimeProfile?.maxPixelRatio ?? 2,
+    );
     const app = new Application(this.canvas, { graphicsDevice });
     this.app = app;
-    this.memoryCoordinator = new GaussianMemoryCoordinator(
-      graphicsDevice,
-      this.options.memoryPolicy ?? detectAutomaticGaussian4DMemoryPolicy(),
-    );
-    this.gaussianImporter = new GaussianAssetImporter();
+    this.memoryPolicy = this.options.memoryPolicy ?? detectAutomaticGaussian4DMemoryPolicy();
+    this.memoryCoordinator = new GaussianMemoryCoordinator(graphicsDevice, this.memoryPolicy);
+    this.gaussianImporter = new GaussianAssetImporter(runtimeProfile?.loaderWorkerCount);
     this.canvas.style.width = '100%';
     this.canvas.style.height = '100%';
     app.scene.ambientLight = new Color(0.35, 0.38, 0.45);
@@ -577,7 +585,9 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
     this.frameMonitorHandle = app.on('update', (deltaSeconds: number) => {
       this.performanceMonitor.recordFrame(deltaSeconds * 1000);
     });
-    this.rendererLabel = graphicsDevice.isWebGPU ? 'WebGPU · GPU Sort' : 'WebGL2 · Worker Sort';
+    this.rendererLabel = runtimeProfile?.name === 'mobile-compatible'
+      ? '移动兼容 · WebGL2 滑动关键帧'
+      : graphicsDevice.isWebGPU ? 'WebGPU · GPU Sort' : 'WebGL2 · Worker Sort';
     return this.installEmptyScene();
   }
 
@@ -1371,6 +1381,8 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
   }
 
   setMemoryPolicy(policy: Gaussian4DMemoryPolicy): void {
+    this.memoryPolicy = policy;
+    if (!policy.preloadAllKeyframes) this.raw4DPrefetchGeneration += 1;
     this.memoryCoordinator?.setPolicy(policy);
     if (this.raw4DSequenceActiveIndex >= 0) {
       // #WDD-gpt 2026-08-16 - 运行中降低显存预算时保留当前段和最近未来段，先清理已播放段，再清理最远未来段。
@@ -1380,7 +1392,7 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
         if (!this.evictRaw4DGpuCacheEntry(this.raw4DSequenceActiveIndex, true)) break;
       }
       this.memoryCoordinator?.gpuPool.trim();
-      this.scheduleRaw4DFuturePrefetch(this.raw4DSequenceActiveIndex);
+      if (policy.preloadAllKeyframes) this.scheduleRaw4DFuturePrefetch(this.raw4DSequenceActiveIndex);
     }
   }
 
@@ -2486,7 +2498,11 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
       this.app,
       resident.loaded.asset,
       this.memoryCoordinator.gpuPool,
-      { enabled: false, edits: sequenceEdits },
+      {
+        enabled: false,
+        edits: sequenceEdits,
+        streamTextureKeyframes: this.options.runtimeProfile?.streamTextureKeyframes,
+      },
     );
     if (signal.aborted || this.destroyRequested || !this.memoryCoordinator) {
       raw4D.dispose();
@@ -2576,6 +2592,7 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
   }
 
   private scheduleRaw4DFuturePrefetch(activeIndex: number): void {
+    if (this.memoryPolicy?.preloadAllKeyframes === false) return;
     const generation = ++this.raw4DPrefetchGeneration;
     void (async () => {
       for (let index = activeIndex + 1; index < this.raw4DSequenceGpuOrder.length; index += 1) {
@@ -2703,6 +2720,7 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
         signal: controller.signal,
         run: () => createRaw4DGaussian(app, residentAsset.value, memoryCoordinator.gpuPool, {
           edits: sequenceEdits,
+          streamTextureKeyframes: this.options.runtimeProfile?.streamTextureKeyframes,
         }),
       });
     } catch (error) {
