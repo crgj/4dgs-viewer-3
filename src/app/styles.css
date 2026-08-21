@@ -1739,11 +1739,26 @@ input:focus-visible {
 
 /* #WDD-gpt 2026-08-19 - 直方图默认只占一条精致停靠栏，展开后在时间轴上方提供跨片段属性选择。 */
 .gaussian-histogram-panel { position: absolute; z-index: 9; right: 10px; bottom: 9px; left: 58px; overflow: hidden; border-radius: 11px; transition: right 160ms ease; }
-.gaussian-histogram-panel.inspector-open { right: 296px; }
-.gaussian-histogram-toggle { display: grid; width: 100%; height: 30px; grid-template-columns: auto 1fr auto; align-items: center; gap: 10px; padding: 0 10px; border: 0; color: #aab4bc; background: rgba(9, 13, 16, 0.86); text-align: left; cursor: pointer; }
+/* #WDD-gpt 2026-08-21 - 检查器宽度按断点为 320/292/276px，直方图右缘跟随各档实际宽度留 8px 间距，不再压住场景面板。 */
+.gaussian-histogram-panel.inspector-open { right: 336px; }
+
+@media (max-width: 1080px) {
+  .gaussian-histogram-panel.inspector-open { right: 308px; }
+}
+
+@media (max-width: 860px) {
+  .gaussian-histogram-panel.inspector-open { right: 292px; }
+}
+
+@media (max-width: 620px) {
+  .gaussian-histogram-panel.inspector-open { right: 10px; }
+}
+.gaussian-histogram-toggle { display: grid; width: 100%; height: 30px; grid-template-columns: auto minmax(0, 1fr) auto auto; align-items: center; gap: 10px; padding: 0 10px; border: 0; color: #aab4bc; background: rgba(9, 13, 16, 0.86); text-align: left; cursor: pointer; }
 .gaussian-histogram-toggle > span { display: flex; align-items: center; gap: 7px; font-size: 10px; font-weight: 670; }
 .gaussian-histogram-toggle > span i { width: 6px; height: 6px; border-radius: 50%; background: #4dddb3; box-shadow: 0 0 7px rgba(77, 221, 179, 0.36); }
 .gaussian-histogram-toggle small { justify-self: end; color: #65717b; font-size: 8px; }
+/* #WDD-gpt 2026-08-21 - 镜头按键说明常驻开关栏中部空白区，窄视口下省略号截断，不再与左下角其他元素争位。 */
+.histogram-camera-hint { overflow: hidden; color: #5c6672; font-size: 8px; font-style: normal; letter-spacing: 0.2px; white-space: nowrap; text-overflow: ellipsis; }
 .gaussian-histogram-toggle b { color: #6b777f; font-size: 11px; }
 .gaussian-histogram-content { display: grid; gap: 8px; padding: 9px 10px 8px; border-top: 1px solid rgba(255, 255, 255, 0.065); background: rgba(8, 11, 14, 0.94); }
 .gaussian-histogram-content > header { display: grid; grid-template-columns: minmax(120px, 170px) auto minmax(120px, 160px) auto; align-items: center; gap: 7px; }
@@ -1777,10 +1792,64 @@ input:focus-visible {
 @media (max-width: 900px) {
   .welcome-content { width: min(520px, calc(100% - 28px)); gap: 18px; }
   .welcome-content h1 { font-size: 34px; }
-  .gaussian-histogram-panel.inspector-open { right: 10px; }
   .gaussian-histogram-content > header { grid-template-columns: 1fr 1fr; }
   .histogram-range-controls { grid-template-columns: 1fr 1fr; }
   .histogram-range-controls > button { grid-column: 1 / -1; }
+}
+
+/* #WDD-gpt 2026-08-20 - 手机相册不再继承桌面 360/248px 固定卡宽和 296px 动画位移，所有静态与过渡边界均收进视口。 */
+@media (max-width: 560px) {
+  .welcome-content { width: calc(100% - 24px); gap: 16px; padding: 34px 0; }
+  .welcome-content h1 { font-size: clamp(29px, 9vw, 34px); }
+  .welcome-gallery-preview {
+    width: 100%;
+    height: clamp(150px, 45vw, 180px);
+    margin: -2px 0 0;
+    overflow: clip;
+    perspective: 780px;
+  }
+  .welcome-gallery-active-shell,
+  .welcome-gallery-orbit-card {
+    width: calc(100% - 44px);
+    height: auto;
+    aspect-ratio: 36 / 17;
+  }
+  .welcome-gallery-active-shell { top: 2px; left: 0; }
+  .welcome-gallery-orbit-card {
+    top: 14px;
+    left: 44px;
+    border-radius: 14px;
+    transform: translate3d(0, 0, -68px) rotateY(-45deg) scale(0.72);
+    transform-origin: right center;
+  }
+  .welcome-gallery-orbit-card:hover { transform: translate3d(-4px, 0, -52px) rotateY(-38deg) scale(0.75); }
+  .welcome-gallery-reflection {
+    top: clamp(118px, 37vw, 150px);
+    left: 0;
+    width: calc(100% - 44px);
+    height: 38px;
+  }
+  .welcome-gallery-pager { right: 0; bottom: 2px; }
+  .welcome-gallery-feature > span:not(.welcome-gallery-placeholder) { right: 13px; bottom: 12px; left: 13px; gap: 4px; }
+  .welcome-gallery-feature em { top: 10px; right: 10px; }
+  .welcome-gallery-feature.turn-next { animation-name: welcome-coverflow-mobile-out-next; }
+  .welcome-gallery-feature.turn-previous { animation-name: welcome-coverflow-mobile-out-previous; }
+  .welcome-gallery-orbit-card.incoming-next { animation-name: welcome-coverflow-mobile-in-next; }
+  .welcome-gallery-orbit-card.incoming-previous { animation-name: welcome-coverflow-mobile-in-previous; }
+}
+
+@keyframes welcome-coverflow-mobile-out-next {
+  to { opacity: 0.12; transform: translate3d(-72%, 6px, -90px) rotateY(54deg) scale(0.72); }
+}
+@keyframes welcome-coverflow-mobile-out-previous {
+  to { opacity: 0.12; transform: translate3d(72%, 6px, -90px) rotateY(-54deg) scale(0.72); }
+}
+@keyframes welcome-coverflow-mobile-in-next {
+  to { z-index: 4; opacity: 1; border-radius: 18px; transform: translate3d(-44px, -12px, 22px) rotateY(0deg) scale(1); }
+}
+@keyframes welcome-coverflow-mobile-in-previous {
+  from { transform: translate3d(-72%, 0, -68px) rotateY(45deg) scale(0.72); }
+  to { z-index: 4; opacity: 1; border-radius: 18px; transform: translate3d(-44px, -12px, 22px) rotateY(0deg) scale(1); }
 }
 
 /* #WDD-gpt 2026-08-16 - 身高尺数字采用独立投影层，保持厘米数值清晰且不拦截视口交互。 */

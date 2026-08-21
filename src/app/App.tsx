@@ -1690,6 +1690,8 @@ export function App() {
   const activeTimelineSegment = status.raw4dSequence
     ? timelineSegments[status.raw4dSequence.segmentIndex]
     : null;
+  // #WDD-gpt 2026-08-21 - 直方图面板出现期间，镜头按键说明改由其开关栏承载，左下角独立提示条隐藏以免被面板压住。
+  const histogramPanelVisible = !mobilePlayerMode && sourceFiles.length > 0 && status.phase === 'ready';
 
   return (
     <main
@@ -2228,7 +2230,7 @@ export function App() {
               </div>
             )}
           </div>
-          {!mobilePlayerMode && <div className="camera-help" data-camera-input-block>{copy.cameraMoveHint}</div>}
+          {!mobilePlayerMode && !histogramPanelVisible && <div className="camera-help" data-camera-input-block>{copy.cameraMoveHint}</div>}
           {/* #WDD-gpt 2026-08-16 - 使用实时 3D 投影导航立方体同步相机姿态，并隔离主视口的鼠标输入。 */}
           {!mobilePlayerMode && <ViewCube3D
             inspectorOpen={inspectorPanelVisible}
@@ -2698,9 +2700,10 @@ export function App() {
             </section>
           </div>
         )}
-        {!mobilePlayerMode && sourceFiles.length > 0 && status.phase === 'ready' && (
+        {histogramPanelVisible && (
           <GaussianHistogramPanel
             bufferId={status.bufferId}
+            cameraHint={copy.cameraMoveHint}
             currentFrame={currentFrame}
             deletedCount={selectionState.deletedCount ?? 0}
             inspectorOpen={inspectorPanelVisible}

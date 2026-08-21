@@ -15,6 +15,7 @@ import { ValidatedNumberInput } from './ValidatedNumberInput';
 
 interface GaussianHistogramPanelProps {
   readonly bufferId?: string;
+  readonly cameraHint: string;
   readonly currentFrame: number;
   readonly deletedCount: number;
   readonly language: UiLanguage;
@@ -148,6 +149,8 @@ export function GaussianHistogramPanel(props: GaussianHistogramPanelProps) {
     <aside className={`gaussian-histogram-panel glass-panel${open ? ' open' : ''}${props.inspectorOpen ? ' inspector-open' : ''}`} data-camera-input-block>
       <button className="gaussian-histogram-toggle" onClick={() => setOpen((value) => !value)} type="button">
         <span><i />{zh ? 'Gaussian 数据' : 'Gaussian Data'}</span>
+        {/* #WDD-gpt 2026-08-21 - 镜头按键说明并入开关栏空白区，替代左下角被本面板遮住的 camera-help 提示条。 */}
+        <em className="histogram-camera-hint">{props.cameraHint}</em>
         <small>{open ? (zh ? '收起' : 'Collapse') : (zh ? '直方图选择' : 'Histogram selection')}</small>
         <b>{open ? '⌄' : '⌃'}</b>
       </button>
