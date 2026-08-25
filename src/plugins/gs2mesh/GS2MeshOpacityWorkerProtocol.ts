@@ -10,6 +10,8 @@ export interface GS2MeshOpacityWorkerRequest {
   readonly type: 'reconstruct-opacity';
   readonly requestId: number;
   readonly input: GS2MeshGaussianFieldInput;
+  /** #WDD-gpt 2026-08-21 - 重光照逐帧代理：使用全部已选 Gaussian 和请求分辨率进行一次有界稠密重建，跳过 GOF 细化。 */
+  readonly perFrameDenseOnly?: boolean;
 }
 
 export interface GS2MeshOpacityWorkerProgress {

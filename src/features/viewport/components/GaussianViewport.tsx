@@ -36,12 +36,14 @@ interface GaussianViewportProps {
   activeTool: ViewportEditorTool;
   brushRadius: number;
   currentFrame: number;
+  forceSortSync: boolean;
   frameReadyRequestId: number;
   memoryPolicy: Gaussian4DMemoryPolicy;
   onMemoryChange: (memory: ViewportMemoryUsage) => void;
   onPerformanceChange: (performance: ViewportPerformanceSnapshot) => void;
   onHistoryChange: (state: ViewportHistoryState) => void;
   onFrameRenderReady: (requestId: number, sorted: boolean) => void;
+  onFrameDisplayed: (frame: number) => void;
   onCameraBookmarksChange: (bookmarks: readonly (ViewportCameraState | null)[]) => void;
   onRelightingChange: (state: RelightingState) => void;
   onRuntimeChange: (runtime: ViewportRuntime | null) => void;
@@ -168,12 +170,14 @@ export function GaussianViewport({
   activeTool,
   brushRadius,
   currentFrame,
+  forceSortSync,
   frameReadyRequestId,
   memoryPolicy,
   onMemoryChange,
   onPerformanceChange,
   onHistoryChange,
   onFrameRenderReady,
+  onFrameDisplayed,
   onCameraBookmarksChange,
   onRelightingChange,
   onRuntimeChange,
@@ -209,6 +213,7 @@ export function GaussianViewport({
   const activateFourCgsFrameRef = useRef<(frame: number) => Promise<void>>(async () => undefined);
   const activateRaw4DSequenceFrameRef = useRef<(frame: number) => Promise<void>>(async () => undefined);
   const renderModeRef = useRef(renderMode);
+  const onFrameDisplayedRef = useRef(onFrameDisplayed);
   const [runtimeReady, setRuntimeReady] = useState(false);
   const [runtimeGeneration, setRuntimeGeneration] = useState(0);
   const [detectedRuntimeProfile] = useState(detectGaussianRuntimeProfile);
@@ -216,6 +221,7 @@ export function GaussianViewport({
     ? resolveGaussianRuntimeProfile({ mobileHint: true })
     : detectedRuntimeProfile, [detectedRuntimeProfile, memoryPolicy.mode]);
   renderModeRef.current = renderMode;
+  onFrameDisplayedRef.current = onFrameDisplayed;
   pendingFrameRef.current = currentFrame;
 
   activateFourCgsFrameRef.current = async (frame: number) => {
@@ -224,7 +230,7 @@ export function GaussianViewport({
     if (!runtime || !session) return;
     const location = locateFourCgsFrame(session.descriptor.segments, frame);
     if (session.segmentIndex === location.segmentIndex) {
-      runtime.setFrame(location.localFrame);
+      runtime.setFrame(location.localFrame, () => onFrameDisplayedRef.current(frame));
       return;
     }
     if (fourCgsLoadingSegmentRef.current === location.segmentIndex) return;
@@ -260,13 +266,14 @@ export function GaussianViewport({
       // #WDD-gpt 2026-08-16 - 4CGS 复用多 RAW4D 显存滑动窗口；预取命中时只切换隐藏实体，不再跨段重建文件。
       const status = await runtime.activateResidentRaw4D(residentSegment, (next) => {
         if (generation === fourCgsLoadGenerationRef.current) onStatusChange(mappedStatus(next));
-      }, location.localFrame);
+      }, location.localFrame, () => onFrameDisplayedRef.current(frame));
       if (generation !== fourCgsLoadGenerationRef.current || fourCgsSessionRef.current !== session) return;
       session.segmentIndex = location.segmentIndex;
       fourCgsLoadingSegmentRef.current = null;
-      const latest = locateFourCgsFrame(session.descriptor.segments, pendingFrameRef.current);
+      const latestTimelineFrame = pendingFrameRef.current;
+      const latest = locateFourCgsFrame(session.descriptor.segments, latestTimelineFrame);
       if (latest.segmentIndex === session.segmentIndex) {
-        runtime.setFrame(latest.localFrame);
+        runtime.setFrame(latest.localFrame, () => onFrameDisplayedRef.current(latestTimelineFrame));
         onStatusChange(mappedStatus(status));
       } else {
         void activateFourCgsFrameRef.current(pendingFrameRef.current);
@@ -285,7 +292,7 @@ export function GaussianViewport({
     if (!runtime || !session) return;
     const location = locateRaw4DSequenceFrame(session.descriptor.segments, frame);
     if (session.segmentIndex === location.segmentIndex) {
-      runtime.setFrame(location.localFrame);
+      runtime.setFrame(location.localFrame, () => onFrameDisplayedRef.current(frame));
       return;
     }
     if (raw4DSequenceLoadingSegmentRef.current === location.segmentIndex) return;
@@ -338,13 +345,14 @@ export function GaussianViewport({
     try {
       const status = await runtime.activateResidentRaw4D(residentSegment, (next) => {
         if (generation === raw4DSequenceLoadGenerationRef.current) onStatusChange(mappedStatus(next));
-      }, location.localFrame);
+      }, location.localFrame, () => onFrameDisplayedRef.current(frame));
       if (generation !== raw4DSequenceLoadGenerationRef.current || raw4DSequenceSessionRef.current !== session) return;
       session.segmentIndex = location.segmentIndex;
       raw4DSequenceLoadingSegmentRef.current = null;
-      const latest = locateRaw4DSequenceFrame(session.descriptor.segments, pendingFrameRef.current);
+      const latestTimelineFrame = pendingFrameRef.current;
+      const latest = locateRaw4DSequenceFrame(session.descriptor.segments, latestTimelineFrame);
       if (latest.segmentIndex === session.segmentIndex) {
-        runtime.setFrame(latest.localFrame);
+        runtime.setFrame(latest.localFrame, () => onFrameDisplayedRef.current(latestTimelineFrame));
         onStatusChange(mappedStatus(status));
       } else {
         void activateRaw4DSequenceFrameRef.current(pendingFrameRef.current);
@@ -443,6 +451,11 @@ export function GaussianViewport({
   }, [renderMode, runtimeReady]);
 
   useEffect(() => {
+    // #WDD-gpt 2026-08-21 - 强制排序开关直接作用到运行时门槛，关闭时立即落地滞留帧。
+    runtimeRef.current?.setForceSortSync(forceSortSync);
+  }, [forceSortSync, runtimeReady]);
+
+  useEffect(() => {
     runtimeRef.current?.setShLevel(shLevel);
   }, [runtimeReady, shLevel]);
 
@@ -487,7 +500,7 @@ export function GaussianViewport({
         });
       });
     } else {
-      runtimeRef.current?.setFrame(currentFrame);
+      runtimeRef.current?.setFrame(currentFrame, () => onFrameDisplayedRef.current(currentFrame));
       application = Promise.resolve();
     }
     frameApplicationRef.current = application;

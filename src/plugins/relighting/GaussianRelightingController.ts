@@ -40,6 +40,24 @@ interface RelightingProjectionCamera {
   aspectRatio: number;
 }
 
+interface RelightingShadowTarget {
+  readonly light?: { shadowUpdateMode: number } | null;
+}
+
+// #WDD-gpt 2026-08-21 - 动态代理 Mesh 改变后旧阴影图仍对应上一帧，会在脸上形成相邻亮暗块；集中使所有灯本帧重算阴影。
+export function markRelightingShadowMapsDirty(
+  targets: Iterable<RelightingShadowTarget>,
+  updateMode: number = SHADOWUPDATE_THISFRAME,
+): number {
+  let updated = 0;
+  for (const target of targets) {
+    if (!target.light) continue;
+    target.light.shadowUpdateMode = updateMode;
+    updated += 1;
+  }
+  return updated;
+}
+
 // #WDD-gpt 2026-08-16 - The official relighting script only copies fov/clip values; mirror the complete projection so the offscreen mesh stays pixel-aligned with a horizontal-FOV editor camera.
 export function syncRelightingCameraProjection(
   source: RelightingProjectionCamera,
@@ -147,6 +165,7 @@ export class GaussianRelightingController {
       (material) => this.relighting.configureMaterial(material),
     );
     proxy.setRelightingProxyEnabled(this.enabled);
+    this.invalidateProxyLighting();
   }
 
   setEnabled(enabled: boolean): RelightingState {
@@ -216,6 +235,7 @@ export class GaussianRelightingController {
     const fallbackRange = this.proxy?.getRelightingPlacement().radius ?? runtime.spec.range / 4;
     runtime.spec = sanitizeRelightingLight({ ...runtime.spec, ...patch }, fallbackRange * 4);
     this.applyLight(runtime);
+    this.invalidateProxyLighting();
     if (id === this.selectedLightId) this.lightGizmo.update();
     this.emit();
     return this.getState();
@@ -227,6 +247,7 @@ export class GaussianRelightingController {
     this.relighting.brightness = this.settings.brightness;
     this.relighting.background = this.settings.background;
     this.relighting.textureScale = this.settings.textureScale;
+    this.app.renderNextFrame = true;
     this.emit();
     return this.getState();
   }
@@ -284,7 +305,14 @@ export class GaussianRelightingController {
     this.lights.forEach(({ entity }) => { entity.enabled = enabled; });
     this.relighting.enabled = enabled;
     setGaussianRelightingShader(this.app, enabled);
+    if (enabled) this.invalidateProxyLighting();
     this.updateGizmoAttachment();
+  }
+
+  invalidateProxyLighting(): void {
+    if (!this.enabled) return;
+    markRelightingShadowMapsDirty([...this.lights.values()].map(({ entity }) => entity));
+    this.app.renderNextFrame = true;
   }
 
   private selectedRuntimeLight(): RuntimeLight | null {

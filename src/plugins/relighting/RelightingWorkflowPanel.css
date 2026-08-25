@@ -65,9 +65,9 @@
 .relighting-workflow-steps button:first-child.active > b { color: #6ce2bd; border-color: rgba(61, 221, 177, 0.25); }
 .relighting-workflow-steps button:last-child.active > b { color: #ffc46e; border-color: rgba(255, 185, 83, 0.25); }
 .relighting-workflow-steps button > span { display: grid; min-width: 0; gap: 2px; }
-.relighting-workflow-steps button > span strong { overflow: hidden; color: #dce5e2; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
-.relighting-workflow-steps button > span small { overflow: hidden; color: #66706f; font-size: 7px; text-overflow: ellipsis; white-space: nowrap; }
-.relighting-workflow-steps button > em { padding: 3px 5px; border-radius: 5px; color: #75807d; background: rgba(255, 255, 255, 0.035); font-size: 7px; font-style: normal; white-space: nowrap; }
+.relighting-workflow-steps button > span strong { overflow: hidden; color: #dce5e2; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.relighting-workflow-steps button > span small { overflow: hidden; color: #78827f; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.relighting-workflow-steps button > em { padding: 4px 6px; border-radius: 5px; color: #84908d; background: rgba(255, 255, 255, 0.035); font-size: 9px; font-style: normal; white-space: nowrap; }
 .relighting-workflow-steps button.running > em { color: #77e1c0; background: rgba(36, 201, 151, 0.1); }
 .relighting-workflow-steps button.complete > em,
 .relighting-workflow-steps button.ready > em { color: #efbf78; background: rgba(220, 145, 47, 0.1); }
@@ -76,3 +76,45 @@
 .relighting-workflow-body[hidden] { display: none; }
 .relighting-workflow-body > .gs2mesh-card > .gs2mesh-heading,
 .relighting-workflow-body > .relighting-card > .relighting-heading { display: none; }
+
+/* #WDD-gpt 2026-08-21 - 重光照逐帧代理复用基础控件规范，并以蓝色工作区和可读指标覆盖形成独立视觉层级。 */
+.relighting-mesh-card {
+  display: grid;
+  gap: 11px;
+  padding: 13px;
+  border: 1px solid rgba(96, 165, 250, 0.24);
+  border-radius: 10px;
+  background: radial-gradient(circle at 12% 0%, rgba(59, 130, 246, 0.12), transparent 44%), rgba(9, 14, 19, 0.68);
+}
+
+.relighting-mesh-card .gs2mesh-heading > span { border-color: rgba(96, 165, 250, 0.38); color: #7cb0f8; background: rgba(59, 130, 246, 0.12); }
+.relighting-mesh-card .gs2mesh-heading strong { font-size: 14px; }
+.relighting-mesh-card .gs2mesh-heading small { color: #7898bc; font-size: 10px; }
+.relighting-mesh-card > p { margin: 0; color: #aab9c9; font-size: 11px; line-height: 1.65; }
+.relighting-mesh-facts { display: flex; flex-wrap: wrap; gap: 6px; }
+.relighting-mesh-facts span { padding: 4px 7px; border: 1px solid rgba(96, 165, 250, 0.18); border-radius: 999px; color: #87a9cc; background: rgba(59, 130, 246, 0.07); font: 700 8px/1 ui-monospace, monospace; letter-spacing: .06em; }
+.relighting-mesh-card .gs2mesh-status > div { background: rgba(76, 110, 160, 0.22); }
+.relighting-mesh-card .gs2mesh-status i { background: linear-gradient(90deg, #2f6fd0, #6aa6ff); }
+.relighting-mesh-card .gs2mesh-actions button.primary { border-color: rgba(96, 165, 250, 0.46); color: #eff6ff; background: linear-gradient(180deg, rgba(37, 99, 235, 0.76), rgba(30, 64, 175, 0.78)); }
+.relighting-mesh-card .gs2mesh-actions { grid-template-columns: 1fr; }
+.relighting-mesh-card .gs2mesh-config-grid label { display: grid; gap: 4px; }
+.relighting-mesh-card .gs2mesh-config-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.relighting-mesh-card .gs2mesh-config-grid label { color: #8ca0b5; font-size: 10px; }
+.relighting-mesh-card .gs2mesh-config-grid input,
+.relighting-mesh-card .gs2mesh-config-grid select { height: 34px; border-color: rgba(96, 165, 250, 0.22); color: #e8f1fb; background: rgba(6, 11, 19, 0.9); font-size: 11px; }
+.relighting-mesh-card .relighting-mesh-range { grid-column: span 1; }
+.relighting-mesh-card .gs2mesh-config-grid .relighting-mesh-frame-range { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; }
+.relighting-mesh-card .gs2mesh-status { min-height: 22px; color: #bdd0e5; font-size: 11px; }
+.relighting-mesh-metrics { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.relighting-mesh-metrics dt { font-size: 9px; }
+.relighting-mesh-metrics dd { font-size: 11px; }
+.relighting-mesh-metrics .relighting-mesh-backend { grid-column: 1 / -1; }
+.relighting-mesh-metrics .relighting-mesh-backend dd { white-space: normal; }
+.relighting-mesh-card .gs2mesh-actions button { min-height: 36px; font-size: 11px; }
+
+@media (max-width: 720px) {
+  .relighting-workflow-steps { grid-template-columns: 1fr; gap: 5px; }
+  .relighting-workflow-steps > i { display: none; }
+  .relighting-mesh-card .gs2mesh-config-grid { grid-template-columns: 1fr 1fr; }
+  .relighting-mesh-metrics { grid-template-columns: 1fr 1fr; }
+}

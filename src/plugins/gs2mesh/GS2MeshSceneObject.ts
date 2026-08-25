@@ -27,6 +27,29 @@ function signedMeshVolume(positions: Float32Array, indices?: Uint32Array): numbe
   return volume6 / 6;
 }
 
+// #WDD-gpt 2026-08-21 - 只有近似闭合网格的有向体积才可用于判断整体朝向；开放人体代理必须退回径向法线评分。
+export function meshBoundaryEdgeRatio(indices?: Uint32Array): number {
+  if (!indices || indices.length < 3) return 1;
+  let maximumIndex = 0;
+  for (const index of indices) maximumIndex = Math.max(maximumIndex, index);
+  const stride = maximumIndex + 1;
+  const edges = new Map<number, number>();
+  const add = (left: number, right: number): void => {
+    const minimum = Math.min(left, right);
+    const maximum = Math.max(left, right);
+    const key = minimum * stride + maximum;
+    edges.set(key, (edges.get(key) ?? 0) + 1);
+  };
+  for (let offset = 0; offset < indices.length; offset += 3) {
+    add(indices[offset], indices[offset + 1]);
+    add(indices[offset + 1], indices[offset + 2]);
+    add(indices[offset + 2], indices[offset]);
+  }
+  let boundaryEdges = 0;
+  for (const count of edges.values()) if (count !== 2) boundaryEdges += 1;
+  return boundaryEdges / Math.max(1, edges.size);
+}
+
 // #WDD-gpt 2026-08-16 - Prefer signed closed-volume winding over a body-center guess so concave GS2Mesh surfaces cannot flip the light to the opposite side.
 export function orientNormalsOutward(
   positions: Float32Array,
@@ -34,8 +57,9 @@ export function orientNormalsOutward(
   indices?: Uint32Array,
 ): Float32Array {
   if (positions.length !== normals.length || positions.length < 3) return normals;
-  const volume = signedMeshVolume(positions, indices);
-  if (Math.abs(volume) > 1e-12) {
+  const closedEnough = meshBoundaryEdgeRatio(indices) <= 0.001;
+  const volume = closedEnough ? signedMeshVolume(positions, indices) : 0;
+  if (closedEnough && Math.abs(volume) > 1e-12) {
     if (volume > 0) return normals;
     return Float32Array.from(normals, (value) => -value);
   }
@@ -123,7 +147,7 @@ export class GS2MeshSceneObject {
   private normals: Float32Array;
   private boundsCenter: [number, number, number] = [0, 0, 0];
   private boundsRadius = 0.01;
-  readonly stats: GS2MeshSceneStats;
+  stats: GS2MeshSceneStats;
 
   constructor(app: Application, data: GS2MeshData, transformSource?: Entity | null) {
     const sourceWorld = transformSource?.getWorldTransform().clone() ?? null;
@@ -196,6 +220,30 @@ export class GS2MeshSceneObject {
 
   get visible(): boolean {
     return this.entity.enabled;
+  }
+
+  // #WDD-gpt 2026-08-21 - 逐帧网格序列原地更新几何：显示网格与重光照代理共享同一 Mesh 实例，
+  // 一次 setPositions/setNormals 更新即同时作用于两者；无需重建实体，光照代理持续有效。
+  updateFrameGeometry(data: GS2MeshData): GS2MeshSceneStats {
+    const localToWorld = this.entity.getWorldTransform().clone();
+    const worldToLocal = localToWorld.clone().invert();
+    const positions = transformPositionsToLocal(data.positions, worldToLocal);
+    const sourceNormals = data.normals
+      ? transformNormalsToLocal(data.normals, localToWorld)
+      : Float32Array.from(calculateNormals(Array.from(positions), Array.from(data.indices)));
+    this.positions = positions;
+    this.normals = orientNormalsOutward(positions, sourceNormals, data.indices);
+    this.mesh.setPositions(this.positions);
+    this.mesh.setNormals(this.normals);
+    this.mesh.setColors32(data.colors);
+    this.mesh.setIndices(data.indices);
+    this.mesh.update(PRIMITIVE_TRIANGLES);
+    this.updateBounds();
+    this.stats = {
+      vertexCount: this.positions.length / 3,
+      triangleCount: data.indices.length / 3,
+    };
+    return this.stats;
   }
 
   getRelightingPlacement(): { readonly center: readonly [number, number, number]; readonly radius: number } {

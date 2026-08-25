@@ -2666,6 +2666,36 @@ async function reconstruct(request: GS2MeshOpacityWorkerRequest): Promise<Worker
     48,
     Math.min(MAX_SPARSE_FIELD_RESOLUTION, Math.round(request.input.fieldResolution)),
   );
+  // #WDD-gpt 2026-08-21 - 逐帧重光照必须忠实使用面板选定的 Gaussian 数和网格分辨率；
+  // 旧 previewOnly 会暗中固定降到 12K / 72³，造成参数无效、四肢和衣物大面积缺失。
+  if (request.perFrameDenseOnly) {
+    const denseResolution = Math.min(MAX_DENSE_TOPOLOGY_RESOLUTION, requestedResolution);
+    let denseGrid: SparsePreviewField;
+    try {
+      denseGrid = await computeWebGpuField(request.input, denseResolution, false);
+    } catch {
+      denseGrid = {
+        ...splatOpacityField(await getCore(), request.input, request.requestId),
+        backend: `WASM full-frame dense (${request.input.positions.length / 3} Gaussian / ${denseResolution}³) + Surface Nets`,
+      };
+    }
+    if (!denseGrid.backend.includes('full-frame dense')) {
+      denseGrid = {
+        ...denseGrid,
+        backend: `${denseGrid.backend} · full-frame dense (${request.input.positions.length / 3} Gaussian / ${denseResolution}³)`,
+      };
+    }
+    const denseMesh = extractSurfaceNetsPreview(denseGrid, request.input);
+    return {
+      mesh: {
+        positions: denseMesh.positions,
+        normals: denseMesh.normals ?? new Float32Array(denseMesh.positions.length),
+        colors: denseMesh.colors,
+        indices: denseMesh.indices,
+      },
+      backend: denseGrid.backend,
+    };
+  }
   const previewInput = buildPreviewGaussianInput(request.input);
   const previewResolution = PREVIEW_FIELD_RESOLUTION;
   let previewGrid: SparsePreviewField;

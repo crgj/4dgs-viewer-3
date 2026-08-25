@@ -57,6 +57,7 @@ import type {
   GaussianSelectionMode,
 } from '../../gaussian/edit/GaussianEditStore';
 import { installPlayCanvasSortResultGuard } from '../../gaussian/runtime/PlayCanvasSortResultGuard';
+import { StrictSortFrameGate } from '../../gaussian/runtime/StrictSortFrameGate';
 import {
   GaussianMemoryCoordinator,
   type GaussianCpuPageLease,
@@ -88,6 +89,16 @@ import {
   rotateGS2MeshOffset,
 } from '../../../plugins/gs2mesh/GS2MeshCameraPlanner';
 import { GS2MeshSceneObject } from '../../../plugins/gs2mesh/GS2MeshSceneObject';
+import type {
+  RelightingFrameGaussians,
+  RelightingMeshCaptureOptions,
+  RelightingMeshCaptureResult,
+  RelightingMeshFrameVisitor,
+} from '../../../plugins/relighting/RelightingMeshCaptureTypes';
+import {
+  addressRelightingFrames,
+  buildRelightingSegmentFramePlans,
+} from '../../../plugins/relighting/RelightingMeshFramePlan';
 import type {
   GS2MeshCamera,
   GS2MeshCaptureOptions,
@@ -440,6 +451,7 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
   private activeRaw4DAsset: Raw4DAsset | null = null;
   private activeRaw4DSource: File | null = null;
   private gs2MeshObject: GS2MeshSceneObject | null = null;
+  private gs2MeshPersistentAcrossSegments = false;
   private relighting: GaussianRelightingController | null = null;
   private memoryCoordinator: GaussianMemoryCoordinator | null = null;
   private gaussianImporter: GaussianAssetImporter | null = null;
@@ -474,6 +486,13 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
   private uniformScale = true;
   private readonly performanceMonitor = new ViewportPerformanceMonitor();
   private frameMonitorHandle: { off(): void } | null = null;
+  private gsplatFrameReadyHandle: { off(): void } | null = null;
+  // #WDD-gpt 2026-08-21 - 强制排序门槛：prepare 只上传数据并触发排序，引擎 frame:ready 确认排序提交后再 reveal。
+  private readonly strictSortGate = new StrictSortFrameGate({
+    prepareFrame: (frame) => this.activeRaw4D?.prepareFrame(frame) ?? frame,
+    revealFrame: (frame) => this.activeRaw4D?.revealFrame(frame),
+    applyFrameDirect: (frame) => this.activeRaw4D?.setFrame(frame),
+  });
   private smartAlignmentCaptureRunning = false;
   private gs2MeshCaptureRunning = false;
   private transformLayer: Layer | null = null;
@@ -597,6 +616,19 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
     this.frameMonitorHandle = app.on('update', (deltaSeconds: number) => {
       this.performanceMonitor.recordFrame(deltaSeconds * 1000);
     });
+    // #WDD-gpt 2026-08-21 - 监听引擎逐帧 ready 信号：当前世界版本排序提交后才揭示强制排序模式下已准备的帧。
+    const gsplatSystem = app.systems.gsplat;
+    if (gsplatSystem) {
+      const readyCamera = camera.camera!;
+      this.gsplatFrameReadyHandle = gsplatSystem.on('frame:ready', (
+        eventCamera: typeof readyCamera,
+        _layer: unknown,
+        ready: boolean,
+      ) => {
+        if (eventCamera !== readyCamera || !ready) return;
+        this.strictSortGate.onSorted();
+      });
+    }
     this.rendererLabel = runtimeProfile?.name === 'mobile-compatible'
       ? '移动兼容 · WebGL2 滑动关键帧'
       : graphicsDevice.isWebGPU ? 'WebGPU · GPU Sort' : 'WebGL2 · Worker Sort';
@@ -615,6 +647,8 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
     this.extensions.disposeAttached();
     this.frameMonitorHandle?.off();
     this.frameMonitorHandle = null;
+    this.gsplatFrameReadyHandle?.off();
+    this.gsplatFrameReadyHandle = null;
     this.destroyTransformGizmos();
     this.orbit?.destroy();
     this.orbit = null;
@@ -786,9 +820,14 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
     return this.activeRaw4D?.setShBands(this.shLevel) ?? this.shLevel;
   }
 
-  setFrame(frame: number): void {
+  setFrame(frame: number, onDisplayed?: () => void): void {
     this.pendingFrame = frame;
-    this.activeRaw4D?.setFrame(frame);
+    // #WDD-gpt 2026-08-21 - 强制排序开启时经门槛推进：先准备并等待引擎排序提交，再切换显示帧。
+    this.strictSortGate.request(frame, onDisplayed);
+  }
+
+  setForceSortSync(enabled: boolean): void {
+    this.strictSortGate.setEnabled(enabled);
   }
 
   // #WDD-gpt 2026-08-19 - 循环回到首帧时以引擎真实 frame:ready 信号作为继续播放门槛，避免 Worker 排序尚未提交就推进下一帧。
@@ -1179,6 +1218,8 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
       await activeRaw4D.refreshSourceData();
       activeRaw4D.setAllMode(this.renderMode === 'all');
       activeRaw4D.setShBands(this.shLevel);
+      // #WDD-gpt 2026-08-21 - 源数据整体重烤后旧门槛状态全部失效，直接应用目标帧。
+      this.strictSortGate.reset();
       activeRaw4D.setFrame(this.pendingFrame);
 
       // #WDD-gpt 2026-08-17 - Mesh 仍在旧 Gaussian 局部坐标，先用旧实体矩阵烘焙，再归一 Gaussian 实体。
@@ -2021,6 +2062,7 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
 
   installGS2Mesh(data: GS2MeshData): GS2MeshSceneStats {
     if (!this.app) throw new Error('三维视口尚未初始化完成。');
+    this.gs2MeshPersistentAcrossSegments = false;
     const previous = this.gs2MeshObject;
     const next = new GS2MeshSceneObject(this.app, data, this.activeRaw4D?.entity);
     this.gs2MeshObject = next;
@@ -2029,10 +2071,497 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
     return next.stats;
   }
 
+  // #WDD-gpt 2026-08-21 - 重光照逐帧代理按统一时间轴流式采样：每帧独立选择当前真正可见的 Gaussian，
+  // 立即提交 Worker 后释放该帧数组；跨 4CGS/RAW4D 片段时共享边界只采用后一段，不再截断在活动片段。
+  async streamRelightingMeshFrames(
+    options: RelightingMeshCaptureOptions,
+    visitor: RelightingMeshFrameVisitor,
+  ): Promise<void> {
+    const activeRaw4D = this.activeRaw4D;
+    const activeAsset = this.activeRaw4DAsset;
+    const sequence = this.gaussianSelectionSequence;
+    const camera = this.camera;
+    if (!activeRaw4D || !activeAsset || !camera) throw new Error('请先完成 RAW4D/4CGS 文件导入。');
+    if (camera.camera?.projection === PROJECTION_ORTHOGRAPHIC) {
+      throw new Error('重光照逐帧网格需要透视摄像机，请先切换回透视视图。');
+    }
+    if (options.signal?.aborted) throw new DOMException('重光照 Gaussian 采样已取消。', 'AbortError');
+
+    const segmentFrameCounts = sequence
+      ? Array.from({ length: sequence.edits.segmentCount }, (_, index) => sequence.edits.segment(index).totalFrames)
+      : [activeAsset.totalFrames];
+    const plans = buildRelightingSegmentFramePlans(segmentFrameCounts);
+    const addresses = addressRelightingFrames(plans, options.frameStart, options.frameEnd);
+    if (addresses.length === 0) throw new Error('所选帧范围为空。');
+
+    const maximum = Math.max(10_000, Math.min(200_000, Math.round(options.maxGaussians)));
+    const sourceWorld = activeRaw4D.entity.getWorldTransform().clone();
+    const sourceRotation = activeRaw4D.entity.getRotation().clone();
+    const sourceScale = sourceWorld.getScale(new Vec3());
+    const scaleValues = [Math.abs(sourceScale.x), Math.abs(sourceScale.y), Math.abs(sourceScale.z)];
+    const maximumScale = Math.max(...scaleValues, 1e-8);
+    const minimumScale = Math.min(...scaleValues);
+    if (maximumScale - minimumScale > maximumScale * 1e-4) {
+      throw new Error('逐帧 Mesh 目前要求模型使用等比缩放；请先开启等比缩放或把变换烘焙到模型数据。');
+    }
+    const uniformScale = scaleValues.reduce((sum, value) => sum + value, 0) / 3;
+    const cameraPosition = camera.getPosition().clone();
+    const cameraRight = camera.right.clone();
+    const cameraUp = camera.up.clone();
+    const cameraForward = camera.forward.clone();
+    const captureWidth = Math.max(1, this.canvas.width);
+    const captureHeight = Math.max(1, this.canvas.height);
+    const intrinsics = perspectiveIntrinsics(
+      captureWidth,
+      captureHeight,
+      camera.camera?.fov ?? 60,
+      camera.camera?.horizontalFov ?? false,
+    );
+    const tanHalfFovX = captureWidth * 0.5 / intrinsics.fx;
+    const tanHalfFovY = captureHeight * 0.5 / intrinsics.fy;
+    const viewCount = Math.max(4, Math.min(16, Math.round(options.viewCount)));
+    const sceneUnitMillimeters = Number.isFinite(options.sceneUnitMillimeters)
+      ? Math.max(1e-3, Math.min(1_000_000, options.sceneUnitMillimeters))
+      : 1000;
+    const targetVoxelMillimeters = Number.isFinite(options.targetVoxelMillimeters)
+      ? Math.max(0.1, Math.min(20, options.targetVoxelMillimeters))
+      : 2;
+    const targetVoxelSize = Math.max(1e-7, Math.min(1, targetVoxelMillimeters / sceneUnitMillimeters));
+    const shC0 = 0.28209479177387814;
+    let completed = 0;
+
+    for (const plan of plans) {
+      const segmentAddresses = addresses.filter((address) => address.segmentIndex === plan.segmentIndex);
+      if (segmentAddresses.length === 0) continue;
+      const lease = sequence
+        ? await sequence.acquireAsset(plan.segmentIndex, options.signal ?? new AbortController().signal)
+        : { asset: activeAsset, release: () => undefined };
+      try {
+        const asset = lease.asset;
+        const edits = sequence?.edits.segment(plan.segmentIndex).edits ?? activeRaw4D.edits;
+        if (asset.splatCount !== edits.pointCount) {
+          throw new Error(`片段 ${plan.segmentIndex + 1} Gaussian 数量与编辑位集不一致。`);
+        }
+        const sampler = new Raw4DFrameSampler(asset);
+        const properties = sampler.properties;
+        const groupSize = Math.max(1, Math.ceil(asset.splatCount / maximum));
+        const localPosition = new Vec3();
+        const worldPosition = new Vec3();
+        const localRotation = new Quat();
+        const worldRotation = new Quat();
+
+        for (const address of segmentAddresses) {
+          if (options.signal?.aborted) throw new DOMException('重光照 Gaussian 采样已取消。', 'AbortError');
+          if (activeRaw4D !== this.activeRaw4D || sequence !== this.gaussianSelectionSequence) {
+            throw new DOMException('场景已切换，逐帧 Mesh 生成已取消。', 'AbortError');
+          }
+          sampler.sample(address.localFrame);
+          const selected: number[] = [];
+          for (let start = 0; start < asset.splatCount; start += groupSize) {
+            let bestIndex = -1;
+            let bestScore = 0;
+            const end = Math.min(asset.splatCount, start + groupSize);
+            for (let index = start; index < end; index += 1) {
+              if (edits.isDeleted(index)) continue;
+              const opacity = properties.opacity[index];
+              const largestScale = Math.max(properties.scaleX[index], properties.scaleY[index], properties.scaleZ[index]);
+              const score = opacity * Math.sqrt(Math.max(0, largestScale));
+              if (opacity > 1e-4 && Number.isFinite(score) && score > bestScore
+                && Number.isFinite(properties.x[index]) && Number.isFinite(properties.y[index]) && Number.isFinite(properties.z[index])) {
+                bestScore = score;
+                bestIndex = index;
+              }
+            }
+            if (bestIndex >= 0) selected.push(bestIndex);
+          }
+          if (selected.length < 64) {
+            throw new Error(`时间轴第 ${address.globalFrame} 帧只有 ${selected.length} 个有效 Gaussian，无法稳定重建 Mesh。`);
+          }
+
+          const count = selected.length;
+          const positions = new Float32Array(count * 3);
+          const rotations = new Float32Array(count * 4);
+          const scales = new Float32Array(count * 3);
+          const colors = new Uint8Array(count * 4);
+          const opacities = new Float32Array(count);
+          const min = new Vec3(Infinity, Infinity, Infinity);
+          const max = new Vec3(-Infinity, -Infinity, -Infinity);
+          for (let outputIndex = 0; outputIndex < count; outputIndex += 1) {
+            const sourceIndex = selected[outputIndex];
+            sourceWorld.transformPoint(localPosition.set(
+              properties.x[sourceIndex], properties.y[sourceIndex], properties.z[sourceIndex],
+            ), worldPosition);
+            const positionOffset = outputIndex * 3;
+            positions[positionOffset] = worldPosition.x;
+            positions[positionOffset + 1] = worldPosition.y;
+            positions[positionOffset + 2] = worldPosition.z;
+            min.x = Math.min(min.x, worldPosition.x); min.y = Math.min(min.y, worldPosition.y); min.z = Math.min(min.z, worldPosition.z);
+            max.x = Math.max(max.x, worldPosition.x); max.y = Math.max(max.y, worldPosition.y); max.z = Math.max(max.z, worldPosition.z);
+            localRotation.set(
+              properties.rotationX[sourceIndex], properties.rotationY[sourceIndex],
+              properties.rotationZ[sourceIndex], properties.rotationW[sourceIndex],
+            );
+            worldRotation.mul2(sourceRotation, localRotation).normalize();
+            const rotationOffset = outputIndex * 4;
+            rotations[rotationOffset] = worldRotation.x;
+            rotations[rotationOffset + 1] = worldRotation.y;
+            rotations[rotationOffset + 2] = worldRotation.z;
+            rotations[rotationOffset + 3] = worldRotation.w;
+            scales[positionOffset] = Math.max(1e-7, properties.scaleX[sourceIndex] * uniformScale);
+            scales[positionOffset + 1] = Math.max(1e-7, properties.scaleY[sourceIndex] * uniformScale);
+            scales[positionOffset + 2] = Math.max(1e-7, properties.scaleZ[sourceIndex] * uniformScale);
+            const colorOffset = outputIndex * 4;
+            colors[colorOffset] = Math.round(Math.max(0, Math.min(1, 0.5 + properties.colorR[sourceIndex] * shC0)) * 255);
+            colors[colorOffset + 1] = Math.round(Math.max(0, Math.min(1, 0.5 + properties.colorG[sourceIndex] * shC0)) * 255);
+            colors[colorOffset + 2] = Math.round(Math.max(0, Math.min(1, 0.5 + properties.colorB[sourceIndex] * shC0)) * 255);
+            colors[colorOffset + 3] = 255;
+            opacities[outputIndex] = properties.opacity[sourceIndex];
+          }
+
+          const fallback = min.clone().add(max).mulScalar(0.5);
+          const focusSamples: GS2MeshVector3[] = [];
+          const focusStride = Math.max(1, Math.ceil(count / 30_000));
+          for (let index = 0; index < count; index += focusStride) {
+            focusSamples.push([positions[index * 3], positions[index * 3 + 1], positions[index * 3 + 2]]);
+          }
+          const focusEstimate = estimateGS2MeshFocus(
+            [cameraPosition.x, cameraPosition.y, cameraPosition.z],
+            [cameraForward.x, cameraForward.y, cameraForward.z],
+            focusSamples,
+            [fallback.x, fallback.y, fallback.z],
+          );
+          const focus = new Vec3(...focusEstimate.focus);
+          const cameraOffset: GS2MeshVector3 = [
+            cameraPosition.x - focus.x, cameraPosition.y - focus.y, cameraPosition.z - focus.z,
+          ];
+          const views: GS2MeshFieldView[] = [];
+          for (let viewIndex = 0; viewIndex < viewCount; viewIndex += 1) {
+            const offset = viewIndex === 0
+              ? cameraOffset
+              : rotateGS2MeshOffset(cameraOffset, [0, 1, 0], viewIndex * Math.PI * 2 / viewCount);
+            const position = new Vec3(focus.x + offset[0], focus.y + offset[1], focus.z + offset[2]);
+            if (viewIndex === 0) {
+              views.push({
+                position: [position.x, position.y, position.z],
+                right: [cameraRight.x, cameraRight.y, cameraRight.z],
+                up: [cameraUp.x, cameraUp.y, cameraUp.z],
+                forward: [cameraForward.x, cameraForward.y, cameraForward.z],
+                tanHalfFovX,
+                tanHalfFovY,
+              });
+            } else {
+              const forward = focus.clone().sub(position).normalize();
+              const upHint = Math.abs(forward.dot(Vec3.UP)) > 0.96 ? cameraUp.clone() : Vec3.UP;
+              const right = new Vec3().cross(forward, upHint).normalize();
+              const up = new Vec3().cross(right, forward).normalize();
+              views.push({
+                position: [position.x, position.y, position.z],
+                right: [right.x, right.y, right.z],
+                up: [up.x, up.y, up.z],
+                forward: [forward.x, forward.y, forward.z],
+                tanHalfFovX,
+                tanHalfFovY,
+              });
+            }
+          }
+          await visitor({
+            frame: address.globalFrame,
+            focus: focusEstimate.focus,
+            boundsMin: [min.x, min.y, min.z],
+            boundsMax: [max.x, max.y, max.z],
+            positions,
+            rotations,
+            scales,
+            colors,
+            opacities,
+            views,
+            fieldResolution: Math.max(48, Math.min(160, Math.round(options.fieldResolution))),
+            isoLevel: Math.max(0.08, Math.min(0.8, options.isoLevel)),
+            sceneUnitMillimeters,
+            targetVoxelMillimeters,
+            targetVoxelSize,
+            smoothingIterations: 0,
+          }, completed + 1, addresses.length);
+          completed += 1;
+          options.onProgress?.(completed, addresses.length);
+          await new Promise<void>((resolve) => setTimeout(resolve, 0));
+        }
+      } finally {
+        lease.release();
+      }
+    }
+  }
+
+  installRelightingMesh(data: GS2MeshData): GS2MeshSceneStats {
+    if (!this.app) throw new Error('三维视口尚未初始化完成。');
+    this.gs2MeshPersistentAcrossSegments = true;
+    const previous = this.gs2MeshObject;
+    const next = new GS2MeshSceneObject(this.app, data, this.activeRaw4D?.entity);
+    this.gs2MeshObject = next;
+    this.relighting?.setProxy(next);
+    previous?.destroy();
+    return next.stats;
+  }
+
+  // #WDD-gpt 2026-08-21 - 旧批量采集实现仅保留兼容，重光照运行路径已改用 streamRelightingMeshFrames。
+  async captureRelightingMeshFrames(options: RelightingMeshCaptureOptions): Promise<RelightingMeshCaptureResult> {
+    const raw4D = this.activeRaw4D;
+    const asset = this.activeRaw4DAsset;
+    const camera = this.camera;
+    if (!raw4D || !asset || !camera) throw new Error('请先完成 RAW4D 文件导入。');
+    if (camera.camera?.projection === PROJECTION_ORTHOGRAPHIC) {
+      throw new Error('重光照逐帧网格需要透视摄像机，请先切换回透视视图。');
+    }
+    const frameStart = Math.max(0, Math.min(asset.totalFrames - 1, Math.round(options.frameStart)));
+    const frameEnd = Math.max(frameStart, Math.min(asset.totalFrames - 1, Math.round(options.frameEnd)));
+    if (options.signal?.aborted) throw new DOMException('重光照 Gaussian 采样已取消。', 'AbortError');
+
+    const maximum = Math.max(10_000, Math.min(200_000, Math.round(options.maxGaussians)));
+    const sampler = new Raw4DFrameSampler(asset);
+    sampler.sample(frameStart);
+    const properties = sampler.properties;
+    const groupSize = Math.max(1, Math.ceil(asset.splatCount / maximum));
+    const selected: number[] = [];
+    for (let start = 0; start < asset.splatCount; start += groupSize) {
+      let bestIndex = -1;
+      let bestScore = 0;
+      const end = Math.min(asset.splatCount, start + groupSize);
+      for (let index = start; index < end; index += 1) {
+        if (raw4D.edits.isDeleted(index)) continue;
+        const opacity = properties.opacity[index];
+        const largestScale = Math.max(
+          properties.scaleX[index],
+          properties.scaleY[index],
+          properties.scaleZ[index],
+        );
+        const score = opacity * Math.sqrt(Math.max(0, largestScale));
+        if (opacity >= 0.035 && Number.isFinite(score) && score > bestScore) {
+          bestScore = score;
+          bestIndex = index;
+        }
+      }
+      if (bestIndex >= 0) selected.push(bestIndex);
+    }
+    if (selected.length < 64) throw new Error('canonical 帧没有足够的可见 Gaussian 用于逐帧网格转换。');
+
+    const count = selected.length;
+    const matrix = raw4D.entity.getWorldTransform();
+    const entityRotation = raw4D.entity.getRotation();
+    const entityScale = matrix.getScale(new Vec3());
+    const uniformScale = Math.max(
+      1e-6,
+      Math.abs(entityScale.x),
+      Math.abs(entityScale.y),
+      Math.abs(entityScale.z),
+    );
+    const localPosition = new Vec3();
+    const worldPosition = new Vec3();
+    const localRotation = new Quat();
+    const worldRotation = new Quat();
+    const min = new Vec3(Infinity, Infinity, Infinity);
+    const max = new Vec3(-Infinity, -Infinity, -Infinity);
+    const colors = new Uint8Array(count * 4);
+    const uids = new Float64Array(count);
+    const shC0 = 0.28209479177387814;
+    const frameIndices: number[] = [];
+    const frames: RelightingFrameGaussians[] = [];
+    const canonicalPositions = new Float32Array(count * 3);
+    const canonicalRotations = new Float32Array(count * 4);
+    const canonicalScales = new Float32Array(count * 3);
+    const canonicalOpacities = new Float32Array(count);
+
+    const writeFrameSample = (target: RelightingFrameGaussians | null, outputIndex: number) => {
+      const sourceIndex = selected[outputIndex];
+      matrix.transformPoint(localPosition.set(
+        properties.x[sourceIndex],
+        properties.y[sourceIndex],
+        properties.z[sourceIndex],
+      ), worldPosition);
+      const offset = outputIndex * 3;
+      if (target) {
+        target.positions[offset] = worldPosition.x;
+        target.positions[offset + 1] = worldPosition.y;
+        target.positions[offset + 2] = worldPosition.z;
+      } else {
+        canonicalPositions[offset] = worldPosition.x;
+        canonicalPositions[offset + 1] = worldPosition.y;
+        canonicalPositions[offset + 2] = worldPosition.z;
+        min.x = Math.min(min.x, worldPosition.x);
+        min.y = Math.min(min.y, worldPosition.y);
+        min.z = Math.min(min.z, worldPosition.z);
+        max.x = Math.max(max.x, worldPosition.x);
+        max.y = Math.max(max.y, worldPosition.y);
+        max.z = Math.max(max.z, worldPosition.z);
+      }
+      localRotation.set(
+        properties.rotationX[sourceIndex],
+        properties.rotationY[sourceIndex],
+        properties.rotationZ[sourceIndex],
+        properties.rotationW[sourceIndex],
+      );
+      worldRotation.mul2(entityRotation, localRotation).normalize();
+      const rotationOffset = outputIndex * 4;
+      const rotationTarget = target ? target.rotations : canonicalRotations;
+      rotationTarget[rotationOffset] = worldRotation.x;
+      rotationTarget[rotationOffset + 1] = worldRotation.y;
+      rotationTarget[rotationOffset + 2] = worldRotation.z;
+      rotationTarget[rotationOffset + 3] = worldRotation.w;
+      const scaleX = Math.max(1e-7, properties.scaleX[sourceIndex] * uniformScale);
+      const scaleY = Math.max(1e-7, properties.scaleY[sourceIndex] * uniformScale);
+      const scaleZ = Math.max(1e-7, properties.scaleZ[sourceIndex] * uniformScale);
+      const scaleTarget = target ? target.scales : canonicalScales;
+      scaleTarget[offset] = scaleX;
+      scaleTarget[offset + 1] = scaleY;
+      scaleTarget[offset + 2] = scaleZ;
+      if (target) {
+        target.opacities[outputIndex] = properties.opacity[sourceIndex];
+      } else {
+        canonicalOpacities[outputIndex] = properties.opacity[sourceIndex];
+        const colorOffset = outputIndex * 4;
+        colors[colorOffset] = Math.round(Math.max(0, Math.min(1, 0.5 + properties.colorR[sourceIndex] * shC0)) * 255);
+        colors[colorOffset + 1] = Math.round(Math.max(0, Math.min(1, 0.5 + properties.colorG[sourceIndex] * shC0)) * 255);
+        colors[colorOffset + 2] = Math.round(Math.max(0, Math.min(1, 0.5 + properties.colorB[sourceIndex] * shC0)) * 255);
+        colors[colorOffset + 3] = 255;
+        uids[outputIndex] = sourceIndex;
+      }
+    };
+
+    for (let outputIndex = 0; outputIndex < count; outputIndex += 1) writeFrameSample(null, outputIndex);
+    frames.push({ positions: canonicalPositions, rotations: canonicalRotations, scales: canonicalScales, opacities: canonicalOpacities });
+    // frameIndices 记录全局时间轴帧号（本地采样帧 + 偏移），供插件进度展示与 showFrame 匹配。
+    const frameIndexOffset = Number.isFinite(options.frameIndexOffset) ? Math.round(options.frameIndexOffset as number) : 0;
+    frameIndices.push(frameStart + frameIndexOffset);
+    for (let frame = frameStart + 1; frame <= frameEnd; frame += 1) {
+      if (options.signal?.aborted) throw new DOMException('重光照 Gaussian 采样已取消。', 'AbortError');
+      sampler.sample(frame);
+      const next: RelightingFrameGaussians = {
+        positions: new Float32Array(count * 3),
+        rotations: new Float32Array(count * 4),
+        scales: new Float32Array(count * 3),
+        opacities: new Float32Array(count),
+      };
+      for (let outputIndex = 0; outputIndex < count; outputIndex += 1) writeFrameSample(next, outputIndex);
+      frames.push(next);
+      frameIndices.push(frame + frameIndexOffset);
+      options.onProgress?.(frames.length, frameEnd - frameStart + 1);
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
+    options.onProgress?.(frames.length, frames.length);
+
+    // canonical 帧视角环：与 GS2Mesh 相同的焦点估计 + 环绕视角，仅构造参数不渲染截图。
+    const fallback = min.clone().add(max).mulScalar(0.5);
+    const focusSamples: GS2MeshVector3[] = [];
+    const focusStride = Math.max(1, Math.ceil(count / 30_000));
+    for (let index = 0; index < count; index += focusStride) {
+      focusSamples.push([canonicalPositions[index * 3], canonicalPositions[index * 3 + 1], canonicalPositions[index * 3 + 2]]);
+    }
+    const focusEstimate = estimateGS2MeshFocus(
+      [camera.getPosition().x, camera.getPosition().y, camera.getPosition().z],
+      [camera.forward.x, camera.forward.y, camera.forward.z],
+      focusSamples,
+      [fallback.x, fallback.y, fallback.z],
+    );
+    const focus = new Vec3(...focusEstimate.focus);
+    const cameraPosition = camera.getPosition();
+    const cameraOffset: GS2MeshVector3 = [
+      cameraPosition.x - focus.x,
+      cameraPosition.y - focus.y,
+      cameraPosition.z - focus.z,
+    ];
+    const viewCount = Math.max(4, Math.min(16, Math.round(options.viewCount)));
+    const captureWidth = Math.max(1, this.canvas.width);
+    const captureHeight = Math.max(1, this.canvas.height);
+    const intrinsics = perspectiveIntrinsics(
+      captureWidth,
+      captureHeight,
+      camera.camera?.fov ?? 60,
+      camera.camera?.horizontalFov ?? false,
+    );
+    const tanHalfFovX = captureWidth * 0.5 / intrinsics.fx;
+    const tanHalfFovY = captureHeight * 0.5 / intrinsics.fy;
+    const views: GS2MeshFieldView[] = [];
+    for (let index = 0; index < viewCount; index += 1) {
+      const offset = index === 0
+        ? cameraOffset
+        : rotateGS2MeshOffset(cameraOffset, [0, 1, 0], index * Math.PI * 2 / viewCount);
+      const position = new Vec3(focus.x + offset[0], focus.y + offset[1], focus.z + offset[2]);
+      if (index === 0) {
+        views.push({
+          position: [position.x, position.y, position.z],
+          right: [camera.right.x, camera.right.y, camera.right.z],
+          up: [camera.up.x, camera.up.y, camera.up.z],
+          forward: [camera.forward.x, camera.forward.y, camera.forward.z],
+          tanHalfFovX,
+          tanHalfFovY,
+        });
+        continue;
+      }
+      const forward = focus.clone().sub(position).normalize();
+      const upHint = Math.abs(forward.dot(Vec3.UP)) > 0.96 ? camera.up.clone() : Vec3.UP;
+      const right = new Vec3().cross(forward, upHint).normalize();
+      const up = new Vec3().cross(right, forward).normalize();
+      views.push({
+        position: [position.x, position.y, position.z],
+        right: [right.x, right.y, right.z],
+        up: [up.x, up.y, up.z],
+        forward: [forward.x, forward.y, forward.z],
+        tanHalfFovX,
+        tanHalfFovY,
+      });
+    }
+    const sceneUnitMillimeters = Number.isFinite(options.sceneUnitMillimeters)
+      ? Math.max(1e-3, Math.min(1_000_000, options.sceneUnitMillimeters))
+      : 1000;
+    const targetVoxelMillimeters = Number.isFinite(options.targetVoxelMillimeters)
+      ? Math.max(0.1, Math.min(20, options.targetVoxelMillimeters))
+      : 0.5;
+    const targetVoxelSize = Math.max(1e-7, Math.min(1, targetVoxelMillimeters / sceneUnitMillimeters));
+    return {
+      frameIndices,
+      frames,
+      uids,
+      colors,
+      canonical: {
+        frame: frameStart,
+        focus: focusEstimate.focus,
+        boundsMin: [min.x, min.y, min.z],
+        boundsMax: [max.x, max.y, max.z],
+        // #WDD-gpt 2026-08-21 - GS2Mesh Worker 会以 transfer 方式取得输入数组所有权；
+        // canonical 输入必须持有独立副本，否则转移后 frames[0] 在主线程脱管归零，绑定与传播全部失效。
+        positions: canonicalPositions.slice(),
+        rotations: canonicalRotations.slice(),
+        scales: canonicalScales.slice(),
+        colors: colors.slice(),
+        opacities: canonicalOpacities.slice(),
+        views,
+        fieldResolution: Math.max(48, Math.min(1024, Math.round(options.fieldResolution))),
+        isoLevel: Math.max(0.08, Math.min(0.8, options.isoLevel)),
+        sceneUnitMillimeters,
+        targetVoxelMillimeters,
+        targetVoxelSize,
+        smoothingIterations: Number.isFinite(options.smoothingIterations)
+          ? Math.max(0, Math.min(5, Math.round(options.smoothingIterations)))
+          : 3,
+      },
+    };
+  }
+
   clearGS2Mesh(): void {
     this.relighting?.setProxy(null);
     this.gs2MeshObject?.destroy();
     this.gs2MeshObject = null;
+    this.gs2MeshPersistentAcrossSegments = false;
+  }
+
+  // #WDD-gpt 2026-08-21 - 逐帧网格序列在既有 GS2Mesh 实体上原地更新几何，
+  // 重光照代理共享同一 Mesh 实例，光照随帧连续作用而无需重建实体。
+  updateGS2MeshGeometry(data: GS2MeshData): GS2MeshSceneStats | null {
+    const target = this.gs2MeshObject;
+    if (!target) return null;
+    const stats = target.updateFrameGeometry(data);
+    // #WDD-gpt 2026-08-21 - 顶点变化与 Gaussian 帧提交同批完成，并强制刷新代理阴影，避免沿用上一帧阴影造成阴阳脸。
+    this.relighting?.invalidateProxyLighting();
+    return stats;
   }
 
   setGS2MeshVisible(visible: boolean): void {
@@ -2417,6 +2946,7 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
     handle: ViewportResidentRaw4DSegment,
     onStatusChange: (status: ViewportStatus) => void,
     initialFrame = 0,
+    onDisplayed?: () => void,
   ): Promise<ViewportStatus> {
     const entry = this.residentRaw4DSegments.get(handle.residentId);
     if (!entry || entry.handle !== handle) throw new Error(`${handle.file.name} 已不在系统内存驻留池。`);
@@ -2454,7 +2984,7 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
     if (controller.signal.aborted || this.destroyRequested) {
       throw new DOMException('RAW4D 段落换入已取消。', 'AbortError');
     }
-    const status = this.activateResidentRaw4DGpuEntry(gpuEntry, targetIndex, initialFrame);
+    const status = this.activateResidentRaw4DGpuEntry(gpuEntry, targetIndex, initialFrame, onDisplayed);
     if (this.importController === controller) this.importController = null;
     this.scheduleRaw4DFuturePrefetch(targetIndex);
     return status;
@@ -2602,16 +3132,19 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
     gpuEntry: ResidentRaw4DGpuEntry,
     targetIndex: number,
     initialFrame: number,
+    onDisplayed?: () => void,
   ): ViewportStatus {
     const previous = this.activeRaw4D;
     if (previous && previous !== gpuEntry.raw4D) previous.entity.enabled = false;
+    // #WDD-gpt 2026-08-21 - 段切换直接落地目标帧；门槛状态属于旧段，先清空再换活跃实体。
+    this.strictSortGate.reset();
     gpuEntry.raw4D.setFrame(initialFrame);
     gpuEntry.raw4D.setAllMode(this.renderMode === 'all');
     gpuEntry.raw4D.setShBands(this.shLevel);
     gpuEntry.raw4D.entity.enabled = this.gaussianVisible;
     gpuEntry.lastUsed = ++this.raw4DGpuUseClock;
-    // #WDD-gpt 2026-08-16 - 切段不是新资产导入，保留覆盖多个片段的撤销栈。
-    this.clearGS2Mesh();
+    // #WDD-gpt 2026-08-21 - 普通“当前帧 Mesh”切段即失效；重光照逐帧序列已覆盖统一时间轴，切段时必须保留。
+    if (!this.gs2MeshPersistentAcrossSegments) this.clearGS2Mesh();
     this.activeRaw4D = gpuEntry.raw4D;
     this.activeRaw4DAsset = gpuEntry.resident.loaded.asset;
     this.activeRaw4DSource = gpuEntry.resident.handle.file;
@@ -2625,6 +3158,8 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
       phase: 'ready', scope: this.selectionScope, progress: 1,
       selectedCount: this.gaussianSelectedCount(this.selectionScope), hitCount: 0,
     });
+    // #WDD-gpt 2026-08-21 - 片段实体、目标帧、可见性和变换全部落地后才确认显示，防止播放循环提前推进下一帧。
+    onDisplayed?.();
     const asset = gpuEntry.resident.loaded.asset;
     return {
       phase: 'ready', renderer: this.rendererLabel, splatCount: asset.splatCount,
@@ -2821,6 +3356,8 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
     };
     // #WDD-gpt 2026-08-16 - 只有真正的新资产清空历史；序列切段继续沿用跨片段编辑命令。
     if (!this.gaussianSelectionSequence) this.history.clear();
+    // #WDD-gpt 2026-08-21 - 新资产接管渲染，旧门槛状态（属于被替换实体）整体作废。
+    this.strictSortGate.reset();
     this.activeRaw4D = raw4D;
     this.activeRaw4DAsset = residentAsset.value;
     this.activeRaw4DSource = loadedAsset.format === 'RAW4D' || loadedAsset.format === 'PLY4' ? file : null;

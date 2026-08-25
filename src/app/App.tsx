@@ -50,6 +50,11 @@ import {
 } from '../plugins/smart-alignment/SmartAlignmentTypes';
 import { GS2MeshPlugin } from '../plugins/gs2mesh/GS2MeshPlugin';
 import {
+  INITIAL_RELIGHTING_MESH_STATE,
+  RelightingMeshSequence,
+  type RelightingMeshState,
+} from '../plugins/relighting/RelightingMeshSequence';
+import {
   INITIAL_GS2MESH_STATE,
   type GS2MeshOptions,
   type GS2MeshState,
@@ -57,6 +62,7 @@ import {
 import {
   reconcileRelightingWorkflowStep,
   RelightingWorkflowPanel,
+  type RelightingMeshStatus,
   type RelightingWorkflowStep,
 } from '../plugins/relighting/RelightingWorkflowPanel';
 import {
@@ -458,6 +464,8 @@ export function App() {
   const [frameReadyRequestId, setFrameReadyRequestId] = useState(0);
   // #WDD-gpt 2026-08-16 - 播放速率独立于文件元数据并默认 30 FPS，允许用户按检查需求降速或加速。
   const [playbackFps, setPlaybackFps] = useState(30);
+  // #WDD-gpt 2026-08-21 - 强制排序：新帧必须等 CPU 深度排序提交后再渲染，随工作区草稿持久化。
+  const [forceSortSync, setForceSortSync] = useState(false);
   const [renderMode, setRenderMode] = useState<GaussianRenderMode>('gaussian');
   // #WDD-gpt 2026-08-19 - 手机首屏默认 SH0，先保证低功耗 GPU 稳定出图；用户仍可在渲染栏手动提高级别。
   const [shLevel, setShLevel] = useState(initialRuntimeProfile.name === 'mobile-compatible' ? 0 : 3);
@@ -474,6 +482,7 @@ export function App() {
   const [viewportRuntime, setViewportRuntime] = useState<ViewportRuntime | null>(null);
   const [smartAlignmentState, setSmartAlignmentState] = useState<SmartAlignmentState>(INITIAL_SMART_ALIGNMENT_STATE);
   const [gs2MeshState, setGS2MeshState] = useState<GS2MeshState>(INITIAL_GS2MESH_STATE);
+  const [relightMeshState, setRelightMeshState] = useState<RelightingMeshState>(INITIAL_RELIGHTING_MESH_STATE);
   const [relightingState, setRelightingState] = useState<RelightingState>(INITIAL_RELIGHTING_STATE);
   const [relightingWorkflowStep, setRelightingWorkflowStep] = useState<RelightingWorkflowStep>('mesh');
   const [gs2MeshVisible, setGS2MeshVisible] = useState(true);
@@ -527,11 +536,18 @@ export function App() {
   const workspaceSaveBusyRef = useRef(false);
   const loopRestartPendingRef = useRef(false);
   const loopRestartRequestIdRef = useRef(0);
+  const pendingDisplayedFrameRef = useRef<{
+    readonly frame: number;
+    readonly timeoutId: number;
+    readonly resolve: (displayed: boolean) => void;
+  } | null>(null);
   const restoredWorkspaceSignatureRef = useRef<string | null>(null);
   const smartAlignmentPluginRef = useRef<SmartAlignmentPlugin | null>(null);
   const gs2MeshPluginRef = useRef<GS2MeshPlugin | null>(null);
+  const relightMeshRef = useRef<RelightingMeshSequence | null>(null);
   if (!smartAlignmentPluginRef.current) smartAlignmentPluginRef.current = new SmartAlignmentPlugin();
   if (!gs2MeshPluginRef.current) gs2MeshPluginRef.current = new GS2MeshPlugin();
+  if (!relightMeshRef.current) relightMeshRef.current = new RelightingMeshSequence();
   const memoryPolicy = useMemo(
     () => createGaussian4DMemoryPolicy(memoryMode, customCpuGiB, customGpuGiB),
     [customCpuGiB, customGpuGiB, memoryMode],
@@ -669,7 +685,7 @@ export function App() {
     && sceneTransform.rotation.every((value) => Math.abs(value) <= 1e-8)
     && sceneTransform.scale.every((value) => Math.abs(value - 1) <= 1e-8);
   const sceneRotationIsIdentity = sceneTransform.rotation.every((value) => Math.abs(value) <= 1e-8);
-  const hasGS2Mesh = gs2MeshState.stage === 'success';
+  const hasGS2Mesh = gs2MeshState.stage === 'success' || relightMeshState.stage === 'success';
   const statusDeletedCount = selectionState.deletedCount ?? 0;
   const statusActiveCount = Math.max(0, (selectionState.pointCount ?? status.splatCount) - statusDeletedCount);
   const statusCurrentFrameDisplayedCount = selectionState.currentFrameDisplayedCount
@@ -708,9 +724,9 @@ export function App() {
       : smartAlignmentState.stage === 'error'
         ? 'error'
         : smartAlignmentState.stage === 'idle' ? 'idle' : 'running',
-    relighting: relightingState.error || gs2MeshState.stage === 'error'
+    relighting: relightingState.error || gs2MeshState.stage === 'error' || relightMeshState.stage === 'error'
       ? 'error'
-      : ['capturing', 'matching', 'fusing', 'installing'].includes(gs2MeshState.stage)
+      : ['capturing', 'matching', 'fusing', 'installing'].includes(gs2MeshState.stage) || ['capturing', 'rebuilding'].includes(relightMeshState.stage)
         ? 'running'
         : relightingState.enabled ? 'success' : 'idle',
     'model-health': modelHealthBusy ? 'running' : modelHealthReport?.healthy ? 'success' : modelHealthReport ? 'error' : 'idle',
@@ -721,6 +737,7 @@ export function App() {
     exportAbortRef.current?.abort();
     smartAlignmentPluginRef.current?.dispose();
     gs2MeshPluginRef.current?.dispose();
+    relightMeshRef.current?.dispose();
   }, []);
 
   useEffect(() => {
@@ -765,6 +782,7 @@ export function App() {
       setSceneName(workspaceDraft.sceneName);
       setCurrentFrame(Math.max(0, Math.min(timelineEndFrame, workspaceDraft.view.currentFrame)));
       setPlaybackFps(workspaceDraft.view.playbackFps);
+      setForceSortSync(workspaceDraft.view.forceSortSync ?? false);
       setRenderMode(workspaceDraft.view.renderMode);
       setShLevel(workspaceDraft.view.shLevel);
       setShowGrid(workspaceDraft.view.showGrid);
@@ -802,6 +820,7 @@ export function App() {
           camera: viewportRuntime.getCameraState(),
           cameraBookmarks,
           currentFrame,
+          forceSortSync,
           gaussianVisible,
           gs2MeshVisible,
           inspectorTab,
@@ -827,7 +846,7 @@ export function App() {
     }, 900);
     return () => window.clearTimeout(timeout);
   }, [
-    cameraBookmarks, currentFrame, displaySceneName, gaussianVisible, gs2MeshVisible, inspectorTab,
+    cameraBookmarks, currentFrame, displaySceneName, forceSortSync, gaussianVisible, gs2MeshVisible, inspectorTab,
     playbackFps, renderMode, sceneTransform, selectionState.deletedCount, selectionState.selectedCount,
     shLevel, showAxes, showGaussianEnvelope, showGrid, showHeightRuler, sourceFiles, status.bufferId,
     status.phase, viewportRuntime, workspaceSaveTick,
@@ -854,12 +873,30 @@ export function App() {
     const previousStage = previousGS2MeshStageRef.current;
     previousGS2MeshStageRef.current = gs2MeshState.stage;
     // #WDD-gpt 2026-08-17 - Step 1 首次成功后自动进入布光；Mesh 被清除或重建时退回 Step 1。
+    const toStatus = (stage: GS2MeshState['stage']): RelightingMeshStatus => stage === 'success'
+      ? 'success'
+      : stage === 'error' ? 'error' : stage === 'idle' || stage === 'cancelled' ? 'idle' : 'running';
     setRelightingWorkflowStep((current) => reconcileRelightingWorkflowStep(
       current,
-      previousStage,
-      gs2MeshState.stage,
+      toStatus(previousStage),
+      toStatus(gs2MeshState.stage),
     ));
   }, [gs2MeshState.stage]);
+
+  // #WDD-gpt 2026-08-21 - 逐帧网格序列的 Step 1 状态与单帧 GS2Mesh 共用同一推进规则。
+  const previousRelightMeshStageRef = useRef<RelightingMeshState['stage']>(relightMeshState.stage);
+  useEffect(() => {
+    const previousStage = previousRelightMeshStageRef.current;
+    previousRelightMeshStageRef.current = relightMeshState.stage;
+    const toStatus = (stage: RelightingMeshState['stage']): RelightingMeshStatus => stage === 'success'
+      ? 'success'
+      : stage === 'error' ? 'error' : stage === 'idle' || stage === 'cancelled' ? 'idle' : 'running';
+    setRelightingWorkflowStep((current) => reconcileRelightingWorkflowStep(
+      current,
+      toStatus(previousStage),
+      toStatus(relightMeshState.stage),
+    ));
+  }, [relightMeshState.stage]);
 
   useEffect(() => {
     if (status.phase !== 'ready') return;
@@ -924,9 +961,63 @@ export function App() {
       setIsPlaying(false);
       return;
     }
+    const frameCount = timelineEndFrame + 1;
+    if (forceSortSync) {
+      // #WDD-gpt 2026-08-21 - 强制排序播放：等引擎确认当前帧排序提交后再推进下一帧；
+      // 排序吞吐不足时播放自动降速，而不是带过期顺序渲染，循环回绕也天然被同一门槛约束。
+      let stopped = false;
+      let frame = currentFrame;
+      const step = async () => {
+        while (!stopped) {
+          const next = frame + 1;
+          if (!isLooping && next >= frameCount) {
+            setCurrentFrame(timelineEndFrame);
+            setIsPlaying(false);
+            return;
+          }
+          frame = isLooping ? next % frameCount : next;
+          const frameStartedAt = performance.now();
+          // #WDD-gpt 2026-08-21 - 必须先登记目标再 setState，等待 GaussianViewport 回报该帧已真实提交；
+          // 旧实现直接监听任意 frame:ready，常在 React 尚未提交目标帧前就误判完成，导致时间轴/代理独走。
+          const displayed = new Promise<boolean>((resolve) => {
+            const previous = pendingDisplayedFrameRef.current;
+            if (previous) {
+              window.clearTimeout(previous.timeoutId);
+              previous.resolve(false);
+            }
+            const timeoutId = window.setTimeout(() => {
+              const pending = pendingDisplayedFrameRef.current;
+              if (!pending || pending.frame !== frame) return;
+              pendingDisplayedFrameRef.current = null;
+              resolve(false);
+            }, 4_000);
+            pendingDisplayedFrameRef.current = { frame, timeoutId, resolve };
+          });
+          setCurrentFrame((current) => current === frame ? current : frame);
+          const committed = await displayed;
+          if (stopped) return;
+          if (!committed) {
+            setIsPlaying(false);
+            return;
+          }
+          const remainingFrameBudgetMs = 1000 / playbackFps - (performance.now() - frameStartedAt);
+          if (remainingFrameBudgetMs > 0) {
+            await new Promise((resolve) => window.setTimeout(resolve, remainingFrameBudgetMs));
+          }
+        }
+      };
+      void step();
+      return () => {
+        stopped = true;
+        const pending = pendingDisplayedFrameRef.current;
+        if (!pending) return;
+        window.clearTimeout(pending.timeoutId);
+        pendingDisplayedFrameRef.current = null;
+        pending.resolve(false);
+      };
+    }
     const startTime = performance.now();
     const startFrame = currentFrame;
-    const frameCount = timelineEndFrame + 1;
     let animationFrame = 0;
     // #WDD-gpt 2026-08-14 - 使用真实时间驱动播放，避免定时器积压导致 RAW4D 越播越卡。
     const updatePlayback = (now: number) => {
@@ -954,7 +1045,7 @@ export function App() {
     };
     animationFrame = window.requestAnimationFrame(updatePlayback);
     return () => window.cancelAnimationFrame(animationFrame);
-  }, [isLooping, isPlaying, playbackFps, timelineEndFrame]);
+  }, [forceSortSync, isLooping, isPlaying, playbackFps, timelineEndFrame]);
 
   useEffect(() => {
     setCurrentFrame((frame) => Math.min(frame, timelineEndFrame));
@@ -1033,6 +1124,43 @@ export function App() {
     viewportRuntime.setGS2MeshVisible(true);
     void gs2MeshPluginRef.current?.reconstruct(viewportRuntime, options, setGS2MeshState);
   };
+
+  // #WDD-gpt 2026-08-21 - 帧范围直接使用统一时间轴；Runtime 负责跨片段寻址，避免只计算活动片段。
+  const runRelightingMeshSequence = (
+    frameStart: number,
+    frameEnd: number,
+    isoLevel: number,
+    maxGaussians: number,
+    fieldResolution: number,
+  ) => {
+    if (!viewportRuntime || transformDisabled) return;
+    setIsPlaying(false);
+    void relightMeshRef.current?.generate(viewportRuntime, {
+      frameStart,
+      frameEnd,
+      isoLevel,
+      maxGaussians,
+      fieldResolution,
+    }, setRelightMeshState);
+  };
+
+  const showDisplayedRelightingFrame = useCallback((frame: number) => {
+    const pending = pendingDisplayedFrameRef.current;
+    if (pending?.frame === frame) {
+      window.clearTimeout(pending.timeoutId);
+      pendingDisplayedFrameRef.current = null;
+      pending.resolve(true);
+    }
+    if (viewportRuntime && relightMeshRef.current?.isReady) {
+      relightMeshRef.current.showFrame(viewportRuntime, frame);
+    }
+  }, [viewportRuntime]);
+
+  useEffect(() => {
+    if (relightMeshState.stage !== 'success') return;
+    // #WDD-gpt 2026-08-21 - 生成完成只校准一次；后续播放只能由 ViewportRuntime 的真实显示提交驱动，禁止目标时间轴提前换 Mesh。
+    showDisplayedRelightingFrame(currentFrame);
+  }, [relightMeshState.stage, showDisplayedRelightingFrame]);
 
   const clearGS2Mesh = () => {
     if (!viewportRuntime) return;
@@ -2150,8 +2278,10 @@ export function App() {
             activeTool={activeTool}
             brushRadius={selectionBrushRadius}
             currentFrame={currentFrame}
+            forceSortSync={forceSortSync}
             frameReadyRequestId={frameReadyRequestId}
             memoryPolicy={memoryPolicy}
+            onFrameDisplayed={showDisplayedRelightingFrame}
             onFrameRenderReady={handleFrameRenderReady}
             onHistoryChange={setHistoryState}
             onCameraBookmarksChange={setCameraBookmarks}
@@ -2560,6 +2690,19 @@ export function App() {
               <section aria-labelledby="inspector-tab-performance" className="inspector-section memory-settings" id="inspector-panel-performance" role="tabpanel">
                 <h3><Icon name="chevron" size={13} />{copy.memoryAndVram}</h3>
                 <PerformanceDiagnosticsPanel snapshot={performanceSnapshot} />
+                {/* #WDD-gpt 2026-08-21 - 强制排序开关随 IndexedDB 工作区草稿持久化，播放与拖帧都必须等排序提交。 */}
+                <div className="scale-link-row force-sort-toggle-row">
+                  <span>{copy.forceSortSync}</span>
+                  <button
+                    aria-label={copy.forceSortSyncTip}
+                    aria-pressed={forceSortSync}
+                    className={forceSortSync ? 'scale-link active has-tip' : 'scale-link has-tip'}
+                    data-tip={copy.forceSortSyncTip}
+                    onClick={() => setForceSortSync((enabled) => !enabled)}
+                    type="button"
+                  >{forceSortSync ? '●' : '○'}</button>
+                </div>
+                {forceSortSync && <p className="memory-auto-note">{copy.forceSortSyncActiveNote}</p>}
                 <label className="memory-mode-field">
                   <span>{copy.budgetMode}</span>
                   <select
@@ -2655,19 +2798,13 @@ export function App() {
                 )}
                 {activePlugin === 'relighting' && (
                   <RelightingWorkflowPanel
-                    gs2mesh={{
-                      canExport: gs2MeshPluginRef.current?.canExport ?? false,
+                    mesh={{
                       disabled: transformDisabled,
-                      gaussianVisible,
                       language,
-                      meshVisible: gs2MeshVisible,
-                      onCancel: () => gs2MeshPluginRef.current?.cancel(),
-                      onClear: clearGS2Mesh,
-                      onExport: exportGS2Mesh,
-                      onGaussianVisibleChange: changeGaussianVisible,
-                      onMeshVisibleChange: changeGS2MeshVisible,
-                      onRun: runGS2Mesh,
-                      state: gs2MeshState,
+                      onCancel: () => relightMeshRef.current?.cancel(),
+                      onRun: runRelightingMeshSequence,
+                      state: relightMeshState,
+                      totalFrames: status.totalFrames ?? 0,
                     }}
                     language={language}
                     onStepChange={setRelightingWorkflowStep}

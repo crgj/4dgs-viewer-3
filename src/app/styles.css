@@ -1425,7 +1425,8 @@ input:focus-visible {
 }
 
 .plugin-workspace-relighting {
-  width: min(590px, calc(100vw - 48px));
+  /* #WDD-gpt 2026-08-21 - 重光照包含两步参数与运行指标，扩大工作宽度，避免标题、输入和状态互相挤压。 */
+  width: min(720px, calc(100vw - 48px));
 }
 
 .plugin-workspace-heading {

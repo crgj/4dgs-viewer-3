@@ -12,7 +12,7 @@ const COPY = {
     title: 'Gaussian 重光照',
     local: 'GS2Mesh 代理 · 屏幕空间传递 · 纯前端',
     description: '用 GS2Mesh 的表面与法线承接点光源和阴影，再逐像素调制 Gaussian；原始颜色与透明度保持不变。',
-    missingMesh: '请先返回 Step 1 生成当前帧 Mesh。',
+    missingMesh: '请先返回 Step 1 生成逐帧 Mesh 代理。',
     ready: 'Mesh 代理已就绪。启用后可在视口拖动所选光源。',
     enabled: '启用重光照',
     meshVisible: '显示 Mesh',
@@ -35,7 +35,7 @@ const COPY = {
     title: 'Gaussian Relighting',
     local: 'GS2Mesh proxy · screen-space transfer · frontend only',
     description: 'Light the GS2Mesh surface and normals with point lights and shadows, then modulate Gaussian pixels without changing source color or opacity.',
-    missingMesh: 'Return to Step 1 and generate the current-frame mesh first.',
+    missingMesh: 'Return to Step 1 and build the per-frame mesh proxies first.',
     ready: 'The mesh proxy is ready. Enable relighting, then drag the selected light in the viewport.',
     enabled: 'Enable relighting',
     meshVisible: 'Show mesh',
@@ -56,7 +56,7 @@ const COPY = {
   },
 } as const;
 
-interface RelightingPanelProps {
+export interface RelightingPanelProps {
   readonly hasMesh: boolean;
   readonly language: UiLanguage;
   readonly meshVisible: boolean;
@@ -100,25 +100,16 @@ export function RelightingPanel({
         <span>{hasMesh ? copy.ready : copy.missingMesh}</span>
       </div>
 
-      <label className="relighting-master-toggle">
-        <span><strong>{copy.enabled}</strong><small>{state.enabled ? 'ON' : 'OFF'}</small></span>
-        <input
-          checked={state.enabled}
-          disabled={!hasMesh}
-          onChange={(event) => onEnabledChange(event.target.checked)}
-          type="checkbox"
-        />
-      </label>
-
-      <label className="relighting-master-toggle">
-        <span><strong>{copy.meshVisible}</strong><small>{meshVisible ? 'ON' : 'OFF'}</small></span>
-        <input
-          checked={meshVisible}
-          disabled={!hasMesh}
-          onChange={(event) => onMeshVisibleChange(event.target.checked)}
-          type="checkbox"
-        />
-      </label>
+      <div className="relighting-master-row">
+        <label className="relighting-master-toggle">
+          <span><strong>{copy.enabled}</strong><small>{state.enabled ? 'ON' : 'OFF'}</small></span>
+          <input checked={state.enabled} disabled={!hasMesh} onChange={(event) => onEnabledChange(event.target.checked)} type="checkbox" />
+        </label>
+        <label className="relighting-master-toggle">
+          <span><strong>{copy.meshVisible}</strong><small>{meshVisible ? 'ON' : 'OFF'}</small></span>
+          <input checked={meshVisible} disabled={!hasMesh} onChange={(event) => onMeshVisibleChange(event.target.checked)} type="checkbox" />
+        </label>
+      </div>
 
       <div className="relighting-settings-grid">
         <label>

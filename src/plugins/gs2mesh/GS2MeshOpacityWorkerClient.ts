@@ -26,6 +26,7 @@ interface PendingOpacityReconstruction {
   readonly fieldResolution: number;
   readonly targetVoxelMillimeters?: number;
   readonly input: GS2MeshGaussianFieldInput;
+  readonly perFrameDenseOnly: boolean;
   submitted: boolean;
   workerStarted: boolean;
 }
@@ -51,6 +52,7 @@ export class GS2MeshOpacityWorkerClient {
     signal: AbortSignal,
     onProgress: (stage: GS2MeshOpacityWorkerStage, progress: number) => void,
     onPreview: (data: GS2MeshData, backend: string, elapsedMs: number) => void,
+    options: { readonly perFrameDenseOnly?: boolean } = {},
   ): Promise<GS2MeshOpacityReconstruction> {
     if (this.pending) return Promise.reject(new Error('GS2Mesh opacity reconstruction is already running.'));
     if (signal.aborted) return Promise.reject(new DOMException('GS2Mesh reconstruction was cancelled.', 'AbortError'));
@@ -78,6 +80,7 @@ export class GS2MeshOpacityWorkerClient {
         fieldResolution: input.fieldResolution,
         targetVoxelMillimeters: input.targetVoxelMillimeters,
         input,
+        perFrameDenseOnly: options.perFrameDenseOnly === true,
         submitted: false,
         workerStarted: false,
       };
@@ -164,7 +167,12 @@ export class GS2MeshOpacityWorkerClient {
     pending.submitted = true;
     pending.workerStarted = true;
     const { input } = pending;
-    const request: GS2MeshOpacityWorkerRequest = { type: 'reconstruct-opacity', requestId: pending.requestId, input };
+      const request: GS2MeshOpacityWorkerRequest = {
+        type: 'reconstruct-opacity',
+        requestId: pending.requestId,
+        input,
+        perFrameDenseOnly: pending.perFrameDenseOnly,
+      };
     // #WDD-gpt 2026-08-15 - 将当前帧参数所有权直接转交 Worker，避免复制数十万 Gaussian 数组。
     try {
       worker.postMessage(request, [

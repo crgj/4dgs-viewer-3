@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { orientNormalsOutward } from './GS2MeshSceneObject';
+import { meshBoundaryEdgeRatio, orientNormalsOutward } from './GS2MeshSceneObject';
 
 const positions = Float32Array.from([
   1, 0, 0,
@@ -44,5 +44,26 @@ describe('GS2Mesh relighting normals', () => {
     expect(oriented[0]).toBeCloseTo(-1 / Math.sqrt(3));
     expect(oriented[1]).toBeCloseTo(-1 / Math.sqrt(3));
     expect(oriented[2]).toBeCloseTo(-1 / Math.sqrt(3));
+    expect(meshBoundaryEdgeRatio(inwardIndices)).toBe(0);
+  });
+
+  it('does not trust signed volume for an open mesh', () => {
+    const openPositions = Float32Array.from([
+      -1, -1, 1,
+      1, -1, 1,
+      1, 1, 1,
+      -1, 1, 1,
+      0, 0, 0,
+    ]);
+    const openIndices = Uint32Array.from([0, 1, 4, 1, 2, 4, 2, 3, 4]);
+    const outward = Float32Array.from([
+      0, 0, 1,
+      0, 0, 1,
+      0, 0, 1,
+      0, 0, 1,
+      0, 0, 1,
+    ]);
+    expect(meshBoundaryEdgeRatio(openIndices)).toBeGreaterThan(0.001);
+    expect(orientNormalsOutward(openPositions, outward, openIndices)).toBe(outward);
   });
 });

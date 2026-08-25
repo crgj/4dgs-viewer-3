@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import { syncRelightingCameraProjection } from './GaussianRelightingController';
+import {
+  markRelightingShadowMapsDirty,
+  syncRelightingCameraProjection,
+} from './GaussianRelightingController';
 
 describe('GaussianRelightingController projection sync', () => {
   it('copies horizontal FOV and the full projection state to the offscreen camera', () => {
@@ -24,5 +27,15 @@ describe('GaussianRelightingController projection sync', () => {
     syncRelightingCameraProjection(source, target);
     // #WDD-gpt 2026-08-16 - A vertical-FOV proxy camera projects a different mesh footprint in wide viewports and makes splats sample unrelated lighting pixels.
     expect(target).toEqual(source);
+  });
+});
+
+describe('GaussianRelightingController shadow refresh', () => {
+  it('marks every active shadow map for the same frame after proxy geometry changes', () => {
+    const first = { light: { shadowUpdateMode: 0 } };
+    const second = { light: { shadowUpdateMode: 0 } };
+    expect(markRelightingShadowMapsDirty([first, {}, second], 17)).toBe(2);
+    expect(first.light.shadowUpdateMode).toBe(17);
+    expect(second.light.shadowUpdateMode).toBe(17);
   });
 });

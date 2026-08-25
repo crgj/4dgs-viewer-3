@@ -19,6 +19,8 @@ export interface WorkspaceViewState {
   readonly camera: ViewportCameraState | null;
   readonly cameraBookmarks: readonly (ViewportCameraState | null)[];
   readonly currentFrame: number;
+  /** 强制排序（播放帧必须等待排序提交）；旧草稿缺省视为关闭。 */
+  readonly forceSortSync?: boolean;
   readonly gaussianVisible: boolean;
   readonly gs2MeshVisible: boolean;
   readonly inspectorTab: 'scene' | 'transform' | 'gaussian' | 'performance';

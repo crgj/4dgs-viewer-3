@@ -1342,14 +1342,34 @@ export class Raw4DGpuPlayback {
     this.selectionTexture.unlock();
   }
 
-  setFrame(requestedFrame: number): void {
-    if (this.disposed) return;
+  // #WDD-gpt 2026-08-21 - 强制排序模式把“准备帧”与“显示帧”拆开：prepare 上传关键帧并刷新排序中心
+  // （centersVersion 变化即触发引擎新版本排序），reveal 只切换 dongRaw4dFrame，等排序提交后再显示。
+  prepareFrame(requestedFrame: number): number {
     const frame = Math.min(this.asset.totalFrames - 1, Math.max(0, requestedFrame));
+    if (this.disposed) return frame;
     this.ensureStorageFrame(frame);
     this.ensureStreamingTextureFrame(frame);
-    const component = this.entity.gsplat!;
-    component.setParameter('dongRaw4dFrame', frame);
+    this.refreshSortCenters(frame);
+    const component = this.entity.gsplat;
+    if (component) component.workBufferUpdate = WORKBUFFER_UPDATE_ONCE;
+    return frame;
+  }
+
+  revealFrame(frame: number): void {
+    if (this.disposed) return;
+    const component = this.entity.gsplat;
+    if (!component) return;
+    component.setParameter('dongRaw4dFrame', Math.min(this.asset.totalFrames - 1, Math.max(0, frame)));
     component.workBufferUpdate = WORKBUFFER_UPDATE_ONCE;
+  }
+
+  setFrame(requestedFrame: number): void {
+    if (this.disposed) return;
+    const frame = this.prepareFrame(requestedFrame);
+    this.revealFrame(frame);
+  }
+
+  private refreshSortCenters(frame: number): void {
     if (this.resource.centers && this.sampler && raw4DSortCentersNeedRefresh(frame, this.lastCenterFrame)) {
       this.sampler.samplePosition(frame);
       const { x, y, z } = this.sampler.properties;

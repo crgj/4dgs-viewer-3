@@ -52,6 +52,10 @@ export interface Raw4DGaussian {
   setAllMode(enabled: boolean): void;
   setShBands(level: number): number;
   refreshSourceData(): Promise<void>;
+  /** 强制排序路径：只上传数据并刷新排序中心，不切换显示帧。返回钳制后的帧号。 */
+  prepareFrame(frame: number): number;
+  /** 强制排序路径：排序提交后切换显示帧 uniform。 */
+  revealFrame(frame: number): void;
   setFrame(frame: number): void;
   dispose(): void;
 }
@@ -121,6 +125,14 @@ export async function createRaw4DGaussian(
       if (disposed) return;
       currentFrame = frame;
       gpuPlayback.setFrame(frame);
+    },
+    prepareFrame: (frame: number) => {
+      currentFrame = frame;
+      return gpuPlayback.prepareFrame(frame);
+    },
+    revealFrame: (frame: number) => {
+      currentFrame = frame;
+      gpuPlayback.revealFrame(frame);
     },
     refreshSourceData: async () => {
       if (disposed) return;
