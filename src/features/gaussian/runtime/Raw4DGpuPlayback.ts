@@ -362,9 +362,10 @@ fn dongIsNegativeInfinity(value: f32) -> bool {
 fn dongInterpolateExtended(left: f32, right: f32, alpha: f32) -> f32 {
     if (alpha <= 0.0 || left == right) { return left; }
     if (alpha >= 1.0) { return right; }
-    if (dongIsNegativeInfinity(left) || dongIsNegativeInfinity(right)) {
-        return bitcast<f32>(0xff800000u);
-    }
+    // #WDD-gpt 2026-08-25 - Preserve the source -Infinity bit pattern without constructing an
+    // abstract WGSL constant that strict Tint validators reject as unrepresentable f32.
+    if (dongIsNegativeInfinity(left)) { return left; }
+    if (dongIsNegativeInfinity(right)) { return right; }
     return mix(left, right, alpha);
 }
 
@@ -445,10 +446,14 @@ fn modifySplatColor(center: vec3f, color: ptr<function, vec4f>) {
     );
     let deleted = textureLoad(dongRaw4dDeleteMaskTex, dongTextureUv(splat.index), 0).x;
     let selected = textureLoad(dongRaw4dSelectionMaskTex, dongTextureUv(splat.index), 0).x;
-    (*color).rgb = mix((*color).rgb, vec3f(1.0, 0.58, 0.08), step(0.5, selected) * 0.82);
     let alive = 1.0 - step(0.5, deleted);
     let visibleAlpha = dongSigmoid(opacityLogit) * gate * alive;
-    (*color).a = mix(visibleAlpha, 0.82 * alive, step(0.5, uniform.dongRaw4dAllMode));
+    let currentColor = *color;
+    let selectedColor = mix(currentColor.rgb, vec3f(1.0, 0.58, 0.08), step(0.5, selected) * 0.82);
+    let outputAlpha = mix(visibleAlpha, 0.82 * alive, step(0.5, uniform.dongRaw4dAllMode));
+    // #WDD-gpt 2026-08-25 - Use a whole-vector store for the same strict WGSL compatibility
+    // required by the render-mode fragment chunks; pointer-dereference swizzles are not portable lvalues.
+    *color = vec4f(selectedColor, outputAlpha);
 }
 `;
 

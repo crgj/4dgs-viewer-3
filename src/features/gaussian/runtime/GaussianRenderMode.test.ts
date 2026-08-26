@@ -70,6 +70,10 @@ describe('GaussianRenderMode', () => {
     expect(material.shaderChunks.wgsl.get('gsplatModifyVS')).not.toContain('currentColor.a >= 0.0039215686');
     expect(material.shaderChunks.glsl.get('gsplatModifyPS')).toContain('color.a = pointEdge');
     expect(material.shaderChunks.glsl.get('gsplatModifyPS')).toContain('centerDot');
+    // #WDD-gpt 2026-08-25 - WebGPU chunks must assign the pointer target as a complete vec4;
+    // Chromium/Tint variants disagree on writable swizzles after pointer dereference.
+    expect(material.shaderChunks.wgsl.get('gsplatModifyPS')).not.toMatch(/\(\*color\)\.(?:rgb|a)\s*=/);
+    expect(material.shaderChunks.wgsl.get('gsplatModifyPS')).toContain('*color = vec4f(mix(currentColor.rgb');
     expect(material.shaderChunks.glsl.get('gsplatModifyPS')).toContain('color.a = 1.0 - smoothstep(0.70, 0.96, radialDistance)');
     expect(material.shaderChunks.glsl.get('gsplatPS')).toContain('exp(-dongGsplatKernelExponent * A)');
     expect(material.shaderChunks.glsl.get('gsplatCornerVS')).toContain('3.33 * min(sqrt(lambda1), vmin)');
@@ -115,6 +119,7 @@ describe('GaussianRenderMode', () => {
     expect(material.shaderChunks.wgsl.get('gsplatModifyPS')).toContain('displayLighting');
     expect(material.shaderChunks.wgsl.get('gsplatModifyPS')).toContain('log2(vec3f(1.0) + hdrLighting)');
     expect(material.shaderChunks.wgsl.get('gsplatModifyPS')).toContain('boundedRelitColor');
+    expect(material.shaderChunks.wgsl.get('gsplatModifyPS')).not.toMatch(/\(\*color\)\.(?:rgb|a)\s*=/);
 
     setGaussianRelightingShader(app, false);
     expect(material.shaderChunks.glsl.get('gsplatModifyPS')).not.toContain('uRelightMap');

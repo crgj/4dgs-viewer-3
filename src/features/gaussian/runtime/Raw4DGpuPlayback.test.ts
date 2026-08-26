@@ -35,6 +35,12 @@ describe('RAW4D storage playback shader', () => {
     expect(shader).toContain('bitcast<u32>(value) == 0xff800000u');
     expect(shader).toContain('if (bitcast<u32>(value) == 0xff800000u) { return 0.0; }');
     expect(shader).toContain('let opacityLogit = dongInterpolateExtended(');
-    expect(shader).toContain('return bitcast<f32>(0xff800000u);');
+    // #WDD-gpt 2026-08-25 - Strict WGSL validators reject a constant expression whose value is
+    // -Infinity, so interpolation must forward the already-loaded endpoint bit pattern instead.
+    expect(shader).toContain('if (dongIsNegativeInfinity(left)) { return left; }');
+    expect(shader).toContain('if (dongIsNegativeInfinity(right)) { return right; }');
+    expect(shader).not.toContain('return bitcast<f32>(0xff800000u);');
+    expect(shader).not.toMatch(/\(\*color\)\.(?:rgb|a)\s*=/);
+    expect(shader).toContain('*color = vec4f(selectedColor, outputAlpha);');
   });
 });

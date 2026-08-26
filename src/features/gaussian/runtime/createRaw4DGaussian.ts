@@ -17,6 +17,7 @@ import { Raw4DFrameSampler } from './Raw4DFrameSampler';
 import { Raw4DGpuPlayback } from './Raw4DGpuPlayback';
 import { createRaw4DGpuMemoryPlan } from './Raw4DGpuMemoryPlan';
 import { Raw4DResource } from './Raw4DResource';
+import { disposeGSplatAfterRendererSync } from './disposeGSplatAfterRendererSync';
 
 const PREFETCH_GPU_WORK_BYTES_PER_SPLAT = 192;
 
@@ -95,8 +96,11 @@ export async function createRaw4DGaussian(
       { streamTextureKeyframes: options.streamTextureKeyframes },
     );
   } catch (error) {
-    entity.destroy();
-    resource.destroy();
+    // #WDD-gpt 2026-08-25 - 异步创建失败也可能已有 GSplatWorld 快照，禁止同步销毁 placement 形成 resource=null 的悬空窗口。
+    disposeGSplatAfterRendererSync(app, entity, () => {
+      entity.destroy();
+      resource.destroy();
+    });
     throw error;
   }
 
@@ -152,9 +156,12 @@ export async function createRaw4DGaussian(
     dispose: () => {
       if (disposed) return;
       disposed = true;
-      gpuPlayback.destroy();
-      entity.destroy();
-      resource.destroy();
+      // #WDD-gpt 2026-08-25 - 先隐藏并让 PlayCanvas reconcile Layer，再释放 GPU/placement，避免 GSplatInfo 读取空 resource。
+      disposeGSplatAfterRendererSync(app, entity, () => {
+        gpuPlayback.destroy();
+        entity.destroy();
+        resource.destroy();
+      });
     },
   };
 }

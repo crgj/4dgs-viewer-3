@@ -1,4 +1,5 @@
 import { Application, Entity, GSplatData, GSplatResource, Quat } from 'playcanvas';
+import { disposeGSplatAfterRendererSync } from './disposeGSplatAfterRendererSync';
 
 const SH_C0 = 0.28209479177387814;
 const GOLDEN_RATIO = 0.6180339887498949;
@@ -102,8 +103,11 @@ export function createDemoGaussian(app: Application, count: number): DemoGaussia
         return;
       }
       disposed = true;
-      entity.destroy();
-      resource.destroy();
+      // #WDD-gpt 2026-08-25 - 演示资源沿用正式 GSplat 的跨帧安全释放，避免空场景切换时留下已清空 placement。
+      disposeGSplatAfterRendererSync(app, entity, () => {
+        entity.destroy();
+        resource.destroy();
+      });
     },
   };
 }

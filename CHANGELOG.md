@@ -2,6 +2,19 @@
 
 本文档按版本倒序记录 Dong Editor 3 的功能、交互与稳定性修改。根目录 `VERSION` 是页面显示的唯一版本来源。
 
+## 3.0.90 - 2026-08-25
+
+- 修复部分浏览器读入或切换模型后 `gsplat-info.js` 访问空 `resource.numSplats`、模型不显示的问题：根因是同步 `entity.destroy()` 已把 PlayCanvas `GSplatPlacement.resource` 清空，但各摄像机的 `GSplatWorld` 尚未在下一次渲染中移除旧 placement。
+- RAW4D/4CGS 正常卸载、异步 GPU 创建失败回收及演示 Gaussian 统一改为两阶段释放：先禁用实体并请求渲染，让 Layer 与所有 GSplatWorld 完成 reconcile；随后才销毁 GPU playback、placement 和 resource。应用整体关闭时仍会立即完成一次且仅一次的资源回收。
+- 新增释放时序回归测试，验证同步阶段只隐藏实体而不销毁资源、下一次安全渲染后才真正回收，以及应用提前销毁时不会重复释放。
+
+## 3.0.89 - 2026-08-25
+
+- 修复部分 Chromium/Tint WebGPU 实现在读入 4CGS/RAW4D 后模型不显示：opacity 插值不再用 `bitcast<f32>(0xff800000u)` 主动构造会被严格 WGSL 常量求值拒绝的 `-Infinity`，改为直接返回已从数据缓冲读取的 `-Infinity` 端点，保留原始位模式和完全不可见语义。
+- 修复 RAW4D 颜色/透明度、点中心蓝点、椭圆与重光照 WGSL 块对 `(*color).rgb`/`(*color).a` 指针解引用 swizzle 直接赋值的依赖；统一改为重建完整 `vec4f` 后一次写回，兼容将该 swizzle 视为不可写左值的 WebGPU 驱动。
+- 新增严格 WGSL 回归断言：生成的 RAW4D 与渲染模式着色器不得包含常量 `-Infinity` 构造或指针 swizzle 写入，并保持原 opacity、选择高亮和点/椭圆/全部显示语义。
+- 验证结果：TypeScript 检查通过，完整 251 项测试通过、8 项按环境跳过；生产构建与 `docs` 版本校验通过。真实页面以 WebGL2 读入 `red.4cgs` 后正常绘制 335,265 个活跃 Gaussian，控制台无警告/错误；外部 Chrome WebGPU 会话在当前验收环境不可用，未将 WebGL2 实测冒充为截图设备的驱动验收。
+
 ## 3.0.88 - 2026-08-21
 
 - 修复开启“强制排序”后播放时 Gaussian 停在旧帧、仅影子 Mesh 更新的回归：播放循环现在会先为目标帧建立确认器，再提交时间轴帧，且只有收到该准确帧的 Gaussian 已显示回调后才继续播放；4 秒未提交则停止播放，不再让时间轴空跑。

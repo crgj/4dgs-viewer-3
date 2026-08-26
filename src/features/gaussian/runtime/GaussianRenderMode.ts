@@ -325,16 +325,22 @@ fn modifySplatColor(gaussianUV: vec2f, color: ptr<function, vec4f>) {
 
     if (uniform.dongRenderMode < 1.5) {
         let pointEdge = 1.0 - smoothstep(0.70, 0.96, radialDistance);
-        (*color).a = pointEdge;
         let centerDot = 1.0 - smoothstep(0.015, 0.040, radialDistance);
-        (*color).rgb = mix((*color).rgb, vec3f(0.08, 0.42, 1.0), centerDot);
+        let currentColor = *color;
+        // #WDD-gpt 2026-08-25 - Rebuild the full vector because strict WGSL validators reject
+        // a swizzle of a pointer dereference as an assignment target.
+        *color = vec4f(mix(currentColor.rgb, vec3f(0.08, 0.42, 1.0), centerDot), pointEdge);
     } else if (uniform.dongRenderMode < 2.5) {
         let ellipseInnerEdge = smoothstep(0.64, 0.72, radialDistance);
         let ellipseOuterEdge = 1.0 - smoothstep(0.86, 0.93, radialDistance);
-        (*color).a = sourceOpacity * ellipseInnerEdge * ellipseOuterEdge * 0.95;
-        (*color).rgb = mix((*color).rgb, vec3f(1.0), 0.08);
+        let currentColor = *color;
+        *color = vec4f(
+            mix(currentColor.rgb, vec3f(1.0), 0.08),
+            sourceOpacity * ellipseInnerEdge * ellipseOuterEdge * 0.95
+        );
     } else {
-        (*color).a = 1.0 - smoothstep(0.70, 0.96, radialDistance);
+        let currentColor = *color;
+        *color = vec4f(currentColor.rgb, 1.0 - smoothstep(0.70, 0.96, radialDistance));
     }
 }
 `;
@@ -401,14 +407,19 @@ fn modifySplatColor(gaussianUV: vec2f, color: ptr<function, vec4f>) {
 
         if (uniform.dongRenderMode < 1.5) {
             let pointEdge = 1.0 - smoothstep(0.70, 0.96, radialDistance);
-            (*color).a = pointEdge;
+            let currentColor = *color;
+            *color = vec4f(currentColor.rgb, pointEdge);
         } else if (uniform.dongRenderMode < 2.5) {
             let ellipseInnerEdge = smoothstep(0.64, 0.72, radialDistance);
             let ellipseOuterEdge = 1.0 - smoothstep(0.86, 0.93, radialDistance);
-            (*color).a = sourceOpacity * ellipseInnerEdge * ellipseOuterEdge * 0.95;
-            (*color).rgb = mix((*color).rgb, vec3f(1.0), 0.08);
+            let currentColor = *color;
+            *color = vec4f(
+                mix(currentColor.rgb, vec3f(1.0), 0.08),
+                sourceOpacity * ellipseInnerEdge * ellipseOuterEdge * 0.95
+            );
         } else {
-            (*color).a = 1.0 - smoothstep(0.70, 0.96, radialDistance);
+            let currentColor = *color;
+            *color = vec4f(currentColor.rgb, 1.0 - smoothstep(0.70, 0.96, radialDistance));
         }
     }
 
@@ -423,7 +434,8 @@ fn modifySplatColor(gaussianUV: vec2f, color: ptr<function, vec4f>) {
     *color = vec4f(mix((*color).rgb, boundedRelitColor, uniform.uRelightBlend), (*color).a);
     if (uniform.dongRenderMode > 0.5 && uniform.dongRenderMode < 1.5) {
         let centerDot = 1.0 - smoothstep(0.015, 0.040, radialDistance);
-        (*color).rgb = mix((*color).rgb, vec3f(0.08, 0.42, 1.0), centerDot);
+        let currentColor = *color;
+        *color = vec4f(mix(currentColor.rgb, vec3f(0.08, 0.42, 1.0), centerDot), currentColor.a);
     }
 }
 `;
