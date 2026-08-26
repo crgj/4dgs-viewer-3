@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { resolveGaussianRuntimeProfile } from './GaussianRuntimeProfile';
+import { resolveForceSortSync, resolveGaussianRuntimeProfile } from './GaussianRuntimeProfile';
 
 describe('Gaussian runtime profile', () => {
   it('uses the mobile fallback for Android even when memory reporting is unavailable', () => {
@@ -37,5 +37,12 @@ describe('Gaussian runtime profile', () => {
     });
     expect(profile.name).toBe('desktop');
     expect(profile.defaultMemoryMode).toBe('local-maximum');
+  });
+
+  it('always enables strict frame sorting in the mobile player without changing the desktop preference', () => {
+    expect(resolveForceSortSync(true, false)).toBe(true);
+    expect(resolveForceSortSync(true, true)).toBe(true);
+    expect(resolveForceSortSync(false, false)).toBe(false);
+    expect(resolveForceSortSync(false, true)).toBe(true);
   });
 });

@@ -11,7 +11,10 @@ import {
   createGaussian4DMemoryPolicy,
   type Gaussian4DMemoryMode,
 } from '../features/gaussian/memory/Gaussian4DMemoryPolicy';
-import { detectGaussianRuntimeProfile } from '../features/gaussian/memory/GaussianRuntimeProfile';
+import {
+  detectGaussianRuntimeProfile,
+  resolveForceSortSync,
+} from '../features/gaussian/memory/GaussianRuntimeProfile';
 import type { GaussianRenderMode } from '../features/gaussian/runtime/GaussianRenderMode';
 import { writeFourCgsFile } from '../features/gaussian/formats/fourcgs/FourCgsContainer';
 import {
@@ -466,6 +469,9 @@ export function App() {
   const [playbackFps, setPlaybackFps] = useState(30);
   // #WDD-gpt 2026-08-21 - 强制排序：新帧必须等 CPU 深度排序提交后再渲染，随工作区草稿持久化。
   const [forceSortSync, setForceSortSync] = useState(false);
+  // Mobile playback always waits for the current frame's depth sort. The stored
+  // desktop preference remains independent so responsive layout changes are reversible.
+  const effectiveForceSortSync = resolveForceSortSync(mobilePlayerMode, forceSortSync);
   const [renderMode, setRenderMode] = useState<GaussianRenderMode>('gaussian');
   // #WDD-gpt 2026-08-19 - 手机首屏默认 SH0，先保证低功耗 GPU 稳定出图；用户仍可在渲染栏手动提高级别。
   const [shLevel, setShLevel] = useState(initialRuntimeProfile.name === 'mobile-compatible' ? 0 : 3);
@@ -962,7 +968,7 @@ export function App() {
       return;
     }
     const frameCount = timelineEndFrame + 1;
-    if (forceSortSync) {
+    if (effectiveForceSortSync) {
       // #WDD-gpt 2026-08-21 - 强制排序播放：等引擎确认当前帧排序提交后再推进下一帧；
       // 排序吞吐不足时播放自动降速，而不是带过期顺序渲染，循环回绕也天然被同一门槛约束。
       let stopped = false;
@@ -1045,7 +1051,7 @@ export function App() {
     };
     animationFrame = window.requestAnimationFrame(updatePlayback);
     return () => window.cancelAnimationFrame(animationFrame);
-  }, [forceSortSync, isLooping, isPlaying, playbackFps, timelineEndFrame]);
+  }, [effectiveForceSortSync, isLooping, isPlaying, playbackFps, timelineEndFrame]);
 
   useEffect(() => {
     setCurrentFrame((frame) => Math.min(frame, timelineEndFrame));
@@ -2278,7 +2284,7 @@ export function App() {
             activeTool={activeTool}
             brushRadius={selectionBrushRadius}
             currentFrame={currentFrame}
-            forceSortSync={forceSortSync}
+            forceSortSync={effectiveForceSortSync}
             frameReadyRequestId={frameReadyRequestId}
             memoryPolicy={memoryPolicy}
             onFrameDisplayed={showDisplayedRelightingFrame}

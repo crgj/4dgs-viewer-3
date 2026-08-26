@@ -62,7 +62,6 @@ describe('GaussianRenderMode', () => {
     ]);
     expect([...material.shaderChunks.wgsl.keys()]).toEqual([
       'gsplatModifyVS', 'gsplatModifyPS', 'gsplatPS', 'gsplatCornerVS', 'gsplatCommonVS', 'gsplatVS',
-      'gsplatHybridVS',
     ]);
     expect(material.shaderChunks.glsl.get('gsplatModifyPS')).toContain('ellipseInnerEdge');
     expect(material.shaderChunks.glsl.get('gsplatModifyVS')).toContain('0.0175');
@@ -82,11 +81,16 @@ describe('GaussianRenderMode', () => {
     expect(material.shaderChunks.glsl.get('gsplatModifyPS')).toContain('color.a = 1.0 - smoothstep(0.70, 0.96, radialDistance)');
     expect(material.shaderChunks.glsl.get('gsplatPS')).toContain('exp(-dongGsplatKernelExponent * A)');
     expect(material.shaderChunks.glsl.get('gsplatCornerVS')).toContain('3.33 * min(sqrt(lambda1), vmin)');
-    expect(material.shaderChunks.wgsl.get('gsplatVS')).toContain('varying gaussianUV: vec2f;');
-    expect(material.shaderChunks.wgsl.get('gsplatHybridVS')).toContain('varying gaussianUV: vec2f;');
-    expect(material.shaderChunks.wgsl.get('gsplatHybridVS')).toContain('varying gaussianColor: vec4f;');
-    expect(material.shaderChunks.wgsl.get('gsplatHybridVS')).toContain('output.gaussianUV = vec2f(cornerClipped);');
-    expect(material.shaderChunks.wgsl.get('gsplatHybridVS')).toContain('output.gaussianColor = vec4f(half4(');
+    // WebGPU/Metal requires the exact same base type across shader stages. Keep the
+    // PlayCanvas f16 interface and promote values only after they enter the fragment.
+    expect(material.shaderChunks.wgsl.get('gsplatVS')).toContain('varying gaussianUV: half2;');
+    expect(gsplatHybridWGSL).toContain('varying gaussianUV: half2;');
+    expect(gsplatHybridWGSL).toContain('varying gaussianColor: half4;');
+    expect(material.shaderChunks.wgsl.get('gsplatPS')).toContain('varying gaussianUV: half2;');
+    expect(material.shaderChunks.wgsl.get('gsplatPS')).toContain('varying gaussianColor: half4;');
+    expect(material.shaderChunks.wgsl.get('gsplatPS')).toContain('let gaussianUVF32 = vec2f(gaussianUV);');
+    expect(material.shaderChunks.wgsl.get('gsplatPS')).toContain('let gaussianColorF32 = vec4f(gaussianColor);');
+    expect(material.shaderChunks.wgsl.has('gsplatHybridVS')).toBe(false);
     expect(material.setParameter).toHaveBeenCalledWith('dongGsplatKernelExponent', 0.5 * 3.33 * 3.33);
     expect(material.setParameter).toHaveBeenCalledWith('dongRenderMode', 0);
     expect(material.update).toHaveBeenCalledTimes(2);

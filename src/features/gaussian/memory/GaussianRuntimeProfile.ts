@@ -21,6 +21,10 @@ export interface GaussianRuntimeProfile {
   readonly loaderWorkerCount: number | undefined;
 }
 
+export function resolveForceSortSync(mobilePlayerMode: boolean, requested: boolean): boolean {
+  return mobilePlayerMode || requested;
+}
+
 const MOBILE_USER_AGENT = /Android|iPhone|iPad|iPod|Mobile|IEMobile|Opera Mini/i;
 
 export function resolveGaussianRuntimeProfile(signals: GaussianRuntimeSignals): GaussianRuntimeProfile {

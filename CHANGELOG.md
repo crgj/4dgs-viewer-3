@@ -2,10 +2,11 @@
 
 本文档按版本倒序记录 Dong Editor 3 的功能、交互与稳定性修改。根目录 `VERSION` 是页面显示的唯一版本来源。
 
-## 3.0.92 - 2026-08-26
+## 3.0.93 - 2026-08-26
 
-- 修复 WebGPU GPU 排序渲染路径加载 4CGS/RAW4D 后模型不显示并持续产生 `RenderPipeline` 校验错误：自定义 `f32` Gaussian 片元 varying 现在会与 `gsplatHybridVS` 顶点输出同步，消除 `f16`/`f32` location 类型冲突。
-- 新增基于当前 PlayCanvas 原始 chunk 的混合 GSplat 顶点着色器回归断言，覆盖 UV、颜色 varying 及两个颜色输出分支的 `f32` 转换；完整 252 项测试通过、9 项按环境跳过，生产构建与 `docs` 版本校验通过。
+- 手机版播放器强制开启逐帧排序同步：播放和时间轴切帧必须等待当前帧深度排序提交后才显示；桌面版仍保留工作区中的独立开关偏好。
+- 修复 macOS WebGPU/Metal 加载 4CGS/RAW4D 后模型不显示并持续产生 `RenderPipeline` 校验错误：Gaussian 顶点到片元的 varying 保持 PlayCanvas 原生 `f16` 接口，仅在片元函数内部提升到 `f32` 计算，兼容前向、深度、拾取、阴影以及 GPU/CPU 排序派生材质。
+- 新增标准与混合 GSplat 顶点 chunk、定制片元 chunk 的跨阶段类型回归断言，防止再次出现 location 0 的 `f16`/`f32` 冲突。
 
 ## 3.0.90 - 2026-08-25
 

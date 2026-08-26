@@ -30,23 +30,16 @@ function replaceRequired(source: string, search: string, replacement: string, ch
   return source.replace(search, replacement);
 }
 
-function replacePatternRequired(source: string, search: RegExp, replacement: string, chunk: string): string {
-  if (!search.test(source)) throw new Error(`PlayCanvas ${chunk} changed; gsplat compatibility profile must be updated.`);
-  return source.replace(search, replacement);
-}
-
 function gsplatProjectionChunks(app: Application, language: typeof SHADERLANGUAGE_GLSL | typeof SHADERLANGUAGE_WGSL): {
   corner: string;
   common: string;
   vertex: string;
-  hybridVertex: string | null;
 } {
   const chunks = ShaderChunks.get(app.graphicsDevice, language);
   const isWgsl = language === SHADERLANGUAGE_WGSL;
   let corner = chunks.get('gsplatCornerVS');
   let common = chunks.get('gsplatCommonVS');
   let vertex = chunks.get('gsplatVS');
-  let hybridVertex = isWgsl ? chunks.get('gsplatHybridVS') : null;
   corner = replaceRequired(
     corner,
     '2.0 * min(sqrt(2.0 * lambda1), vmin)',
@@ -66,46 +59,21 @@ function gsplatProjectionChunks(app: Application, language: typeof SHADERLANGUAG
     'gsplatCommonVS',
   );
   if (isWgsl) {
-    vertex = replaceRequired(vertex, 'varying gaussianUV: half2;', 'varying gaussianUV: vec2f;', 'gsplatVS');
-    vertex = replaceRequired(vertex, 'varying gaussianColor: half4;', 'varying gaussianColor: vec4f;', 'gsplatVS');
-    vertex = replaceRequired(vertex, 'output.gaussianUV = corner.uv;', 'output.gaussianUV = vec2f(corner.uv);', 'gsplatVS');
-    vertex = replaceRequired(
-      vertex,
-      'output.gaussianColor = half4(half3(rampColor), clr.a);',
-      'output.gaussianColor = vec4f(rampColor, f32(clr.a));',
-      'gsplatVS',
-    );
-    vertex = replaceRequired(
-      vertex,
-      'output.gaussianColor = half4(half3(prepareOutputFromGamma(max(vec3f(clr.xyz), vec3f(0.0)), -center.view.z)), clr.w);',
-      'output.gaussianColor = vec4f(prepareOutputFromGamma(max(vec3f(clr.xyz), vec3f(0.0)), -center.view.z), f32(clr.w));',
-      'gsplatVS',
-    );
-    hybridVertex = replaceRequired(hybridVertex!, 'varying gaussianUV: half2;', 'varying gaussianUV: vec2f;', 'gsplatHybridVS');
-    hybridVertex = replaceRequired(hybridVertex, 'varying gaussianColor: half4;', 'varying gaussianColor: vec4f;', 'gsplatHybridVS');
-    hybridVertex = replaceRequired(
-      hybridVertex,
-      'output.gaussianUV = half2(cornerClipped);',
-      'output.gaussianUV = vec2f(cornerClipped);',
-      'gsplatHybridVS',
-    );
-    hybridVertex = replaceRequired(
-      hybridVertex,
-      'output.gaussianColor = half4(half3(rampColor), outAlpha);',
-      'output.gaussianColor = vec4f(half4(half3(rampColor), outAlpha));',
-      'gsplatHybridVS',
-    );
-    hybridVertex = replacePatternRequired(
-      hybridVertex,
-      /output\.gaussianColor = half4\(\s*half3\(prepareOutputFromGamma\(max\(vec3f\(clr\.xyz\), vec3f\(0\.0\)\), viewDepth\)\),\s*alpha\s*\);/,
-      'output.gaussianColor = vec4f(half4(half3(prepareOutputFromGamma(max(vec3f(clr.xyz), vec3f(0.0)), viewDepth)), alpha));',
-      'gsplatHybridVS',
-    );
+    const hybridVertex = chunks.get('gsplatHybridVS');
+    // Keep the vertex/fragment interface at PlayCanvas' native f16 precision. Unified
+    // rendering creates separate forward, depth, pick and shadow materials, and not all
+    // of those derived materials inherit a user-overridden vertex chunk on WebGPU/Metal.
+    // Converting only inside the fragment function avoids cross-stage f16/f32 mismatches.
+    for (const [source, chunk] of [[vertex, 'gsplatVS'], [hybridVertex, 'gsplatHybridVS']] as const) {
+      if (!source.includes('varying gaussianUV: half2;') || !source.includes('varying gaussianColor: half4;')) {
+        throw new Error(`PlayCanvas ${chunk} changed; gsplat compatibility profile must be updated.`);
+      }
+    }
   } else {
     vertex = replaceRequired(vertex, 'varying mediump vec2 gaussianUV;', 'varying highp vec2 gaussianUV;', 'gsplatVS');
     vertex = replaceRequired(vertex, 'varying mediump vec4 gaussianColor;', 'varying highp vec4 gaussianColor;', 'gsplatVS');
   }
-  return { corner, common, vertex, hybridVertex };
+  return { corner, common, vertex };
 }
 
 // #WDD-gpt 2026-08-16 - Python gsplat直接计算 opacity*exp(-sigma)，不使用PlayCanvas在核边缘归零的归一化指数。
@@ -202,8 +170,8 @@ uniform dongGsplatKernelExponent: f32;
     uniform alphaClipForward: f32;
 #endif
 
-varying gaussianUV: vec2f;
-varying gaussianColor: vec4f;
+varying gaussianUV: half2;
+varying gaussianColor: half4;
 
 #if defined(GSPLAT_UNIFIED_ID) && defined(PICK_PASS)
     varying @interpolate(flat) vPickId: u32;
@@ -221,10 +189,12 @@ varying gaussianColor: vec4f;
 @fragment
 fn fragmentMain(input: FragmentInput) -> FragmentOutput {
     var output: FragmentOutput;
-    let A = dot(gaussianUV, gaussianUV);
+    let gaussianUVF32 = vec2f(gaussianUV);
+    let gaussianColorF32 = vec4f(gaussianColor);
+    let A = dot(gaussianUVF32, gaussianUVF32);
     if (A > 1.0) { discard; }
 
-    let alpha = min(0.999, exp(-uniform.dongGsplatKernelExponent * A) * gaussianColor.a);
+    let alpha = min(0.999, exp(-uniform.dongGsplatKernelExponent * A) * gaussianColorF32.a);
 
     #if defined(SHADOW_PASS) || defined(PICK_PASS) || defined(PREPASS_PASS)
         if (alpha < uniform.alphaClip) { discard; return output; }
@@ -248,8 +218,8 @@ fn fragmentMain(input: FragmentInput) -> FragmentOutput {
         #ifndef DITHER_NONE
             opacityDither(alpha, id * 0.013);
         #endif
-        var fragColor = vec4f(gaussianColor.xyz, alpha);
-        modifySplatColor(gaussianUV, &fragColor);
+        var fragColor = vec4f(gaussianColorF32.xyz, alpha);
+        modifySplatColor(gaussianUVF32, &fragColor);
         output.color = vec4f(fragColor.xyz * fragColor.a, fragColor.a);
     #endif
     return output;
@@ -509,7 +479,6 @@ export function setGaussianRasterKernel(app: Application, kernel: GaussianRaster
     material.shaderChunks.wgsl.set('gsplatCommonVS', wgslProjection.common);
     material.shaderChunks.glsl.set('gsplatVS', glslProjection.vertex);
     material.shaderChunks.wgsl.set('gsplatVS', wgslProjection.vertex);
-    material.shaderChunks.wgsl.set('gsplatHybridVS', wgslProjection.hybridVertex!);
     material.setParameter('dongGsplatKernelExponent', GSPLAT_KERNEL_EXPONENT);
   } else {
     material.shaderChunks.glsl.delete('gsplatPS');
@@ -520,7 +489,6 @@ export function setGaussianRasterKernel(app: Application, kernel: GaussianRaster
     material.shaderChunks.wgsl.delete('gsplatCommonVS');
     material.shaderChunks.glsl.delete('gsplatVS');
     material.shaderChunks.wgsl.delete('gsplatVS');
-    material.shaderChunks.wgsl.delete('gsplatHybridVS');
   }
   material.update();
 }
