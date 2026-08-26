@@ -2,6 +2,11 @@
 
 本文档按版本倒序记录 Dong Editor 3 的功能、交互与稳定性修改。根目录 `VERSION` 是页面显示的唯一版本来源。
 
+## 3.0.92 - 2026-08-26
+
+- 修复 WebGPU GPU 排序渲染路径加载 4CGS/RAW4D 后模型不显示并持续产生 `RenderPipeline` 校验错误：自定义 `f32` Gaussian 片元 varying 现在会与 `gsplatHybridVS` 顶点输出同步，消除 `f16`/`f32` location 类型冲突。
+- 新增基于当前 PlayCanvas 原始 chunk 的混合 GSplat 顶点着色器回归断言，覆盖 UV、颜色 varying 及两个颜色输出分支的 `f32` 转换；完整 252 项测试通过、9 项按环境跳过，生产构建与 `docs` 版本校验通过。
+
 ## 3.0.90 - 2026-08-25
 
 - 修复部分浏览器读入或切换模型后 `gsplat-info.js` 访问空 `resource.numSplats`、模型不显示的问题：根因是同步 `entity.destroy()` 已把 PlayCanvas `GSplatPlacement.resource` 清空，但各摄像机的 `GSplatWorld` 尚未在下一次渲染中移除旧 placement。
