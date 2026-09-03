@@ -30,6 +30,20 @@ describe('GaussianEditStore', () => {
     expect(edits.byteLength - before).toBeLessThan(128);
   });
 
+  it('bulk replaces dense semantic attributes without per-point writes', () => {
+    const edits = new GaussianEditStore(6, 4);
+    edits.defineAttribute({ name: 'semantic.class_id', type: 'u16' });
+    const events: string[] = [];
+    edits.onChange((event) => events.push(`${event.kind}:${event.attribute ?? ''}`));
+
+    edits.setDenseAttributeValues('semantic.class_id', new Uint16Array([1, 1, 0, 2, 2, 3]));
+
+    expect(edits.getAttribute('semantic.class_id', 0)).toEqual([1]);
+    expect(edits.getAttribute('semantic.class_id', 4)).toEqual([2]);
+    expect(edits.getAttribute('semantic.class_id', 5)).toEqual([3]);
+    expect(events).toEqual(['attribute:semantic.class_id']);
+  });
+
   it('inverts only undeleted stable IDs for global selection', () => {
     const edits = new GaussianEditStore(6);
     edits.setDeleted([1, 5]);

@@ -16,6 +16,8 @@ export interface WorkspaceSourceIdentity {
 }
 
 export interface WorkspaceViewState {
+  /** 旧草稿缺省时沿用当前浏览器的视口背景偏好。 */
+  readonly backgroundColor?: string;
   readonly camera: ViewportCameraState | null;
   readonly cameraBookmarks: readonly (ViewportCameraState | null)[];
   readonly currentFrame: number;

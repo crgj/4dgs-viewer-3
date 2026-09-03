@@ -34,6 +34,7 @@ import {
 
 interface GaussianViewportProps {
   activeTool: ViewportEditorTool;
+  backgroundColor: string;
   brushRadius: number;
   currentFrame: number;
   forceSortSync: boolean;
@@ -168,6 +169,7 @@ function fourCgsSequenceStatus(descriptor: FourCgsDescriptor, segmentIndex: numb
 
 export function GaussianViewport({
   activeTool,
+  backgroundColor,
   brushRadius,
   currentFrame,
   forceSortSync,
@@ -212,6 +214,7 @@ export function GaussianViewport({
   const frameReadyGenerationRef = useRef(0);
   const activateFourCgsFrameRef = useRef<(frame: number) => Promise<void>>(async () => undefined);
   const activateRaw4DSequenceFrameRef = useRef<(frame: number) => Promise<void>>(async () => undefined);
+  const backgroundColorRef = useRef(backgroundColor);
   const renderModeRef = useRef(renderMode);
   const onFrameDisplayedRef = useRef(onFrameDisplayed);
   const [runtimeReady, setRuntimeReady] = useState(false);
@@ -220,6 +223,7 @@ export function GaussianViewport({
   const runtimeProfile = useMemo(() => memoryPolicy.mode === 'mobile'
     ? resolveGaussianRuntimeProfile({ mobileHint: true })
     : detectedRuntimeProfile, [detectedRuntimeProfile, memoryPolicy.mode]);
+  backgroundColorRef.current = backgroundColor;
   renderModeRef.current = renderMode;
   onFrameDisplayedRef.current = onFrameDisplayed;
   pendingFrameRef.current = currentFrame;
@@ -373,6 +377,7 @@ export function GaussianViewport({
     // #WDD-gpt 2026-08-19 - 桌面/手机渲染档切换时先提交未就绪状态，确保现有场景随后按新 GraphicsDevice 重新上传。
     setRuntimeReady(false);
     const runtime = new ViewportRuntime(canvas, {
+      backgroundColor: backgroundColorRef.current,
       showGuides,
       preserveDrawingBuffer,
       memoryPolicy,
@@ -421,6 +426,10 @@ export function GaussianViewport({
       runtimeRef.current = null;
     };
   }, [onHistoryChange, onRelightingChange, onRuntimeChange, onSelectionChange, onStatusChange, onTransformChange, preserveDrawingBuffer, runtimeProfile, showGuides]);
+
+  useEffect(() => {
+    runtimeRef.current?.setBackgroundColor(backgroundColor);
+  }, [backgroundColor, runtimeReady]);
 
   useEffect(() => {
     runtimeRef.current?.setEditorTool(activeTool);

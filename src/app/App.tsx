@@ -28,6 +28,13 @@ import { MemoryTelemetryPanel } from '../features/viewport/components/MemoryTele
 import { PerformanceDiagnosticsPanel } from '../features/viewport/components/PerformanceDiagnosticsPanel';
 import type { ViewportPerformanceSnapshot } from '../features/viewport/runtime/ViewportPerformanceMonitor';
 import type { GaussianCylinderSelectionRegion } from '../features/viewport/runtime/selection/GaussianCylinderSelection';
+import { gaussianSelectionModeFromModifiers } from '../features/viewport/runtime/selection/GaussianScreenSelection';
+import {
+  DEFAULT_VIEWPORT_BACKGROUND_COLOR,
+  isViewportBackgroundColor,
+  normalizeViewportBackgroundColor,
+  VIEWPORT_BACKGROUND_COLOR_STORAGE_KEY,
+} from '../features/viewport/runtime/ViewportBackgroundColor';
 import {
   INITIAL_EDITOR_HISTORY_STATE,
   INITIAL_VIEWPORT_SELECTION_STATE,
@@ -76,6 +83,20 @@ import {
 } from '../plugins/relighting/RelightingTypes';
 import { ModelHealthPanel } from '../plugins/model-health/ModelHealthPanel';
 import type { ModelHealthReport } from '../plugins/model-health/ModelHealth';
+import { SemanticClassificationPanel } from '../plugins/semantic-classification/SemanticClassificationPanel';
+import { SemanticClassificationResultsPanel } from '../plugins/semantic-classification/SemanticClassificationResultsPanel';
+import {
+  clampPluginWindowPosition,
+  type PluginWindowPosition,
+} from './components/PluginWindowBounds';
+import {
+  SemanticClassificationPlugin,
+  type SemanticClassificationOptions,
+} from '../plugins/semantic-classification/SemanticClassificationPlugin';
+import {
+  INITIAL_SEMANTIC_CLASSIFICATION_STATE,
+  type SemanticClassificationState,
+} from '../plugins/semantic-classification/SemanticClassificationTypes';
 import {
   UI_COPY,
   localizeRuntimeMessage,
@@ -404,15 +425,14 @@ const gaussianRenderModes: Array<{
 ];
 
 type MenuName = 'file' | 'view' | 'plugins' | null;
-type InspectorTab = 'scene' | 'transform' | 'gaussian' | 'performance';
-type PluginId = 'smart-alignment' | 'relighting' | 'model-health';
+type InspectorTab = 'scene' | 'transform' | 'gaussian' | 'semantic' | 'performance';
+type PluginId = 'smart-alignment' | 'relighting' | 'model-health' | 'semantic-classification';
 type PluginStatusTone = 'idle' | 'running' | 'success' | 'error';
-type PluginWindowPosition = { readonly x: number; readonly y: number };
-
 const inspectorTabs: ReadonlyArray<{ readonly id: InspectorTab; readonly labelKey: keyof UiCopy }> = [
   { id: 'scene', labelKey: 'tabScene' },
   { id: 'transform', labelKey: 'tabTransform' },
   { id: 'gaussian', labelKey: 'tabGaussian' },
+  { id: 'semantic', labelKey: 'tabSemantic' },
   { id: 'performance', labelKey: 'tabPerformance' },
 ];
 
@@ -426,6 +446,7 @@ const pluginMenuItems: ReadonlyArray<{
   { id: 'smart-alignment', mark: '✦', titleKey: 'pluginSmartAlignment', descriptionKey: 'pluginSmartAlignmentDescription' },
   { id: 'relighting', mark: '☀', titleKey: 'pluginRelighting', descriptionKey: 'pluginRelightingDescription' },
   { id: 'model-health', mark: '✓', titleKey: 'pluginModelHealth', descriptionKey: 'pluginModelHealthDescription' },
+  { id: 'semantic-classification', mark: '◈', titleKey: 'pluginSemanticClassification', descriptionKey: 'pluginSemanticClassificationDescription' },
 ];
 
 const pluginStatusLabelKeys: Readonly<Record<PluginStatusTone, keyof UiCopy>> = {
@@ -473,6 +494,14 @@ export function App() {
   // desktop preference remains independent so responsive layout changes are reversible.
   const effectiveForceSortSync = resolveForceSortSync(mobilePlayerMode, forceSortSync);
   const [renderMode, setRenderMode] = useState<GaussianRenderMode>('gaussian');
+  const [backgroundColor, setBackgroundColor] = useState(() => {
+    if (typeof window === 'undefined') return DEFAULT_VIEWPORT_BACKGROUND_COLOR;
+    try {
+      return normalizeViewportBackgroundColor(window.localStorage.getItem(VIEWPORT_BACKGROUND_COLOR_STORAGE_KEY));
+    } catch {
+      return DEFAULT_VIEWPORT_BACKGROUND_COLOR;
+    }
+  });
   // #WDD-gpt 2026-08-19 - 手机首屏默认 SH0，先保证低功耗 GPU 稳定出图；用户仍可在渲染栏手动提高级别。
   const [shLevel, setShLevel] = useState(initialRuntimeProfile.name === 'mobile-compatible' ? 0 : 3);
   const [showGrid, setShowGrid] = useState(true);
@@ -495,6 +524,7 @@ export function App() {
   const [gaussianVisible, setGaussianVisible] = useState(true);
   const [modelHealthReport, setModelHealthReport] = useState<ModelHealthReport | null>(null);
   const [modelHealthBusy, setModelHealthBusy] = useState(false);
+  const [semanticClassificationState, setSemanticClassificationState] = useState<SemanticClassificationState>(INITIAL_SEMANTIC_CLASSIFICATION_STATE);
   const [originBakeDialogVisible, setOriginBakeDialogVisible] = useState(false);
   const [originBakeBusy, setOriginBakeBusy] = useState(false);
   const [originBakeProgress, setOriginBakeProgress] = useState<ViewportTransformBakeProgress | null>(null);
@@ -551,9 +581,11 @@ export function App() {
   const smartAlignmentPluginRef = useRef<SmartAlignmentPlugin | null>(null);
   const gs2MeshPluginRef = useRef<GS2MeshPlugin | null>(null);
   const relightMeshRef = useRef<RelightingMeshSequence | null>(null);
+  const semanticClassificationRef = useRef<SemanticClassificationPlugin | null>(null);
   if (!smartAlignmentPluginRef.current) smartAlignmentPluginRef.current = new SmartAlignmentPlugin();
   if (!gs2MeshPluginRef.current) gs2MeshPluginRef.current = new GS2MeshPlugin();
   if (!relightMeshRef.current) relightMeshRef.current = new RelightingMeshSequence();
+  if (!semanticClassificationRef.current) semanticClassificationRef.current = new SemanticClassificationPlugin();
   const memoryPolicy = useMemo(
     () => createGaussian4DMemoryPolicy(memoryMode, customCpuGiB, customGpuGiB),
     [customCpuGiB, customGpuGiB, memoryMode],
@@ -736,6 +768,13 @@ export function App() {
         ? 'running'
         : relightingState.enabled ? 'success' : 'idle',
     'model-health': modelHealthBusy ? 'running' : modelHealthReport?.healthy ? 'success' : modelHealthReport ? 'error' : 'idle',
+    'semantic-classification': semanticClassificationState.stage === 'success'
+      ? 'success'
+      : semanticClassificationState.stage === 'error'
+        ? 'error'
+        : semanticClassificationState.stage === 'idle' || semanticClassificationState.stage === 'cancelled'
+          ? 'idle'
+          : 'running',
   };
   const activePluginItem = pluginMenuItems.find((plugin) => plugin.id === activePlugin) ?? null;
 
@@ -744,7 +783,16 @@ export function App() {
     smartAlignmentPluginRef.current?.dispose();
     gs2MeshPluginRef.current?.dispose();
     relightMeshRef.current?.dispose();
+    semanticClassificationRef.current?.dispose();
   }, []);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(VIEWPORT_BACKGROUND_COLOR_STORAGE_KEY, backgroundColor);
+    } catch {
+      // #WDD-gpt 2026-09-02 - 浏览器禁用持久存储时仍保留当前会话内的实时背景设置。
+    }
+  }, [backgroundColor]);
 
   useEffect(() => {
     let active = true;
@@ -790,6 +838,11 @@ export function App() {
       setPlaybackFps(workspaceDraft.view.playbackFps);
       setForceSortSync(workspaceDraft.view.forceSortSync ?? false);
       setRenderMode(workspaceDraft.view.renderMode);
+      if (workspaceDraft.view.backgroundColor) {
+        const restoredBackgroundColor = normalizeViewportBackgroundColor(workspaceDraft.view.backgroundColor);
+        setBackgroundColor(restoredBackgroundColor);
+        viewportRuntime.setBackgroundColor(restoredBackgroundColor);
+      }
       setShLevel(workspaceDraft.view.shLevel);
       setShowGrid(workspaceDraft.view.showGrid);
       setShowAxes(workspaceDraft.view.showAxes);
@@ -823,13 +876,14 @@ export function App() {
         sceneName: displaySceneName,
         sources: workspaceSourceIdentities(sourceFiles),
         view: {
+          backgroundColor,
           camera: viewportRuntime.getCameraState(),
           cameraBookmarks,
           currentFrame,
           forceSortSync,
           gaussianVisible,
           gs2MeshVisible,
-          inspectorTab,
+          inspectorTab: inspectorTab === 'semantic' ? 'scene' : inspectorTab,
           playbackFps,
           renderMode,
           sceneTransform,
@@ -852,7 +906,7 @@ export function App() {
     }, 900);
     return () => window.clearTimeout(timeout);
   }, [
-    cameraBookmarks, currentFrame, displaySceneName, forceSortSync, gaussianVisible, gs2MeshVisible, inspectorTab,
+    backgroundColor, cameraBookmarks, currentFrame, displaySceneName, forceSortSync, gaussianVisible, gs2MeshVisible, inspectorTab,
     playbackFps, renderMode, sceneTransform, selectionState.deletedCount, selectionState.selectedCount,
     shLevel, showAxes, showGaussianEnvelope, showGrid, showHeightRuler, sourceFiles, status.bufferId,
     status.phase, viewportRuntime, workspaceSaveTick,
@@ -908,6 +962,14 @@ export function App() {
     if (status.phase !== 'ready') return;
     setShLevel(status.splatCount > 0 ? status.shBands ?? 0 : 0);
   }, [status.bufferId, status.phase, status.shBands, status.splatCount]);
+
+  useEffect(() => {
+    if (semanticClassificationState.stage === 'success' && semanticClassificationState.result) {
+      // #WDD-gpt 2026-08-27 - 识别完成后自动打开右侧分类页签，让类别选择与统计脱离插件配置弹窗。
+      setInspectorPanelVisible(true);
+      setInspectorTab('semantic');
+    }
+  }, [semanticClassificationState.result, semanticClassificationState.stage]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -1227,6 +1289,39 @@ export function App() {
     setOpenMenu(null);
   };
 
+  const clampPluginWindowToWorkspace = useCallback(() => {
+    const workspaceBounds = workspaceRef.current?.getBoundingClientRect();
+    const windowBounds = pluginWindowRef.current?.getBoundingClientRect();
+    if (!workspaceBounds || !windowBounds) return;
+    setPluginWindowPosition((position) => {
+      const next = clampPluginWindowPosition({
+        position,
+        workspaceWidth: workspaceBounds.width,
+        workspaceHeight: workspaceBounds.height,
+        windowWidth: windowBounds.width,
+        windowHeight: windowBounds.height,
+      });
+      return next.x === position.x && next.y === position.y ? position : next;
+    });
+  }, []);
+
+  useEffect(() => {
+    if (!activePlugin) return;
+    const workspace = workspaceRef.current;
+    const pluginWindow = pluginWindowRef.current;
+    if (!workspace || !pluginWindow) return;
+    const observer = new ResizeObserver(clampPluginWindowToWorkspace);
+    observer.observe(workspace);
+    observer.observe(pluginWindow);
+    window.addEventListener('resize', clampPluginWindowToWorkspace);
+    const frame = window.requestAnimationFrame(clampPluginWindowToWorkspace);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.removeEventListener('resize', clampPluginWindowToWorkspace);
+      observer.disconnect();
+    };
+  }, [activePlugin, clampPluginWindowToWorkspace, pluginWindowMinimized]);
+
   // #WDD-gpt  2026-08-15 - 插件对话框以标题栏捕获指针并限制在视口内，避免拖动后窗口丢失。
   const beginPluginWindowDrag = (event: React.PointerEvent<HTMLElement>) => {
     if (event.button !== 0 || (event.target instanceof Element && event.target.closest('button'))) return;
@@ -1245,12 +1340,16 @@ export function App() {
     const workspaceBounds = workspaceRef.current?.getBoundingClientRect();
     const windowBounds = pluginWindowRef.current?.getBoundingClientRect();
     if (!workspaceBounds || !windowBounds) return;
-    const horizontalLimit = Math.max(0, (workspaceBounds.width - windowBounds.width) / 2 - 8);
-    const verticalLimit = Math.max(0, (workspaceBounds.height - windowBounds.height) / 2 - 8);
-    setPluginWindowPosition({
-      x: Math.max(-horizontalLimit, Math.min(horizontalLimit, drag.origin.x + event.clientX - drag.startX)),
-      y: Math.max(-verticalLimit, Math.min(verticalLimit, drag.origin.y + event.clientY - drag.startY)),
-    });
+    setPluginWindowPosition(clampPluginWindowPosition({
+      position: {
+        x: drag.origin.x + event.clientX - drag.startX,
+        y: drag.origin.y + event.clientY - drag.startY,
+      },
+      workspaceWidth: workspaceBounds.width,
+      workspaceHeight: workspaceBounds.height,
+      windowWidth: windowBounds.width,
+      windowHeight: windowBounds.height,
+    }));
   };
 
   const endPluginWindowDrag = (event: React.PointerEvent<HTMLElement>) => {
@@ -1683,6 +1782,8 @@ export function App() {
     setOriginBakeError(null);
     // #WDD-gpt 2026-08-19 - 打开任何新场景先清空书签；4CGS 解码完成后再以文件内三个槽位恢复。
     setCameraBookmarks([null, null, null]);
+    semanticClassificationRef.current?.cancel();
+    setSemanticClassificationState(INITIAL_SEMANTIC_CLASSIFICATION_STATE);
     setActiveGalleryId(null);
     setActivePlugin(null);
     setInspectorPanelVisible(!mobilePlayerMode);
@@ -1765,6 +1866,28 @@ export function App() {
       showAppError(error, 'model-health', () => { void runModelHealth(clean); });
     } finally {
       setModelHealthBusy(false);
+    }
+  };
+
+  const runSemanticClassification = (options: SemanticClassificationOptions) => {
+    if (!viewportRuntime) return;
+    setIsPlaying(false);
+    if (inspectorTab === 'semantic') setInspectorTab('scene');
+    void semanticClassificationRef.current?.classify(
+      viewportRuntime,
+      options,
+      setSemanticClassificationState,
+    );
+  };
+
+  const selectSemanticClass = (classId: number) => {
+    if (!viewportRuntime) return;
+    setIsPlaying(false);
+    try {
+      viewportRuntime.selectSemanticClass(classId);
+      // #WDD-gpt 2026-08-27 - 分类结果只更新稳定 ID 选区，保留用户当前浏览、变换或选择工具，不再强制切换矩形选择。
+    } catch (error) {
+      showAppError(error, 'semantic-classification');
     }
   };
 
@@ -1905,6 +2028,31 @@ export function App() {
                 <button onClick={() => setShowGrid((visible) => !visible)} type="button"><span>{copy.grid}</span><b>{showGrid ? '✓' : ''}</b></button>
                 <button onClick={() => setShowAxes((visible) => !visible)} type="button"><span>{copy.axes}</span><b>{showAxes ? '✓' : ''}</b></button>
                 <button onClick={() => setShowHeightRuler((visible) => !visible)} type="button"><span>{copy.heightRuler}</span><b>{showHeightRuler ? '✓' : ''}</b></button>
+                <label className="view-background-color">
+                  <span>{copy.backgroundColor}</span>
+                  <span className="view-background-color-value">
+                    <input
+                      aria-label={copy.backgroundColorHex}
+                      className="view-background-color-hex"
+                      maxLength={7}
+                      onChange={(event) => {
+                        if (isViewportBackgroundColor(event.target.value)) {
+                          setBackgroundColor(normalizeViewportBackgroundColor(event.target.value));
+                        }
+                      }}
+                      spellCheck={false}
+                      type="text"
+                      value={backgroundColor.toUpperCase()}
+                    />
+                    <input
+                      aria-label={copy.backgroundColorPicker}
+                      onChange={(event) => setBackgroundColor(normalizeViewportBackgroundColor(event.target.value))}
+                      title={copy.backgroundColorTip}
+                      type="color"
+                      value={backgroundColor}
+                    />
+                  </span>
+                </label>
               </div>
             )}
           </div>}
@@ -2282,6 +2430,7 @@ export function App() {
         <section className="viewport-stage">
           <GaussianViewport
             activeTool={activeTool}
+            backgroundColor={backgroundColor}
             brushRadius={selectionBrushRadius}
             currentFrame={currentFrame}
             forceSortSync={effectiveForceSortSync}
@@ -2505,7 +2654,9 @@ export function App() {
                 <div className="selection-cylinder-actions">
                   <button
                     disabled={selectionState.phase === 'selecting' || status.splatCount === 0}
-                    onClick={() => void viewportRuntime?.selectGaussiansInCylinder('replace')}
+                    onClick={(event) => void viewportRuntime?.selectGaussiansInCylinder(
+                      gaussianSelectionModeFromModifiers(event),
+                    )}
                     type="button"
                   >{copy.selectCylinder}</button>
                   <button
@@ -2572,8 +2723,12 @@ export function App() {
 
         {!mobilePlayerMode && inspectorPanelVisible && <aside aria-label={copy.inspector} className="panel inspector-panel glass-panel" data-camera-input-block>
           {/* #WDD-gpt 2026-08-15 - 检查器按职责分页，避免属性长列表挤压性能图表。 */}
-          <nav aria-label={copy.inspectorTabs} className="inspector-tabs" role="tablist">
-            {inspectorTabs.map((tab) => (
+          <nav
+            aria-label={copy.inspectorTabs}
+            className={semanticClassificationState.result ? 'inspector-tabs semantic-tab-available' : 'inspector-tabs'}
+            role="tablist"
+          >
+            {inspectorTabs.filter((tab) => tab.id !== 'semantic' || Boolean(semanticClassificationState.result)).map((tab) => (
               <button
                 aria-controls={`inspector-panel-${tab.id}`}
                 aria-selected={inspectorTab === tab.id}
@@ -2690,6 +2845,18 @@ export function App() {
                   <div><dt>{copy.status}</dt><dd className="ready-text">● {status.phase === 'loading' ? copy.loading : status.phase === 'error' ? copy.error : copy.ready}</dd></div>
                 </dl>
               </section>
+            )}
+
+            {inspectorTab === 'semantic' && semanticClassificationState.result && (
+              <SemanticClassificationResultsPanel
+                language={language}
+                onOpenSettings={() => {
+                  setActivePlugin('semantic-classification');
+                  setPluginWindowMinimized(false);
+                }}
+                onSelectClass={selectSemanticClass}
+                result={semanticClassificationState.result}
+              />
             )}
 
             {inspectorTab === 'performance' && (
@@ -2837,6 +3004,22 @@ export function App() {
                     onAnalyze={() => { void runModelHealth(false); }}
                     onClean={() => { void runModelHealth(true); }}
                     report={modelHealthReport}
+                  />
+                )}
+                {activePlugin === 'semantic-classification' && (
+                  <SemanticClassificationPanel
+                    disabled={transformDisabled}
+                    language={language}
+                    onCancel={() => {
+                      semanticClassificationRef.current?.cancel();
+                      setSemanticClassificationState({ stage: 'cancelled', progress: 0 });
+                    }}
+                    onRun={runSemanticClassification}
+                    onShowResults={() => {
+                      setInspectorPanelVisible(true);
+                      setInspectorTab('semantic');
+                    }}
+                    state={semanticClassificationState}
                   />
                 )}
               </div>}

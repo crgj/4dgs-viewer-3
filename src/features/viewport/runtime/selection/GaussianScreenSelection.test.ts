@@ -50,9 +50,11 @@ describe('GaussianScreenSelection', () => {
   it('maps editor modifiers and extracts stable IDs', () => {
     const base = { altKey: false, ctrlKey: false, metaKey: false, shiftKey: false };
     expect(gaussianSelectionModeFromModifiers(base)).toBe('replace');
-    expect(gaussianSelectionModeFromModifiers({ ...base, shiftKey: true })).toBe('add');
-    expect(gaussianSelectionModeFromModifiers({ ...base, altKey: true, shiftKey: true })).toBe('remove');
-    expect(gaussianSelectionModeFromModifiers({ ...base, metaKey: true })).toBe('toggle');
+    expect(gaussianSelectionModeFromModifiers({ ...base, ctrlKey: true })).toBe('add');
+    expect(gaussianSelectionModeFromModifiers({ ...base, metaKey: true })).toBe('add');
+    expect(gaussianSelectionModeFromModifiers({ ...base, shiftKey: true })).toBe('remove');
+    expect(gaussianSelectionModeFromModifiers({ ...base, altKey: true })).toBe('remove');
+    expect(gaussianSelectionModeFromModifiers({ ...base, ctrlKey: true, shiftKey: true })).toBe('remove');
     expect(gaussianSelectionIdsFromMask(Uint8Array.from([0, 1, 0, 1]))).toEqual([1, 3]);
   });
 });

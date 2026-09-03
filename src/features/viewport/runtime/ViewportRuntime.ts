@@ -38,6 +38,16 @@ import type {
   SmartAlignmentViewId,
 } from '../../../plugins/smart-alignment/SmartAlignmentTypes';
 import { smartAlignmentSphereDirection } from '../../../plugins/smart-alignment/SmartAlignmentSphereViews';
+import { classifyProjectedGaussians } from '../../../plugins/semantic-classification/SemanticGaussianClassifier';
+import { planSemanticCaptureFrames, planSemanticViewDirections } from '../../../plugins/semantic-classification/SemanticViewPlanner';
+import type {
+  SemanticApplyOptions,
+  SemanticCaptureOptions,
+  SemanticClassificationHost,
+  SemanticClassificationResult,
+  SemanticVector3,
+  SemanticViewCapture,
+} from '../../../plugins/semantic-classification/SemanticClassificationTypes';
 import { GaussianAssetImporter, detectGaussianSourceFormat } from '../../gaussian/formats/import/GaussianAssetImporter';
 import type {
   GaussianSourceFormat,
@@ -139,6 +149,7 @@ import {
 } from './selection/GaussianScreenSelection';
 import { Raw4DSelectionFrameSampler } from './selection/Raw4DSelectionFrameSampler';
 import { GaussianSequenceEditStore } from './selection/GaussianSequenceEditStore';
+import { viewportBackgroundColorRgb } from './ViewportBackgroundColor';
 import {
   Raw4DHistogramFrameSampler,
   buildGaussianHistogramBins,
@@ -421,6 +432,7 @@ interface PerformanceWithMemory extends Performance {
 }
 
 interface ViewportRuntimeOptions {
+  backgroundColor?: string;
   showGuides?: boolean;
   preserveDrawingBuffer?: boolean;
   memoryPolicy?: Gaussian4DMemoryPolicy;
@@ -438,7 +450,7 @@ interface SmartAlignmentCameraStart {
   readonly target: Vec3;
 }
 
-export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
+export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost, SemanticClassificationHost {
   private app: Application | null = null;
   private camera: Entity | null = null;
   private orbit: OrbitCameraController | null = null;
@@ -495,6 +507,8 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
   });
   private smartAlignmentCaptureRunning = false;
   private gs2MeshCaptureRunning = false;
+  private semanticCaptureRunning = false;
+  private readonly semanticClassIds = new WeakMap<GaussianEditStore, Uint16Array>();
   private transformLayer: Layer | null = null;
   private readonly transformGizmos = new Map<ViewportTransformTool, TransformGizmo>();
   private readonly history: EditorHistory;
@@ -579,9 +593,10 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
     installGaussianRenderModes(app, this.renderMode);
 
     const camera = new Entity('Editor Camera');
+    const [backgroundRed, backgroundGreen, backgroundBlue] = viewportBackgroundColorRgb(this.options.backgroundColor);
     camera.addComponent('camera', {
-      // #WDD-gpt 2026-08-16 - RAW4D 质量参考以纯黑清屏；避免近黑编辑器底色污染整帧 PSNR 与半透明边缘。
-      clearColor: new Color(0, 0, 0),
+      // #WDD-gpt 2026-09-02 - 编辑器允许自定义相机清屏色；未传入时仍严格回退纯黑，保持质量参考和独立渲染器语义。
+      clearColor: new Color(backgroundRed, backgroundGreen, backgroundBlue, 1),
       fov: 48,
       nearClip: 0.01,
       farClip: 200,
@@ -870,6 +885,13 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
     this.guides?.setGridVisible(visible);
   }
 
+  setBackgroundColor(value: string): void {
+    const camera = this.camera?.camera;
+    if (!camera) return;
+    const [red, green, blue] = viewportBackgroundColorRgb(value);
+    camera.clearColor = new Color(red, green, blue, 1);
+  }
+
   setAxesVisible(visible: boolean): void {
     this.axesVisible = visible;
     this.guides?.setAxesVisible(visible);
@@ -1102,7 +1124,8 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
     const bounds = this.canvas.getBoundingClientRect();
     this.startGaussianSelectionRun(
       createGaussianRectSelectionRegion({ left: 0, top: 0, right: bounds.width, bottom: bounds.height }),
-      { altKey: false, ctrlKey: true, metaKey: false, shiftKey: false },
+      { altKey: false, ctrlKey: false, metaKey: false, shiftKey: false },
+      'toggle',
     );
   }
 
@@ -1669,7 +1692,9 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
     if (!app || !camera?.camera || !this.activeRaw4D) {
       throw new Error('请先完成 RAW4D 文件导入。');
     }
-    if (this.smartAlignmentCaptureRunning) throw new Error('智能对齐抓帧正在进行。');
+    if (this.smartAlignmentCaptureRunning || this.gs2MeshCaptureRunning || this.semanticCaptureRunning) {
+      throw new Error('另一个多视角任务正在运行。');
+    }
     this.smartAlignmentCaptureRunning = true;
 
     const cameraPosition = camera.getLocalPosition().clone();
@@ -1718,6 +1743,168 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
     }
   }
 
+  // #WDD-gpt 2026-08-27 - 语义插件从用户当前构图出发生成固定均匀正交视角，双帧等待排序后再交给 CLIPSeg。
+  async captureSemanticClassificationViews(options: SemanticCaptureOptions): Promise<SemanticViewCapture[]> {
+    const app = this.app;
+    const camera = this.camera;
+    const raw4D = this.activeRaw4D;
+    const asset = this.activeRaw4DAsset;
+    if (!app || !camera?.camera || !raw4D || !asset) throw new Error('请先导入 Gaussian 场景。');
+    if (this.smartAlignmentCaptureRunning || this.gs2MeshCaptureRunning || this.semanticCaptureRunning) {
+      throw new Error('另一个多视角任务正在运行。');
+    }
+    this.semanticCaptureRunning = true;
+    const originalPosition = camera.getPosition().clone();
+    const originalRotation = camera.getRotation().clone();
+    const originalProjection = camera.camera.projection;
+    const originalOrthoHeight = camera.camera.orthoHeight;
+    const originalHorizontalFov = camera.camera.horizontalFov;
+    const originalFov = camera.camera.fov;
+    const originalNearClip = camera.camera.nearClip;
+    const originalFarClip = camera.camera.farClip;
+    const guidesEnabled = this.guides?.getEnabled() ?? false;
+    const captures: SemanticViewCapture[] = [];
+    const originalFrame = this.pendingFrame;
+    const start = this.getSmartAlignmentCameraStart();
+    const startDirection = originalPosition.clone().sub(start.target).normalize();
+    const directions = planSemanticViewDirections(
+      options.viewCount,
+      options.seed,
+      [startDirection.x, startDirection.y, startDirection.z],
+    );
+    const captureFrames = planSemanticCaptureFrames(asset.totalFrames, directions.length, originalFrame);
+    this.detachTransformGizmos();
+    this.orbit?.setInputEnabled(false);
+    this.guides?.setEnabled(false);
+    try {
+      for (let index = 0; index < directions.length; index += 1) {
+        const frame = captureFrames[index];
+        // #WDD-gpt 2026-08-27 - 动态 4GS 每个空间视角同时采样一个分散时间点，避免只看当前帧却给全生命周期 Gaussian 强行分类。
+        raw4D.setFrame(frame);
+        const metadata = this.configureSemanticClassificationCamera(
+          `random-${String(index + 1).padStart(2, '0')}`,
+          directions[index],
+          start,
+        );
+        await this.waitForPostRender();
+        await this.waitForPostRender();
+        captures.push({ ...metadata, frame, bitmap: await this.captureViewportBitmap() });
+        options.onProgress?.(index + 1, directions.length);
+      }
+      return captures;
+    } catch (error) {
+      captures.forEach(({ bitmap }) => bitmap.close());
+      throw error;
+    } finally {
+      camera.setPosition(originalPosition);
+      camera.setRotation(originalRotation);
+      camera.camera.projection = originalProjection;
+      camera.camera.orthoHeight = originalOrthoHeight;
+      camera.camera.horizontalFov = originalHorizontalFov;
+      camera.camera.fov = originalFov;
+      camera.camera.nearClip = originalNearClip;
+      camera.camera.farClip = originalFarClip;
+      raw4D.setFrame(originalFrame);
+      this.guides?.setEnabled(guidesEnabled);
+      this.semanticCaptureRunning = false;
+      this.updateTransformGizmoAttachment();
+      this.orbit?.setInputEnabled(true);
+    }
+  }
+
+  applySemanticClassification(options: SemanticApplyOptions): SemanticClassificationResult {
+    const raw4D = this.activeRaw4D;
+    const asset = this.activeRaw4DAsset;
+    if (!raw4D || !asset) throw new Error('语义分类应用时场景已退出内存。');
+    if (options.masks.length < 2) throw new Error('至少需要两个有效视角才能给 Gaussian 分类。');
+    const matrix = raw4D.entity.getWorldTransform();
+    const local = new Vec3();
+    const world = new Vec3();
+    const sampler = new Raw4DSelectionFrameSampler(asset);
+    const captureFrames = [...new Set(options.masks.map((mask) => mask.frame))];
+    const frames = captureFrames.map((frameIndex) => {
+      sampler.sample(frameIndex);
+      const sampled = sampler.properties;
+      const positions = new Float32Array(asset.splatCount * 3);
+      for (let stableId = 0; stableId < asset.splatCount; stableId += 1) {
+        matrix.transformPoint(local.set(sampled.x[stableId], sampled.y[stableId], sampled.z[stableId]), world);
+        const offset = stableId * 3;
+        positions[offset] = world.x;
+        positions[offset + 1] = world.y;
+        positions[offset + 2] = world.z;
+      }
+      return { frame: frameIndex, positions, opacities: sampled.opacity.slice() };
+    });
+    const current = frames.find((frame) => frame.frame === this.pendingFrame) ?? frames[0];
+    if (!current) throw new Error('语义分类没有可用的时空采样帧。');
+    const { min, max } = this.getSmartAlignmentWorldBounds();
+    const diagonal = Math.max(1e-4, max.clone().sub(min).length());
+    const projected = classifyProjectedGaussians({
+      positions: current.positions,
+      opacities: current.opacities,
+      frames,
+      deletedWords: raw4D.edits.deletionWords,
+      tags: options.tags,
+      views: options.masks,
+      threshold: Math.max(0.05, Math.min(0.95, options.threshold)),
+      occlusionTolerance: diagonal * 0.0125,
+    });
+    const classDefinition = raw4D.edits.getAttributeDefinition('semantic.class_id');
+    if (classDefinition && (classDefinition.type !== 'u16' || classDefinition.components !== 1 || classDefinition.sparse)) {
+      raw4D.edits.deleteAttribute('semantic.class_id');
+    }
+    if (!raw4D.edits.getAttributeDefinition('semantic.class_id')) {
+      raw4D.defineAttribute({ name: 'semantic.class_id', type: 'u16', residency: 'cpu-only' });
+    }
+    const confidenceDefinition = raw4D.edits.getAttributeDefinition('semantic.confidence');
+    if (confidenceDefinition && (confidenceDefinition.type !== 'u8' || confidenceDefinition.components !== 1 || confidenceDefinition.sparse)) {
+      raw4D.edits.deleteAttribute('semantic.confidence');
+    }
+    if (!raw4D.edits.getAttributeDefinition('semantic.confidence')) {
+      raw4D.defineAttribute({ name: 'semantic.confidence', type: 'u8', residency: 'cpu-only' });
+    }
+    raw4D.setDenseAttributeValues('semantic.class_id', projected.classIds);
+    raw4D.setDenseAttributeValues('semantic.confidence', projected.confidences);
+    this.semanticClassIds.set(raw4D.edits, projected.classIds.slice());
+    return {
+      pointCount: asset.splatCount,
+      activePointCount: projected.activePointCount,
+      deletedPointCount: projected.deletedPointCount,
+      classifiedCount: projected.classifiedCount,
+      unclassifiedCount: projected.activePointCount - projected.classifiedCount,
+      directCount: projected.directCount,
+      propagatedCount: projected.propagatedCount,
+      coverage: projected.activePointCount > 0 ? projected.classifiedCount / projected.activePointCount : 1,
+      meanConfidence: projected.meanConfidence,
+      viewCount: options.masks.length,
+      frameCount: frames.length,
+      seed: options.seed,
+      classes: projected.classes,
+    };
+  }
+
+  selectSemanticClass(classId: number): number {
+    const raw4D = this.activeRaw4D;
+    if (!raw4D) throw new Error('请先导入 Gaussian 场景。');
+    const cached = this.semanticClassIds.get(raw4D.edits);
+    const stableIds: number[] = [];
+    for (let stableId = 0; stableId < raw4D.splatCount; stableId += 1) {
+      if (raw4D.edits.isDeleted(stableId)) continue;
+      const value = cached?.[stableId] ?? raw4D.edits.getAttribute('semantic.class_id', stableId)?.[0] ?? 0;
+      if (value === classId) stableIds.push(stableId);
+    }
+    raw4D.selectStableIds(stableIds, 'replace');
+    this.selectionScope = 'visible';
+    this.publishSelectionState({
+      phase: 'ready',
+      scope: 'visible',
+      progress: 1,
+      selectedCount: stableIds.length,
+      hitCount: stableIds.length,
+    });
+    return stableIds.length;
+  }
+
   async captureGS2MeshViews(options: GS2MeshCaptureOptions): Promise<GS2MeshCaptureResult> {
     const app = this.app;
     const camera = this.camera;
@@ -1729,7 +1916,7 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
     if (camera.camera.projection === PROJECTION_ORTHOGRAPHIC) {
       throw new Error('GS2Mesh 双目深度需要透视摄像机，请先切换回透视视图。');
     }
-    if (this.gs2MeshCaptureRunning || this.smartAlignmentCaptureRunning) {
+    if (this.gs2MeshCaptureRunning || this.smartAlignmentCaptureRunning || this.semanticCaptureRunning) {
       throw new Error('另一个多视角抓帧任务正在进行。');
     }
     const viewCount = Math.max(3, Math.min(16, Math.round(options.viewCount)));
@@ -3840,11 +4027,12 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
   private startGaussianSelectionRun(
     region: GaussianScreenSelectionRegion,
     modifiers: GaussianSelectionModifiers,
+    modeOverride?: GaussianSelectionMode,
   ): void {
     const runId = ++this.selectionRunId;
     const scope = this.selectionScope;
     this.orbit?.setInputEnabled(false);
-    void this.selectGaussiansInScreenRegion(scope, region, modifiers, runId).finally(() => {
+    void this.selectGaussiansInScreenRegion(scope, region, modifiers, runId, modeOverride).finally(() => {
       if (runId === this.selectionRunId && this.selectionPolygonPoints.length === 0) {
         this.orbit?.setInputEnabled(true);
       }
@@ -3887,6 +4075,7 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
     region: GaussianScreenSelectionRegion,
     modifiers: GaussianSelectionModifiers,
     runId: number,
+    modeOverride?: GaussianSelectionMode,
   ): Promise<void> {
     const raw4D = this.activeRaw4D;
     const asset = this.activeRaw4DAsset;
@@ -4001,7 +4190,8 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
         }
       }
 
-      const mode = gaussianSelectionModeFromModifiers(modifiers);
+      // #WDD-gpt 2026-08-27 - 用户选择遵循 Ctrl 增选/Shift 去除；反选等内部命令使用显式模式，避免快捷键改动破坏原语义。
+      const mode = modeOverride ?? gaussianSelectionModeFromModifiers(modifiers);
       let hitCount = 0;
       for (const selected of selectedBySegment) {
         hitCount += selected.stableIds.length;
@@ -4532,6 +4722,39 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost {
     return {
       id,
       center: [frameCenter.x, frameCenter.y, frameCenter.z],
+      right: [right.x, right.y, right.z],
+      up: [up.x, up.y, up.z],
+      forward: [forward.x, forward.y, forward.z],
+      horizontalSpan: orthoHeight * 2,
+      verticalSpan: orthoHeight * 2,
+    };
+  }
+
+  private configureSemanticClassificationCamera(
+    id: string,
+    direction: SemanticVector3,
+    start: SmartAlignmentCameraStart,
+  ): Omit<SemanticViewCapture, 'bitmap' | 'frame'> {
+    const camera = this.camera;
+    if (!camera?.camera) throw new Error('语义分类摄像机不可用。');
+    const cameraDirection = new Vec3(...direction).normalize();
+    const forward = cameraDirection.clone().mulScalar(-1);
+    const upHint = Math.abs(forward.dot(Vec3.UP)) > 0.92 ? Vec3.FORWARD : Vec3.UP;
+    const right = new Vec3().cross(forward, upHint).normalize();
+    const up = new Vec3().cross(right, forward).normalize();
+    const { min, max } = this.getSmartAlignmentWorldBounds();
+    const diagonal = max.clone().sub(min).length();
+    const distance = Math.max(start.distance, 2, diagonal * 1.4);
+    const orthoHeight = start.captureSpan * 0.5;
+    camera.camera.projection = PROJECTION_ORTHOGRAPHIC;
+    camera.camera.orthoHeight = orthoHeight;
+    camera.camera.nearClip = 0.01;
+    camera.camera.farClip = Math.max(200, distance * 4);
+    camera.setPosition(start.target.clone().add(cameraDirection.mulScalar(distance)));
+    camera.lookAt(start.target, up);
+    return {
+      id,
+      center: [start.target.x, start.target.y, start.target.z],
       right: [right.x, right.y, right.z],
       up: [up.x, up.y, up.z],
       forward: [forward.x, forward.y, forward.z],

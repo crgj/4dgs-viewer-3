@@ -443,6 +443,58 @@ input:focus-visible {
   color: var(--accent-bright);
 }
 
+/* #WDD-gpt 2026-09-02 - 视图菜单提供紧凑原生色板和十六进制回显，背景调整时菜单保持可见。 */
+.view-background-color {
+  display: flex;
+  min-height: 38px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 9px;
+  border-top: 1px solid rgba(255, 255, 255, 0.055);
+  color: #c4c8d0;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.view-background-color-value {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.view-background-color .view-background-color-hex {
+  width: 58px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  outline: 0;
+  color: #7f8795;
+  background: transparent;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 9px;
+  text-transform: uppercase;
+}
+
+.view-background-color input[type='color'] {
+  width: 28px;
+  height: 22px;
+  padding: 1px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 6px;
+  background: #111318;
+  cursor: pointer;
+}
+
+.view-background-color input[type='color']::-webkit-color-swatch-wrapper {
+  padding: 1px;
+}
+
+.view-background-color input[type='color']::-webkit-color-swatch {
+  border: 0;
+  border-radius: 3px;
+}
+
 /* #WDD-gpt 2026-08-17 - 文件菜单的导出项提供 .4cgs 文件与 .ply 序列二级子菜单，悬停展开。 */
 .submenu-anchor {
   position: relative;
@@ -1405,13 +1457,15 @@ input:focus-visible {
   display: grid;
   place-items: center;
   padding: 18px;
+  overflow: hidden;
   pointer-events: none;
 }
 
 .plugin-workspace {
   display: flex;
-  width: min(520px, calc(100vw - 48px));
-  max-height: calc(100% - 20px);
+  width: min(520px, 100%);
+  max-width: 100%;
+  max-height: 100%;
   flex-direction: column;
   overflow: hidden;
   border-radius: 14px;
@@ -1421,12 +1475,17 @@ input:focus-visible {
 }
 
 .plugin-workspace.minimized {
-  width: min(410px, calc(100vw - 48px));
+  width: min(410px, 100%);
 }
 
 .plugin-workspace-relighting {
   /* #WDD-gpt 2026-08-21 - 重光照包含两步参数与运行指标，扩大工作宽度，避免标题、输入和状态互相挤压。 */
-  width: min(720px, calc(100vw - 48px));
+  width: min(720px, 100%);
+}
+
+.plugin-workspace-semantic-classification {
+  /* #WDD-gpt 2026-08-26 - 语义插件并排显示类别名、Prompt 和颜色，扩大弹窗避免输入被截断。 */
+  width: min(640px, 100%);
 }
 
 .plugin-workspace-heading {
@@ -3003,6 +3062,15 @@ select.ui-select optgroup {
   padding: 5px 6px;
   border-bottom: 1px solid var(--stroke);
   background: rgba(10, 12, 15, 0.22);
+}
+
+/* #WDD-gpt 2026-08-27 - 语义结果存在时动态增加第五个右侧页签，分类完成前不占用检查器宽度。 */
+.inspector-tabs.semantic-tab-available {
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+}
+
+.inspector-tabs.semantic-tab-available .inspector-tab {
+  font-size: 11px;
 }
 
 .inspector-tab {

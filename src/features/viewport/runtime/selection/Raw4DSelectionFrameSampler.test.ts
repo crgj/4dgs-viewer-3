@@ -47,4 +47,30 @@ describe('Raw4DSelectionFrameSampler', () => {
       expect([...selection.properties[property]]).toEqual([...renderer.properties[property]]);
     }
   });
+
+  it('matches per-point lifetime endpoint positions and does not gate baked opacity twice', () => {
+    const asset: Raw4DAsset = {
+      ...testAsset(),
+      position: track(3, [
+        [0, 10], [0, 0], [0, 0],
+        [4, 14], [0, 0], [0, 0],
+      ], [0, 2]),
+      opacity: track(1, [[0, 0], [0, 0], [0, 0]], [0, 1, 2]),
+      lifetimeMu: new Float32Array([1, 1]),
+      lifetimeW: new Float32Array([1, 0.5]),
+      positionTiming: 'per-point-lifetime-endpoints',
+      opacityTiming: 'baked',
+    };
+    const selection = new Raw4DSelectionFrameSampler(asset);
+    const renderer = new Raw4DFrameSampler(asset);
+
+    selection.sample(1);
+    renderer.sample(1);
+
+    for (const property of ['x', 'y', 'z', 'opacity'] as const) {
+      expect([...selection.properties[property]]).toEqual([...renderer.properties[property]]);
+    }
+    expect([...selection.properties.x]).toEqual([2, 12]);
+    expect([...selection.properties.opacity]).toEqual([0.5, 0.5]);
+  });
 });

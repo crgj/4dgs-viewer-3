@@ -73,6 +73,23 @@ export class Raw4DSelectionFrameSampler {
 
   private samplePosition(frame: number): void {
     const track = this.asset.position;
+    // #WDD-gpt 2026-08-27 - 4GS 两个位置 bank 是每点生命周期端点，不是全局首尾帧；选择、分类与渲染必须使用同一逐点时间参数。
+    if (this.asset.positionTiming === 'per-point-lifetime-endpoints') {
+      const destinations = [this.properties.x, this.properties.y, this.properties.z];
+      for (let index = 0; index < this.asset.splatCount; index += 1) {
+        const center = readRaw4DScalar(this.asset.lifetimeMu, index, this.asset.sourceEncoding);
+        const halfWidth = Math.max(0, readRaw4DScalar(this.asset.lifetimeW, index, this.asset.sourceEncoding));
+        const start = center - halfWidth;
+        const end = center + halfWidth;
+        const alpha = end > start ? Math.max(0, Math.min(1, (frame - start) / (end - start))) : 0;
+        for (let component = 0; component < 3; component += 1) {
+          const left = readRaw4DScalar(track.values[component], index, track.encoding);
+          const right = readRaw4DScalar(track.values[3 + component], index, track.encoding);
+          destinations[component][index] = left + (right - left) * alpha;
+        }
+      }
+      return;
+    }
     const span = trackSpan(track, frame);
     const destinations = [this.properties.x, this.properties.y, this.properties.z];
     for (let component = 0; component < 3; component += 1) {
@@ -98,11 +115,14 @@ export class Raw4DSelectionFrameSampler {
         readRaw4DScalar(right, index, track.encoding),
         span.alpha,
       );
-      const lifetimeMu = readRaw4DScalar(this.asset.lifetimeMu, index, this.asset.sourceEncoding);
-      const lifetimeW = readRaw4DScalar(this.asset.lifetimeW, index, this.asset.sourceEncoding);
-      const leftGate = stableSigmoid(10 * (frame - (lifetimeMu - lifetimeW)));
-      const rightGate = stableSigmoid(10 * ((lifetimeMu + lifetimeW) - frame));
-      this.properties.opacity[index] = stableSigmoid(logit) * leftGate * rightGate;
+      let gate = 1;
+      if (this.asset.opacityTiming !== 'baked') {
+        const lifetimeMu = readRaw4DScalar(this.asset.lifetimeMu, index, this.asset.sourceEncoding);
+        const lifetimeW = readRaw4DScalar(this.asset.lifetimeW, index, this.asset.sourceEncoding);
+        gate = stableSigmoid(10 * (frame - (lifetimeMu - lifetimeW)))
+          * stableSigmoid(10 * ((lifetimeMu + lifetimeW) - frame));
+      }
+      this.properties.opacity[index] = stableSigmoid(logit) * gate;
     }
   }
 }

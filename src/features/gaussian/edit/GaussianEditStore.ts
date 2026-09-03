@@ -323,6 +323,33 @@ export class GaussianEditStore {
     this.emit({ kind: 'attribute', stableIds: [stableId], attribute: name });
   }
 
+  // #WDD-gpt 2026-08-26 - 语义分类会一次写入百万级 Gaussian，按 Canonical 页批量替换属性，避免逐点事件和稀疏插入退化。
+  setDenseAttributeValues(name: string, values: GaussianAttributeArray): void {
+    const column = this.requireColumn(name);
+    const expected = this.pointCount * column.definition.components;
+    if (column.definition.sparse) {
+      throw new Error(`Gaussian attribute "${name}" is sparse and cannot accept a dense snapshot.`);
+    }
+    if (values.length !== expected) {
+      throw new Error(`Gaussian attribute "${name}" requires ${expected} values, received ${values.length}.`);
+    }
+    const expectedArray = createAttributeArray(column.definition.type, 0);
+    if (values.constructor !== expectedArray.constructor) {
+      throw new Error(`Gaussian attribute "${name}" received a mismatched typed array.`);
+    }
+    column.pages.clear();
+    for (let firstPoint = 0; firstPoint < this.pointCount; firstPoint += this.pageSize) {
+      const pageIndex = Math.floor(firstPoint / this.pageSize);
+      const pagePoints = Math.min(this.pageSize, this.pointCount - firstPoint);
+      const firstValue = firstPoint * column.definition.components;
+      const valueCount = pagePoints * column.definition.components;
+      const pageValues = createAttributeArray(column.definition.type, valueCount);
+      pageValues.set(values.subarray(firstValue, firstValue + valueCount) as never);
+      column.pages.set(pageIndex, { kind: 'dense', values: pageValues });
+    }
+    this.emit({ kind: 'attribute', attribute: name });
+  }
+
   getAttribute(name: string, stableId: number): readonly number[] | null {
     this.validateId(stableId);
     const column = this.requireColumn(name);

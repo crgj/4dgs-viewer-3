@@ -55,11 +55,10 @@ export function gaussianSelectionRectContains(
   return x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
 }
 
-// #WDD-gpt  2026-08-16 - 沿用常见编辑器修饰键：Shift 添加、Alt 减去、Ctrl/Cmd 切换。
+// #WDD-gpt 2026-08-27 - 统一选择修饰键：Ctrl/Cmd 增选，Shift 去除；Shift 优先保证组合按键不会误增选。
 export function gaussianSelectionModeFromModifiers(modifiers: GaussianSelectionModifiers): GaussianSelectionMode {
-  if (modifiers.altKey) return 'remove';
-  if (modifiers.ctrlKey || modifiers.metaKey) return 'toggle';
-  if (modifiers.shiftKey) return 'add';
+  if (modifiers.shiftKey || modifiers.altKey) return 'remove';
+  if (modifiers.ctrlKey || modifiers.metaKey) return 'add';
   return 'replace';
 }
 

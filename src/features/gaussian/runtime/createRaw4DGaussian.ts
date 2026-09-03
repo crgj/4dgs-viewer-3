@@ -7,6 +7,7 @@ import {
 import type { GaussianCanonicalDataset } from '../data/GaussianCanonicalDataset';
 import {
   GaussianEditStore,
+  type GaussianAttributeArray,
   type GaussianAttributeDefinition,
   type GaussianSelectionMode,
 } from '../edit/GaussianEditStore';
@@ -50,6 +51,7 @@ export interface Raw4DGaussian {
   selectStableIds(stableIds: readonly number[], mode?: GaussianSelectionMode): void;
   defineAttribute(definition: GaussianAttributeDefinition): void;
   setAttribute(name: string, stableId: number, value: number | readonly number[]): void;
+  setDenseAttributeValues(name: string, values: GaussianAttributeArray): void;
   setAllMode(enabled: boolean): void;
   setShBands(level: number): number;
   refreshSourceData(): Promise<void>;
@@ -119,6 +121,7 @@ export async function createRaw4DGaussian(
     selectStableIds: (stableIds, mode = 'replace') => edits.select(stableIds, mode),
     defineAttribute: (definition) => edits.defineAttribute(definition),
     setAttribute: (name, stableId, value) => edits.setAttribute(name, stableId, value),
+    setDenseAttributeValues: (name, values) => edits.setDenseAttributeValues(name, values),
     setAllMode: (enabled) => gpuPlayback.setAllMode(enabled),
     setShBands: (level) => {
       const next = resource.setDisplayShBands(level);
