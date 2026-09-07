@@ -57,6 +57,7 @@ import {
   exportCompactedRaw4DSource,
   type Raw4DExportProgress,
 } from '../../gaussian/formats/raw4d/Raw4DExporter';
+import { exportRaw4DSegmentBatch } from '../../gaussian/formats/raw4d/Raw4DSegmentExporter';
 import { readRaw4DScalar, readRaw4DTrack } from '../../gaussian/formats/raw4d/Raw4DValues';
 import type {
   GaussianAttributeDefinition,
@@ -258,6 +259,42 @@ export interface ViewportTransformBakeResult {
   readonly segmentCount: number;
   readonly shBands: number;
   readonly shRotated: boolean;
+}
+
+export interface ViewportRaw4DSegmentExportProgress {
+  readonly completedSegments: number;
+  readonly filename: string;
+  readonly ratio: number;
+  readonly segmentCount: number;
+  readonly segmentIndex: number;
+  readonly segmentRatio: number;
+  readonly sourceName: string;
+  readonly stage: 'encoding' | 'writing' | 'complete';
+  readonly totalPoints: number;
+  readonly writtenPoints: number;
+}
+
+export interface ViewportRaw4DSegmentExportFile {
+  readonly blob: Blob;
+  readonly filename: string;
+  readonly pointCount: number;
+  readonly segmentCount: number;
+  readonly segmentIndex: number;
+  readonly sourceName: string;
+  readonly sourcePreserved: boolean;
+}
+
+export interface ViewportRaw4DSegmentExportResult {
+  readonly fileCount: number;
+  readonly outputBytes: number;
+  readonly pointCount: number;
+  readonly sourcePreservedCount: number;
+}
+
+export interface ViewportRaw4DSegmentExportOptions {
+  readonly onProgress?: (progress: ViewportRaw4DSegmentExportProgress) => void;
+  readonly signal?: AbortSignal;
+  readonly writeSegment: (file: ViewportRaw4DSegmentExportFile) => Promise<void>;
 }
 
 export interface ViewportGaussianSelectionSequenceSegment {
@@ -1004,6 +1041,44 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost, Semanti
       && (this.activeFormat === 'RAW4D' || this.activeFormat === 'PLY4')
       ? exportCompactedRaw4DSource(this.activeRaw4DSource, raw4D.edits.deletionWords, { onProgress })
       : encodeCompactedRaw4D(asset, raw4D.edits.deletionWords, { onProgress });
+  }
+
+  // #WDD-gpt 2026-09-07 - RAW4D 多段导出按时间轴驻留顺序逐段压实并立即提交，保留原分段边界且不同时持有全部输出 Blob。
+  async exportCompactedRaw4DSegments(
+    outputNames: readonly string[],
+    options: ViewportRaw4DSegmentExportOptions,
+  ): Promise<ViewportRaw4DSegmentExportResult> {
+    const sequence = this.gaussianSelectionSequence;
+    const entries = sequence && this.raw4DSequenceGpuOrder.length > 0
+      ? this.raw4DSequenceGpuOrder.map((residentId, segmentIndex) => {
+        const resident = this.residentRaw4DSegments.get(residentId);
+        if (!resident) throw new Error(`RAW4D 第 ${segmentIndex + 1} 段已退出系统内存。`);
+        return {
+          asset: resident.loaded.asset,
+          deletionWords: sequence.edits.segment(segmentIndex).edits.deletionWords,
+          source: resident.handle.file,
+        };
+      })
+      : this.activeRaw4D && this.activeRaw4DAsset
+        ? [{
+          asset: this.activeRaw4DAsset,
+          deletionWords: this.activeRaw4D.edits.deletionWords,
+          source: this.activeRaw4DSource,
+        }]
+        : [];
+    if (entries.length === 0) throw new Error('No active RAW4D dataset.');
+    if (outputNames.length !== entries.length) {
+      throw new Error(`RAW4D export expected ${entries.length} output names, received ${outputNames.length}.`);
+    }
+    return exportRaw4DSegmentBatch(entries.map((entry, index) => ({
+      ...entry,
+      filename: outputNames[index],
+      sourcePreserved: Boolean(
+        entry.source
+        && !this.dirtyRaw4DAssets.has(entry.asset)
+        && (this.activeFormat === 'RAW4D' || this.activeFormat === 'PLY4'),
+      ),
+    })), options);
   }
 
   // #WDD-gpt 2026-08-16 - 4CGS 导出按原始 File 身份快照每段删除位集，避免时间排序后把 A 段删除掩码误套到 B 段。

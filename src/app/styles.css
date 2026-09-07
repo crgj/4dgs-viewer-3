@@ -4629,6 +4629,11 @@ button.outliner-row:hover,
 .export-preflight dt { color: #737d89; }
 .export-preflight dd { min-width: 0; margin: 0; overflow-wrap: anywhere; color: #c7cdd4; text-align: right; }
 .export-preflight p { margin: 11px 0 0; color: #7f8995; font-size: 8px; line-height: 1.6; }
+/* #WDD-gpt 2026-09-07 - RAW4D 多段导出在确认前预览真实输出文件名和每段帧范围。 */
+.export-segment-preview { display: grid; max-height: 112px; gap: 4px; margin: 10px 0 0; padding: 0; overflow-y: auto; list-style: none; }
+.export-segment-preview li { display: flex; min-width: 0; justify-content: space-between; gap: 10px; padding: 5px 7px; border-radius: 6px; background: rgba(67, 218, 173, 0.055); font: 7px/1.35 "SFMono-Regular", Consolas, monospace; }
+.export-segment-preview span { min-width: 0; overflow: hidden; color: #aeb8bf; text-overflow: ellipsis; white-space: nowrap; }
+.export-segment-preview b { flex: 0 0 auto; color: #55d9b3; font-weight: 650; }
 .export-center-dialog > footer { display: flex; justify-content: flex-end; gap: 8px; padding: 12px 20px 17px; border-top: 1px solid rgba(255, 255, 255, 0.07); }
 
 .app-notice-suggestion { display: flex; gap: 8px; margin: 0 0 12px; padding: 10px; border: 1px solid rgba(82, 218, 178, 0.14); border-radius: 8px; color: #9da8b2; background: rgba(82, 218, 178, 0.045); font-size: 8px; line-height: 1.55; }

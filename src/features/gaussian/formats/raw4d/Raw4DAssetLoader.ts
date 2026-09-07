@@ -22,12 +22,23 @@ interface Raw4DPendingLoad {
   cleanupAbort(): void;
 }
 
+let nextRaw4DLoaderNamespace = 1;
+
+function createRaw4DLoaderNamespace(): string {
+  const uuid = globalThis.crypto?.randomUUID?.();
+  if (uuid) return `raw4d-loader-${uuid}`;
+  return `raw4d-loader-${Date.now().toString(36)}-${nextRaw4DLoaderNamespace++}`;
+}
+
 export class Raw4DAssetLoader {
   private worker: Worker | null = null;
   private readonly pendingLoads = new Map<number, Raw4DPendingLoad>();
   private readonly backingBufferIds = new Set<string>();
   private nextRequestId = 1;
   private destroyed = false;
+
+  // #WDD-gpt 2026-09-07 - 各 Loader Worker 的时间戳与局部计数可能同时相同；主线程命名空间保证 CPU/GPU 驻留键跨 Worker 唯一。
+  constructor(private readonly residencyNamespace = createRaw4DLoaderNamespace()) {}
 
   load(
     file: File,
@@ -111,10 +122,12 @@ export class Raw4DAssetLoader {
       return;
     }
 
-    this.backingBufferIds.add(response.bufferId);
+    const workerBufferId = response.bufferId;
+    const residencyBufferId = `${this.residencyNamespace}:${workerBufferId}`;
+    this.backingBufferIds.add(workerBufferId);
     let released = false;
     pending.resolve({
-      bufferId: response.bufferId,
+      bufferId: residencyBufferId,
       asset: response.asset,
       cpuResidentBytes: response.cpuResidentBytes,
       sourceToResidentRatio: pending.fileSize / Math.max(1, response.cpuResidentBytes),
@@ -123,8 +136,8 @@ export class Raw4DAssetLoader {
       releaseBacking: () => {
         if (released) return;
         released = true;
-        this.backingBufferIds.delete(response.bufferId);
-        this.post({ type: 'release', bufferId: response.bufferId });
+        this.backingBufferIds.delete(workerBufferId);
+        this.post({ type: 'release', bufferId: workerBufferId });
       },
     });
   }

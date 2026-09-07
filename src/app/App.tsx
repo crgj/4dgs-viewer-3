@@ -115,7 +115,11 @@ import { SceneOutliner } from './components/SceneOutliner';
 import { GaussianHistogramPanel } from './components/GaussianHistogramPanel';
 import { WelcomePage } from './components/WelcomePage';
 import { ExportCenterDialog } from './components/ExportCenterDialog';
-import { supportsFourCgsSceneExport, type ExportTarget } from './components/ExportCenterModel';
+import {
+  supportsFourCgsSceneExport,
+  supportsRaw4DSceneExport,
+  type ExportTarget,
+} from './components/ExportCenterModel';
 import { describeAppError } from './errors/AppError';
 import {
   clearWorkspaceDraft,
@@ -138,6 +142,12 @@ import {
   isFilePickerAbort,
   writeBlobToFileHandle,
 } from './fourCgsFileSave';
+import {
+  createRaw4DSavePickerOptions,
+  RAW4D_SEGMENTS_DIRECTORY_PICKER_OPTIONS,
+  uniqueRaw4DExportFilenames,
+  writeRaw4DBlobToDirectory,
+} from './raw4dFileSave';
 import {
   fetchFourCgsGalleryFile,
   type FourCgsGalleryItem,
@@ -254,7 +264,7 @@ const transformAxes = ['x', 'y', 'z'] as const;
 const playbackFpsOptions = [1, 2, 4, 10, 15, 30, 60] as const;
 
 interface ExportMonitorState {
-  readonly kind: 'fourcgs' | 'ply-sequence';
+  readonly kind: 'fourcgs' | 'raw4d' | 'ply-sequence';
   readonly phase: 'running' | 'success' | 'error' | 'cancelled';
   readonly inputBytes: number;
   readonly progress: FourCgsProgress;
@@ -264,6 +274,12 @@ interface ExportMonitorState {
     readonly segmentCount: number;
     readonly frameCount: number;
     readonly deletedPointCount: number;
+  };
+  readonly raw4DStats?: {
+    readonly completedFiles: number;
+    readonly fileCount: number;
+    readonly pointCount: number;
+    readonly sourcePreservedCount: number;
   };
   readonly outputBytes?: number;
   readonly error?: string;
@@ -536,6 +552,9 @@ export function App() {
   const [plyDirectoryDialogVisible, setPlyDirectoryDialogVisible] = useState(false);
   const [plyDirectoryPicking, setPlyDirectoryPicking] = useState(false);
   const [plyDirectoryError, setPlyDirectoryError] = useState<string | null>(null);
+  const [raw4DDirectoryDialogVisible, setRaw4DDirectoryDialogVisible] = useState(false);
+  const [raw4DDirectoryPicking, setRaw4DDirectoryPicking] = useState(false);
+  const [raw4DDirectoryError, setRaw4DDirectoryError] = useState<string | null>(null);
   const [appNotice, setAppNotice] = useState<{
     readonly message: string;
     readonly title: string;
@@ -693,6 +712,18 @@ export function App() {
     window.addEventListener('keydown', closeOnEscape, true);
     return () => window.removeEventListener('keydown', closeOnEscape, true);
   }, [plyDirectoryDialogVisible, plyDirectoryPicking]);
+  useEffect(() => {
+    if (!raw4DDirectoryDialogVisible || raw4DDirectoryPicking) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      setRaw4DDirectoryDialogVisible(false);
+      setRaw4DDirectoryError(null);
+    };
+    window.addEventListener('keydown', closeOnEscape, true);
+    return () => window.removeEventListener('keydown', closeOnEscape, true);
+  }, [raw4DDirectoryDialogVisible, raw4DDirectoryPicking]);
   useEffect(() => {
     if (!appNotice) return;
     const closeOnEscape = (event: KeyboardEvent) => {
@@ -1599,6 +1630,226 @@ export function App() {
     downloadBlob(workspaceBlob, 'dong-editor-3-workspace.json');
   };
 
+  type Raw4DExportDestination =
+    | { readonly kind: 'file'; readonly handle: FileSystemFileHandle }
+    | { readonly kind: 'directory'; readonly handle: FileSystemDirectoryHandle };
+
+  // #WDD-gpt 2026-09-07 - 单段 RAW4D 使用另存为，多段则逐段写入同一授权目录；每个 Blob 提交后即可释放。
+  const runRaw4DExport = async (runtime: ViewportRuntime, destination: Raw4DExportDestination) => {
+    const sourceNames = status.raw4dSequence?.segments.map((segment) => segment.name)
+      ?? (sourceFiles.length > 0 ? sourceFiles.map((file) => file.name) : [status.sourceName ?? 'segment.raw4d']);
+    const outputNames = destination.kind === 'file'
+      ? [destination.handle.name]
+      : uniqueRaw4DExportFilenames(sourceNames);
+    const controller = new AbortController();
+    exportAbortRef.current = controller;
+    exportStartedAtRef.current = performance.now();
+    setExportElapsedMs(0);
+    setExportProgress(0);
+    setExportMonitor({
+      kind: 'raw4d',
+      phase: 'running',
+      inputBytes: sourceFiles.reduce((sum, file) => sum + file.size, 0),
+      progress: {
+        ratio: 0,
+        message: language === 'zh'
+          ? `准备导出 ${outputNames.length} 个 RAW4D 片段`
+          : `Preparing ${outputNames.length} RAW4D segment export${outputNames.length === 1 ? '' : 's'}`,
+        stage: language === 'zh' ? '内存快照' : 'Memory snapshot',
+        stageRatio: 0,
+        workerCount: 1,
+        completedTasks: 0,
+        totalTasks: outputNames.length,
+      },
+      raw4DStats: {
+        completedFiles: 0,
+        fileCount: outputNames.length,
+        pointCount: 0,
+        sourcePreservedCount: 0,
+      },
+      logs: [{
+        elapsedMs: 0,
+        message: destination.kind === 'file'
+          ? (language === 'zh' ? `开始保存 ${destination.handle.name}` : `Saving ${destination.handle.name}`)
+          : (language === 'zh' ? `开始向目录 ${destination.handle.name} 写入 ${outputNames.length} 个片段` : `Writing ${outputNames.length} segments to ${destination.handle.name}`),
+      }],
+    });
+    try {
+      const result = await runtime.exportCompactedRaw4DSegments(outputNames, {
+        signal: controller.signal,
+        onProgress: (progress) => {
+          const message = progress.stage === 'encoding'
+            ? (language === 'zh'
+                ? `正在压实片段 ${progress.segmentIndex + 1}/${progress.segmentCount} · ${progress.filename}`
+                : `Compacting segment ${progress.segmentIndex + 1}/${progress.segmentCount} · ${progress.filename}`)
+            : progress.stage === 'writing'
+              ? (language === 'zh' ? `正在写入 ${progress.filename}` : `Writing ${progress.filename}`)
+              : (language === 'zh' ? `已写入 ${progress.filename}` : `Wrote ${progress.filename}`);
+          setExportProgress(progress.ratio);
+          setExportMonitor((current) => {
+            if (!current || current.kind !== 'raw4d' || current.phase !== 'running') return current;
+            const elapsedMs = performance.now() - exportStartedAtRef.current;
+            const logs = current.logs.at(-1)?.message === message
+              ? current.logs
+              : [...current.logs, { elapsedMs, message }].slice(-12);
+            return {
+              ...current,
+              progress: {
+                ratio: progress.ratio,
+                message,
+                stage: progress.stage === 'encoding'
+                  ? (language === 'zh' ? 'RAW4D 压实' : 'RAW4D compaction')
+                  : progress.stage === 'writing'
+                    ? (language === 'zh' ? '文件写入' : 'File write')
+                    : (language === 'zh' ? '片段完成' : 'Segment complete'),
+                stageRatio: progress.segmentRatio,
+                workerCount: 1,
+                completedTasks: progress.completedSegments,
+                totalTasks: progress.segmentCount,
+              },
+              raw4DStats: {
+                completedFiles: progress.completedSegments,
+                fileCount: progress.segmentCount,
+                pointCount: current.raw4DStats?.pointCount ?? 0,
+                sourcePreservedCount: current.raw4DStats?.sourcePreservedCount ?? 0,
+              },
+              logs,
+            };
+          });
+        },
+        writeSegment: async (file) => {
+          if (controller.signal.aborted) throw new DOMException('RAW4D export was cancelled.', 'AbortError');
+          if (destination.kind === 'file') await writeBlobToFileHandle(destination.handle, file.blob);
+          else await writeRaw4DBlobToDirectory(destination.handle, file.filename, file.blob);
+          if (controller.signal.aborted) throw new DOMException('RAW4D export was cancelled.', 'AbortError');
+        },
+      });
+      setExportProgress(1);
+      setExportElapsedMs(performance.now() - exportStartedAtRef.current);
+      setExportMonitor((current) => current ? {
+        ...current,
+        phase: 'success',
+        outputBytes: result.outputBytes,
+        raw4DStats: {
+          completedFiles: result.fileCount,
+          fileCount: result.fileCount,
+          pointCount: result.pointCount,
+          sourcePreservedCount: result.sourcePreservedCount,
+        },
+        progress: {
+          ratio: 1,
+          message: language === 'zh'
+            ? `已保存 ${result.fileCount} 个 RAW4D 文件`
+            : `Saved ${result.fileCount} RAW4D file${result.fileCount === 1 ? '' : 's'}`,
+          stage: language === 'zh' ? '完成' : 'Complete',
+          stageRatio: 1,
+          workerCount: 1,
+          completedTasks: result.fileCount,
+          totalTasks: result.fileCount,
+        },
+        logs: [...current.logs, {
+          elapsedMs: performance.now() - exportStartedAtRef.current,
+          message: language === 'zh'
+            ? `完成 · ${result.fileCount} 个文件 · ${result.pointCount.toLocaleString('zh-CN')} 点 · ${(result.outputBytes / 1_000_000).toFixed(3)}M`
+            : `Complete · ${result.fileCount} files · ${result.pointCount.toLocaleString('en-US')} points · ${(result.outputBytes / 1_000_000).toFixed(3)}M`,
+        }].slice(-12),
+      } : current);
+    } catch (error) {
+      const cancelled = error instanceof DOMException && error.name === 'AbortError';
+      const message = cancelled
+        ? (language === 'zh' ? 'RAW4D 导出已取消。已完成写入的文件会保留。' : 'RAW4D export was cancelled. Completed files remain in the destination.')
+        : error instanceof Error ? error.message : String(error);
+      setExportElapsedMs(performance.now() - exportStartedAtRef.current);
+      setExportMonitor((current) => current ? {
+        ...current,
+        phase: cancelled ? 'cancelled' : 'error',
+        error: message,
+        progress: { ...current.progress, message, stage: cancelled ? (language === 'zh' ? '已取消' : 'Cancelled') : (language === 'zh' ? '失败' : 'Failed') },
+        logs: [...current.logs, { elapsedMs: performance.now() - exportStartedAtRef.current, message }].slice(-12),
+      } : current);
+    } finally {
+      if (exportAbortRef.current === controller) exportAbortRef.current = null;
+      setExportProgress(null);
+    }
+  };
+
+  const exportRaw4DSegments = async () => {
+    setOpenMenu(null);
+    setIsPlaying(false);
+    const runtime = viewportRuntime;
+    if (!runtime || !supportsRaw4DSceneExport(status.format ?? '')) {
+      showAppNotice(
+        language === 'zh' ? '当前场景没有可导出的 RAW4D 时序数据。' : 'The current scene has no RAW4D timeline data to export.',
+        language === 'zh' ? '无法导出 RAW4D' : 'Cannot export RAW4D',
+        'warning',
+      );
+      return;
+    }
+    const segmentNames = status.raw4dSequence?.segments.map((segment) => segment.name)
+      ?? (sourceFiles.length > 0 ? sourceFiles.map((file) => file.name) : [status.sourceName ?? 'segment.raw4d']);
+    if (segmentNames.length > 1) {
+      if (typeof window.showDirectoryPicker !== 'function') {
+        showAppNotice(
+          language === 'zh'
+            ? '多段 RAW4D 导出需要浏览器目录写入能力，请使用最新版 Chrome 或 Edge。'
+            : 'Multi-segment RAW4D export requires directory write access. Use a recent Chrome or Edge release.',
+          language === 'zh' ? '浏览器不支持多文件写入' : 'Multi-file writing unavailable',
+          'warning',
+        );
+        return;
+      }
+      setRaw4DDirectoryError(null);
+      setRaw4DDirectoryDialogVisible(true);
+      return;
+    }
+    if (typeof window.showSaveFilePicker !== 'function') {
+      showAppNotice(
+        language === 'zh'
+          ? '当前浏览器不支持 RAW4D“另存为”文件授权，请使用最新版 Chrome 或 Edge。'
+          : 'This browser does not support RAW4D save-as permission. Use a recent Chrome or Edge release.',
+        language === 'zh' ? '浏览器不支持选择保存位置' : 'Save location picker unavailable',
+        'warning',
+      );
+      return;
+    }
+    const suggestedName = uniqueRaw4DExportFilenames(segmentNames)[0];
+    let handle: FileSystemFileHandle;
+    try {
+      handle = await window.showSaveFilePicker(createRaw4DSavePickerOptions(suggestedName));
+    } catch (error) {
+      if (isFilePickerAbort(error)) return;
+      showAppError(error, 'raw4d-save-permission', () => { void exportRaw4DSegments(); });
+      return;
+    }
+    await runRaw4DExport(runtime, { kind: 'file', handle });
+  };
+
+  const chooseRaw4DDirectory = async () => {
+    const runtime = viewportRuntime;
+    if (!runtime || typeof window.showDirectoryPicker !== 'function' || raw4DDirectoryPicking) return;
+    setRaw4DDirectoryPicking(true);
+    setRaw4DDirectoryError(null);
+    let directory: FileSystemDirectoryHandle;
+    try {
+      directory = await window.showDirectoryPicker(RAW4D_SEGMENTS_DIRECTORY_PICKER_OPTIONS);
+    } catch (error) {
+      if (isDirectoryPickerAbort(error)) {
+        setRaw4DDirectoryError(language === 'zh'
+          ? '尚未选择输出目录。请在“下载”中新建或进入一个专用子文件夹后再选择。'
+          : 'No output folder was selected. Create or enter a dedicated subfolder inside Downloads, then choose it.');
+      } else {
+        setRaw4DDirectoryError(language === 'zh'
+          ? `无法使用所选目录：${error instanceof Error ? error.message : String(error)}`
+          : `The selected folder cannot be used: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      setRaw4DDirectoryPicking(false);
+      return;
+    }
+    setRaw4DDirectoryPicking(false);
+    setRaw4DDirectoryDialogVisible(false);
+    await runRaw4DExport(runtime, { kind: 'directory', handle: directory });
+  };
+
   // #WDD-gpt 2026-08-17 - 文件菜单导出子菜单的 .ply 序列：获准目录后逐帧直写，不再打包 ZIP。
   const runPlySequenceExport = async (runtime: ViewportRuntime, directory: FileSystemDirectoryHandle) => {
     const controller = new AbortController();
@@ -1746,6 +1997,7 @@ export function App() {
   const runExportTarget = (target: ExportTarget) => {
     setExportCenterVisible(false);
     if (target === 'ply-sequence') exportPlySequence();
+    else if (target === 'raw4d') void exportRaw4DSegments();
     else void exportWorkspace();
   };
 
@@ -2201,6 +2453,7 @@ export function App() {
           onExport={runExportTarget}
           sceneName={displaySceneName}
           segmentCount={status.raw4dSequence?.segmentCount ?? 1}
+          segments={status.raw4dSequence?.segments}
         />
       )}
 
@@ -2334,17 +2587,76 @@ export function App() {
         </div>
       )}
 
+      {raw4DDirectoryDialogVisible && (
+        <div className="memory-confirm-backdrop raw4d-directory-backdrop" data-camera-input-block>
+          <section
+            aria-label={language === 'zh' ? '选择 RAW4D 多片段输出目录' : 'Choose RAW4D segment output folder'}
+            aria-modal="true"
+            className="memory-confirm-dialog raw4d-directory-dialog"
+            role="dialog"
+          >
+            <header>
+              <span>RAW4D SEGMENTS · LOCAL FOLDER</span>
+              <strong>{language === 'zh' ? '选择多片段输出文件夹' : 'Choose a segment output folder'}</strong>
+              <p>{language === 'zh'
+                ? `当前场景包含 ${status.raw4dSequence?.segmentCount ?? sourceFiles.length} 个片段。导出会保持每段的帧范围和文件边界，不会合并为一个 RAW4D。`
+                : `This scene contains ${status.raw4dSequence?.segmentCount ?? sourceFiles.length} segments. Export keeps each frame range and file boundary instead of merging them.`}</p>
+            </header>
+            <div className="ply-directory-path" aria-label={language === 'zh' ? '推荐目录' : 'Recommended folder'}>
+              <span>{language === 'zh' ? '下载' : 'Downloads'}</span>
+              <b aria-hidden="true">/</b>
+              <strong>DongEditor3-RAW4D</strong>
+            </div>
+            <ol className="ply-directory-steps">
+              <li>{language === 'zh' ? '新建或进入一个专用子文件夹，然后点击“选择文件夹”。' : 'Create or enter a dedicated subfolder, then choose it.'}</li>
+              <li>{language === 'zh' ? '每个源片段输出一个同名 .raw4d；同名文件会被本次结果替换。' : 'Each source segment becomes one matching .raw4d file; existing files with the same names are replaced.'}</li>
+              <li>{language === 'zh' ? '软删除点逐段物理压实；当前场景与 Canonical 内存不被修改。' : 'Soft-deleted points are compacted per segment; the scene and Canonical memory are not modified.'}</li>
+            </ol>
+            <p className="memory-confirm-warning">
+              {language === 'zh'
+                ? '所有编码、压实和文件写入都在浏览器前端完成，不需要本地服务。'
+                : 'Encoding, compaction, and file writes all run in the browser with no local service.'}
+            </p>
+            {raw4DDirectoryError && <p className="ply-directory-error" role="alert">{raw4DDirectoryError}</p>}
+            <footer>
+              <button
+                className="quiet-button"
+                disabled={raw4DDirectoryPicking}
+                onClick={() => {
+                  setRaw4DDirectoryDialogVisible(false);
+                  setRaw4DDirectoryError(null);
+                }}
+                type="button"
+              >{language === 'zh' ? '取消' : 'Cancel'}</button>
+              <button
+                autoFocus
+                className="primary-button"
+                disabled={raw4DDirectoryPicking}
+                onClick={() => void chooseRaw4DDirectory()}
+                type="button"
+              >{raw4DDirectoryPicking
+                  ? (language === 'zh' ? '正在打开…' : 'Opening…')
+                  : (language === 'zh' ? '选择输出文件夹' : 'Choose output folder')}</button>
+            </footer>
+          </section>
+        </div>
+      )}
+
       {exportMonitor && (
         <div className="export-monitor-backdrop" data-camera-input-block>
           <section aria-label={exportMonitor.kind === 'ply-sequence'
             ? (language === 'zh' ? 'PLY 序列导出监督' : 'PLY sequence export monitor')
-            : (language === 'zh' ? '4CGS 保存监督' : '4CGS export monitor')} aria-modal="true" className="export-monitor-dialog" role="dialog">
+            : exportMonitor.kind === 'raw4d'
+              ? (language === 'zh' ? 'RAW4D 多片段导出监督' : 'RAW4D segment export monitor')
+              : (language === 'zh' ? '4CGS 保存监督' : '4CGS export monitor')} aria-modal="true" className="export-monitor-dialog" role="dialog">
             <header>
               <div>
-                <span>{exportMonitor.kind === 'ply-sequence' ? 'RAW4D · PLY 序列' : '4CGS · V2.6'}</span>
+                <span>{exportMonitor.kind === 'ply-sequence' ? 'RAW4D · PLY 序列' : exportMonitor.kind === 'raw4d' ? 'RAW4D · SEGMENTS' : '4CGS · V2.6'}</span>
                 <strong>{exportMonitor.kind === 'ply-sequence'
                   ? (language === 'zh' ? 'PLY 序列导出监督' : 'PLY sequence export monitor')
-                  : (language === 'zh' ? '压缩保存监督' : 'Compression export monitor')}</strong>
+                  : exportMonitor.kind === 'raw4d'
+                    ? (language === 'zh' ? 'RAW4D 分段保存监督' : 'RAW4D segment export monitor')
+                    : (language === 'zh' ? '压缩保存监督' : 'Compression export monitor')}</strong>
               </div>
               <b className={`export-monitor-state ${exportMonitor.phase}`}>
                 {exportMonitor.phase === 'running' ? (language === 'zh' ? '运行中' : 'Running')
@@ -2369,16 +2681,24 @@ export function App() {
             </div>
 
             <dl className="export-monitor-stats">
-              <div><dt>{language === 'zh' ? 'Worker' : 'Workers'}</dt><dd>{exportMonitor.progress.workerCount ?? 1}</dd></div>
+              <div><dt>{exportMonitor.kind === 'raw4d' ? (language === 'zh' ? '模式' : 'Mode') : (language === 'zh' ? 'Worker' : 'Workers')}</dt><dd>{exportMonitor.kind === 'raw4d' ? (language === 'zh' ? '逐段' : 'Sequential') : exportMonitor.progress.workerCount ?? 1}</dd></div>
               <div><dt>{language === 'zh' ? '任务' : 'Tasks'}</dt><dd>{exportMonitor.progress.completedTasks ?? 0}/{exportMonitor.progress.totalTasks ?? 8}</dd></div>
               <div><dt>{language === 'zh' ? '耗时' : 'Elapsed'}</dt><dd>{(exportElapsedMs / 1000).toFixed(1)} s</dd></div>
               <div><dt>{language === 'zh' ? '输入' : 'Input'}</dt><dd>{exportMonitor.kind === 'ply-sequence'
                 ? (exportMonitor.plyStats ? `${exportMonitor.plyStats.segmentCount} 段` : '--')
-                : `${(exportMonitor.inputBytes / 1_000_000).toFixed(3)}M`}</dd></div>
+                : exportMonitor.kind === 'raw4d'
+                  ? `${exportMonitor.raw4DStats?.fileCount ?? status.raw4dSequence?.segmentCount ?? 1} ${language === 'zh' ? '段' : 'segments'}`
+                  : `${(exportMonitor.inputBytes / 1_000_000).toFixed(3)}M`}</dd></div>
               <div><dt>{language === 'zh' ? '输出' : 'Output'}</dt><dd>{exportMonitor.outputBytes === undefined ? '--' : `${(exportMonitor.outputBytes / 1_000_000).toFixed(3)}M`}</dd></div>
-              <div><dt>{exportMonitor.kind === 'ply-sequence' ? (language === 'zh' ? '帧文件' : 'Frames') : (language === 'zh' ? '压缩比' : 'Ratio')}</dt><dd>{exportMonitor.kind === 'ply-sequence'
+              <div><dt>{exportMonitor.kind === 'ply-sequence'
+                ? (language === 'zh' ? '帧文件' : 'Frames')
+                : exportMonitor.kind === 'raw4d'
+                  ? (language === 'zh' ? '分段文件' : 'Files')
+                  : (language === 'zh' ? '压缩比' : 'Ratio')}</dt><dd>{exportMonitor.kind === 'ply-sequence'
                 ? (exportMonitor.plyStats ? `${exportMonitor.plyStats.frameCount}` : `${exportMonitor.progress.completedTasks ?? 0}`)
-                : (exportMonitor.result ? `${exportMonitor.result.compressionRatio.toFixed(2)}×` : '--')}</dd></div>
+                : exportMonitor.kind === 'raw4d'
+                  ? `${exportMonitor.raw4DStats?.completedFiles ?? 0}/${exportMonitor.raw4DStats?.fileCount ?? exportMonitor.progress.totalTasks ?? 1}`
+                  : (exportMonitor.result ? `${exportMonitor.result.compressionRatio.toFixed(2)}×` : '--')}</dd></div>
             </dl>
 
             {exportMonitor.result?.encodeTimings && (
@@ -2398,7 +2718,9 @@ export function App() {
             <footer>
               <small>{exportMonitor.kind === 'ply-sequence'
                 ? (language === 'zh' ? '每帧 PLY 在浏览器 Worker 中直接写入所选目录；取消不修改场景，目录中可能保留已写入的部分帧。' : 'Each PLY frame is written to the chosen directory by a browser worker; cancelling leaves already-written frames in place.')
-                : (language === 'zh' ? '压缩完全在浏览器 Worker 中执行；取消不会修改当前场景。' : 'Compression runs entirely in browser workers; cancelling does not modify the scene.')}</small>
+                : exportMonitor.kind === 'raw4d'
+                  ? (language === 'zh' ? '每个 RAW4D 片段在浏览器中独立压实并写入；取消不修改场景，已完成文件会保留。' : 'Each RAW4D segment is compacted and written independently in the browser; cancelling keeps completed files and does not modify the scene.')
+                  : (language === 'zh' ? '压缩完全在浏览器 Worker 中执行；取消不会修改当前场景。' : 'Compression runs entirely in browser workers; cancelling does not modify the scene.')}</small>
               {exportMonitor.phase === 'running'
                 ? <button className="quiet-button export-monitor-cancel" onClick={cancelExport} type="button">{language === 'zh' ? '取消保存' : 'Cancel'}</button>
                 : <button className="primary-button" onClick={closeExportMonitor} type="button">{language === 'zh' ? '关闭' : 'Close'}</button>}

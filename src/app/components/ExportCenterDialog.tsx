@@ -1,6 +1,17 @@
 import { useEffect, useState } from 'react';
 import type { UiLanguage } from '../i18n';
-import { supportsFourCgsSceneExport, type ExportTarget } from './ExportCenterModel';
+import { uniqueRaw4DExportFilenames } from '../raw4dFileSave';
+import {
+  supportsFourCgsSceneExport,
+  supportsRaw4DSceneExport,
+  type ExportTarget,
+} from './ExportCenterModel';
+
+interface ExportCenterSegment {
+  readonly firstFrame: number;
+  readonly lastFrame: number;
+  readonly name: string;
+}
 
 interface ExportCenterDialogProps {
   readonly deletedCount: number;
@@ -12,12 +23,13 @@ interface ExportCenterDialogProps {
   readonly onExport: (target: ExportTarget) => void;
   readonly sceneName: string;
   readonly segmentCount: number;
+  readonly segments?: readonly ExportCenterSegment[];
 }
 
 // #WDD-gpt 2026-08-18 - 导出中心先集中展示格式、范围、变换和预计内容，再复用原有浏览器内导出实现。
 export function ExportCenterDialog(props: ExportCenterDialogProps) {
   const zh = props.language === 'zh';
-  const [target, setTarget] = useState<ExportTarget>('fourcgs');
+  const [target, setTarget] = useState<ExportTarget>(props.format === 'RAW4D' ? 'raw4d' : 'fourcgs');
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') props.onClose();
@@ -36,9 +48,23 @@ export function ExportCenterDialog(props: ExportCenterDialogProps) {
         : (zh ? `${props.format} 暂不支持编码为 .4cgs` : `${props.format} cannot currently be encoded as .4cgs`),
       disabled: !supportsFourCgsSceneExport(props.format),
     },
+    {
+      id: 'raw4d',
+      title: '.RAW4D',
+      detail: supportsRaw4DSceneExport(props.format)
+        ? (props.segmentCount > 1
+            ? (zh
+                ? `保持原始分段，写入 ${props.segmentCount} 个独立 .raw4d 文件`
+                : `Keep source boundaries and write ${props.segmentCount} separate .raw4d files`)
+            : (zh ? '压实并保存当前片段为一个 .raw4d 文件' : 'Compact and save the current segment as one .raw4d file'))
+        : (zh ? `${props.format} 暂不支持导出为 .raw4d` : `${props.format} cannot currently be exported as .raw4d`),
+      disabled: !supportsRaw4DSceneExport(props.format),
+    },
     { id: 'ply-sequence', title: zh ? 'PLY 序列' : 'PLY sequence', detail: zh ? `逐帧写入 ${props.frameCount} 个文件` : `Write ${props.frameCount} frame files` },
   ];
   const selected = options.find((option) => option.id === target)!;
+  const segmentPreview = props.segments?.slice(0, 4) ?? [];
+  const segmentOutputNames = uniqueRaw4DExportFilenames(props.segments?.map((segment) => segment.name) ?? []);
   return (
     <div className="export-center-backdrop" data-camera-input-block onPointerDown={(event) => event.target === event.currentTarget && props.onClose()}>
       <section aria-label={zh ? '导出中心' : 'Export Center'} aria-modal="true" className="export-center-dialog" role="dialog">
@@ -54,15 +80,39 @@ export function ExportCenterDialog(props: ExportCenterDialogProps) {
             <dl>
               <div><dt>{zh ? '范围' : 'Scope'}</dt><dd>{zh ? '完整场景' : 'Full scene'}</dd></div>
               <div><dt>{zh ? '片段 / 帧' : 'Segments / frames'}</dt><dd>{`${props.segmentCount} / ${props.frameCount}`}</dd></div>
+              <div><dt>{zh ? '输出文件' : 'Output files'}</dt><dd>{target === 'raw4d' ? `${props.segmentCount} × .raw4d` : target === 'fourcgs' ? '1 × .4cgs' : `${props.frameCount} × .ply`}</dd></div>
               <div><dt>{zh ? '软删除' : 'Soft deleted'}</dt><dd>{props.deletedCount.toLocaleString()}</dd></div>
-              <div><dt>{zh ? '场景变换' : 'Scene transform'}</dt><dd>{target === 'fourcgs' ? (zh ? '写入元数据' : 'Stored in metadata') : (zh ? '按导出器坐标' : 'Exporter coordinates')}</dd></div>
+              <div><dt>{zh ? '场景变换' : 'Scene transform'}</dt><dd>{target === 'fourcgs'
+                ? (zh ? '写入元数据' : 'Stored in metadata')
+                : target === 'raw4d'
+                  ? (zh ? '不写入；可先重设原点' : 'Not stored; bake first')
+                  : (zh ? '按导出器坐标' : 'Exporter coordinates')}</dd></div>
               <div><dt>{zh ? '输入大小' : 'Input size'}</dt><dd>{props.inputBytes > 0 ? `${(props.inputBytes / 1_000_000).toFixed(2)} MB` : '—'}</dd></div>
             </dl>
+            {target === 'raw4d' && segmentPreview.length > 0 && (
+              <ol className="export-segment-preview" aria-label={zh ? 'RAW4D 输出片段预览' : 'RAW4D output segment preview'}>
+                {segmentPreview.map((segment, index) => (
+                  <li key={`${segment.name}-${segment.firstFrame}-${segment.lastFrame}`}>
+                    <span>{segmentOutputNames[index]}</span>
+                    <b>{segment.firstFrame}–{segment.lastFrame}</b>
+                  </li>
+                ))}
+                {props.segmentCount > segmentPreview.length && <li><span>+{props.segmentCount - segmentPreview.length}</span><b>{zh ? '更多片段' : 'more segments'}</b></li>}
+              </ol>
+            )}
             <p>{target === 'fourcgs'
               ? (zh
                   ? `4CGS 会保留完整场景变换；软删除点在重新编码时压实。${props.format === 'PLY4' || props.format === '4GS' ? '场景内存保持 Float32，不会被原地改写。' : ''}`
                   : `4CGS preserves the full scene transform and compacts soft-deleted points when re-encoding.${props.format === 'PLY4' || props.format === '4GS' ? ' Scene memory remains Float32 and is not modified in place.' : ''}`)
-              : (zh ? '浏览器将请求一个专用文件夹，并暂停播放后逐帧写入。' : 'The browser requests a dedicated folder, pauses playback, and writes each frame.')}</p>
+              : target === 'raw4d'
+                ? (props.segmentCount > 1
+                    ? (zh
+                        ? '浏览器将请求一个专用文件夹，按时间轴顺序逐段压实并写入；原片段帧范围和源精度保持不变。'
+                        : 'The browser requests a dedicated folder, then compacts and writes each timeline segment while preserving its frame range and source precision.')
+                    : (zh
+                        ? '软删除点会被物理压实；未重设原点的场景变换不会写入 RAW4D。'
+                        : 'Soft-deleted points are physically compacted; an unbaked scene transform is not stored in RAW4D.'))
+                : (zh ? '浏览器将请求一个专用文件夹，并暂停播放后逐帧写入。' : 'The browser requests a dedicated folder, pauses playback, and writes each frame.')}</p>
           </div>
         </div>
         <footer><button className="quiet-button" onClick={props.onClose} type="button">{zh ? '取消' : 'Cancel'}</button><button className="primary-button" disabled={selected.disabled} onClick={() => props.onExport(target)} type="button">{zh ? '继续导出' : 'Continue export'}</button></footer>

@@ -12,6 +12,7 @@ export interface Raw4DExportProgress {
 export interface Raw4DExportOptions {
   readonly chunkRows?: number;
   readonly onProgress?: (progress: Raw4DExportProgress) => void;
+  readonly signal?: AbortSignal;
 }
 
 interface Raw4DExportColumn {
@@ -115,12 +116,17 @@ async function yieldToBrowser(): Promise<void> {
   await new Promise<void>((resolve) => setTimeout(resolve, 0));
 }
 
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new DOMException('RAW4D export was cancelled.', 'AbortError');
+}
+
 // #WDD-gpt  2026-08-16 - 保存时才根据软删除位集流式压实 RAW4D，编辑期间不改写原始 SoA 属性。
 export async function exportCompactedRaw4D(
   asset: Raw4DAsset,
   deletionWords: Uint32Array,
   options: Raw4DExportOptions = {},
 ): Promise<Blob> {
+  throwIfAborted(options.signal);
   let keptCount = 0;
   for (let stableId = 0; stableId < asset.splatCount; stableId += 1) {
     if (!isDeleted(deletionWords, stableId)) keptCount += 1;
@@ -134,6 +140,7 @@ export async function exportCompactedRaw4D(
   let stableId = 0;
   let writtenPoints = 0;
   while (stableId < asset.splatCount) {
+    throwIfAborted(options.signal);
     const keptIds: number[] = [];
     while (stableId < asset.splatCount && keptIds.length < chunkRows) {
       if (!isDeleted(deletionWords, stableId)) keptIds.push(stableId);
@@ -159,6 +166,7 @@ export async function exportCompactedRaw4D(
     }
     await yieldToBrowser();
   }
+  throwIfAborted(options.signal);
   return new Blob(parts, { type: 'application/octet-stream' });
 }
 
@@ -168,6 +176,7 @@ export async function exportCompactedRaw4DSource(
   deletionWords: Uint32Array,
   options: Raw4DExportOptions = {},
 ): Promise<Blob> {
+  throwIfAborted(options.signal);
   const header = await readRaw4DHeader(source);
   const pointOffsets = new Map<string, number>([
     ['vertex', 0],
@@ -209,6 +218,7 @@ export async function exportCompactedRaw4DSource(
   for (const element of header.elements) {
     const pointOffset = pointOffsets.get(element.name)!;
     for (let firstRow = 0; firstRow < element.count; firstRow += chunkRows) {
+      throwIfAborted(options.signal);
       const rowCount = Math.min(chunkRows, element.count - firstRow);
       const chunk = new Uint8Array(await source.slice(
         element.dataOffset + firstRow * element.recordBytes,
@@ -228,5 +238,6 @@ export async function exportCompactedRaw4DSource(
       await yieldToBrowser();
     }
   }
+  throwIfAborted(options.signal);
   return new Blob(parts, { type: 'application/octet-stream' });
 }
