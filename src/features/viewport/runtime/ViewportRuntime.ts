@@ -8,8 +8,6 @@ import {
   ASPECT_AUTO,
   ASPECT_MANUAL,
   Color,
-  DEVICETYPE_WEBGL2,
-  DEVICETYPE_WEBGPU,
   Entity,
   Gizmo,
   Layer,
@@ -20,8 +18,8 @@ import {
   TransformGizmo,
   TranslateGizmo,
   Vec3,
-  createGraphicsDevice,
 } from 'playcanvas';
+import { createViewportGraphicsDevice } from './ViewportGraphicsDevice';
 import { evaluationCameraManualAspectRatio } from './camera/EvaluationCameraProjection';
 import { RenderExtensionRegistry } from '../../../core/engine/RenderExtension';
 import {
@@ -562,15 +560,19 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost, Semanti
     const runtimeProfile = this.options.runtimeProfile;
     // #WDD-gpt 2026-08-19 - 手机兼容档显式使用 WebGL2，避开移动 WebGPU 驱动差异；桌面仍优先 WebGPU 并保留 WebGL2 回退。
     const graphicsDeviceOptions = {
-      deviceTypes: runtimeProfile?.forceWebGL2
-        ? [DEVICETYPE_WEBGL2]
-        : [DEVICETYPE_WEBGPU, DEVICETYPE_WEBGL2],
       antialias: false,
       // #WDD-gpt 2026-08-15 - 仅独立压缩渲染器开启帧缓冲保留，正式页面维持默认性能路径。
       preserveDrawingBuffer: this.options.preserveDrawingBuffer ?? false,
-      powerPreference: 'high-performance',
-    } as Parameters<typeof createGraphicsDevice>[1] & { preserveDrawingBuffer: boolean };
-    const graphicsDevice = await createGraphicsDevice(this.canvas, graphicsDeviceOptions);
+      powerPreference: 'high-performance' as const,
+    };
+    const graphicsDevice = await createViewportGraphicsDevice(
+      this.canvas,
+      graphicsDeviceOptions,
+      Boolean(runtimeProfile?.forceWebGL2),
+      {
+        onWebGpuFallback: (error) => console.warn('WebGPU device creation failed; using WebGL2.', error),
+      },
+    );
 
     if (this.destroyRequested) {
       graphicsDevice.destroy();

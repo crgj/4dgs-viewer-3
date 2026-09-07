@@ -119,7 +119,9 @@ import { supportsFourCgsSceneExport, type ExportTarget } from './components/Expo
 import { describeAppError } from './errors/AppError';
 import {
   clearWorkspaceDraft,
+  FORCE_SORT_SYNC_REVISION,
   loadWorkspaceDraft,
+  restoreWorkspaceForceSortSync,
   saveWorkspaceDraft,
   workspaceSourceIdentities,
   workspaceSourcesMatch,
@@ -488,8 +490,8 @@ export function App() {
   const [frameReadyRequestId, setFrameReadyRequestId] = useState(0);
   // #WDD-gpt 2026-08-16 - 播放速率独立于文件元数据并默认 30 FPS，允许用户按检查需求降速或加速。
   const [playbackFps, setPlaybackFps] = useState(30);
-  // #WDD-gpt 2026-08-21 - 强制排序：新帧必须等 CPU 深度排序提交后再渲染，随工作区草稿持久化。
-  const [forceSortSync, setForceSortSync] = useState(false);
+  // #WDD-gpt 2026-09-06 - 播放默认逐帧等待正确深度排序；性能优先、允许丢帧只作为用户显式关闭后的选择。
+  const [forceSortSync, setForceSortSync] = useState(true);
   // Mobile playback always waits for the current frame's depth sort. The stored
   // desktop preference remains independent so responsive layout changes are reversible.
   const effectiveForceSortSync = resolveForceSortSync(mobilePlayerMode, forceSortSync);
@@ -836,7 +838,7 @@ export function App() {
       setSceneName(workspaceDraft.sceneName);
       setCurrentFrame(Math.max(0, Math.min(timelineEndFrame, workspaceDraft.view.currentFrame)));
       setPlaybackFps(workspaceDraft.view.playbackFps);
-      setForceSortSync(workspaceDraft.view.forceSortSync ?? false);
+      setForceSortSync(restoreWorkspaceForceSortSync(workspaceDraft.view));
       setRenderMode(workspaceDraft.view.renderMode);
       if (workspaceDraft.view.backgroundColor) {
         const restoredBackgroundColor = normalizeViewportBackgroundColor(workspaceDraft.view.backgroundColor);
@@ -881,6 +883,7 @@ export function App() {
           cameraBookmarks,
           currentFrame,
           forceSortSync,
+          forceSortSyncRevision: FORCE_SORT_SYNC_REVISION,
           gaussianVisible,
           gs2MeshVisible,
           inspectorTab: inspectorTab === 'semantic' ? 'scene' : inspectorTab,

@@ -6,6 +6,7 @@ import type {
 } from '../../features/viewport/runtime/ViewportRuntime';
 
 export const WORKSPACE_DRAFT_KEY = 'dong-editor-3-autosave';
+export const FORCE_SORT_SYNC_REVISION = 1;
 const WORKSPACE_DATABASE = 'dong-editor-3-workspaces';
 const WORKSPACE_STORE = 'drafts';
 
@@ -21,8 +22,10 @@ export interface WorkspaceViewState {
   readonly camera: ViewportCameraState | null;
   readonly cameraBookmarks: readonly (ViewportCameraState | null)[];
   readonly currentFrame: number;
-  /** 强制排序（播放帧必须等待排序提交）；旧草稿缺省视为关闭。 */
+  /** 强制排序（播放帧必须等待排序提交）；旧草稿会迁移为正确性优先的开启状态。 */
   readonly forceSortSync?: boolean;
+  /** 区分旧版默认关闭值与新版用户主动关闭选择。 */
+  readonly forceSortSyncRevision?: number;
   readonly gaussianVisible: boolean;
   readonly gs2MeshVisible: boolean;
   readonly inspectorTab: 'scene' | 'transform' | 'gaussian' | 'performance';
@@ -43,6 +46,15 @@ export interface WorkspaceDraft {
   readonly sources: readonly WorkspaceSourceIdentity[];
   readonly view: WorkspaceViewState;
   readonly edits: readonly ViewportGaussianEditSnapshot[];
+}
+
+// #WDD-gpt 2026-09-06 - 旧工作区曾把允许丢帧的关闭值自动持久化；无当前修订标记时统一迁移为逐帧正确排序，之后仍保留用户主动关闭选择。
+export function restoreWorkspaceForceSortSync(view: Pick<
+  WorkspaceViewState,
+  'forceSortSync' | 'forceSortSyncRevision'
+>): boolean {
+  if (view.forceSortSyncRevision !== FORCE_SORT_SYNC_REVISION) return true;
+  return view.forceSortSync ?? true;
 }
 
 export function workspaceSourceIdentities(files: readonly File[]): readonly WorkspaceSourceIdentity[] {

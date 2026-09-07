@@ -29,7 +29,15 @@ describe('RAW4D real-file integration', () => {
     expect(asset.splatCount).toBe(header.pointCount);
     expect(asset.totalFrames).toBe(header.totalFrames);
     expect(asset.shBands).toBe(3);
-    expect(asset.position.keyframes).toHaveLength(11);
+    // #WDD-gpt 2026-09-06 - 真实分段允许用稀疏位置 bank 覆盖完整时段；验收首尾与顺序，不能把 bank 数量误写成总帧数。
+    expect(asset.position.keyframes[0]).toBe(0);
+    expect(asset.position.keyframes.at(-1)).toBe(header.totalFrames - 1);
+    expect(asset.position.keyframes.length).toBeGreaterThan(1);
+    expect(asset.position.keyframes.every((frame, index, keyframes) => (
+      frame >= 0
+      && frame < header.totalFrames
+      && (index === 0 || frame > keyframes[index - 1])
+    ))).toBe(true);
     expect([...asset.bounds.min, ...asset.bounds.max].every(Number.isFinite)).toBe(true);
     const staticElement = header.elements.find((element) => element.name === 'vertex_static');
     if (staticElement) {

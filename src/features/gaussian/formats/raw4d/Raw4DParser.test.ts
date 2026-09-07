@@ -202,7 +202,7 @@ describe('RAW4D parser', () => {
     expect(asset.lifetimeMu[1]).toBe(40);
   });
 
-  it('reads binary PLY metadata and all independent keyframe banks', async () => {
+  it('reads the legacy layout whose redundant base snapshot aliases bank zero', async () => {
     const source = syntheticRaw4D();
     const header = await readRaw4DHeader(source);
     const asset = await parseRaw4D(source, { sourceName: 'sample.raw4d' });
@@ -219,6 +219,33 @@ describe('RAW4D parser', () => {
     expect(asset.opacity.values[1][1]).toBe(-Infinity);
     expect(asset.bounds).toEqual({ min: [-2, -3, -4], max: [10, 3, 4] });
     await expect(canImportRaw4D(source)).resolves.toBe(true);
+  });
+
+  it('reads the new layout whose redundant base snapshot differs from bank zero', async () => {
+    const source = syntheticRaw4D();
+    const header = await readRaw4DHeader(source);
+    const bytes = await source.arrayBuffer();
+    const view = new DataView(bytes);
+    const rowOffset = header.dataOffset;
+    const overwrite = (name: string, value: number) => {
+      const property = header.propertyNames.indexOf(name);
+      expect(property).toBeGreaterThanOrEqual(0);
+      view.setFloat32(rowOffset + property * Float32Array.BYTES_PER_ELEMENT, value, true);
+    };
+    overwrite('x', -123);
+    overwrite('f_dc_0', -45);
+    overwrite('scale_0', 67);
+    overwrite('opacity', -89);
+
+    const newFormatSource = new Blob([bytes]);
+    // #WDD-gpt 2026-09-06 - 新旧 RAW4D 都须同时通过格式探测与完整解析；新格式的基础参考快照不得覆盖显式时间 bank。
+    await expect(canImportRaw4D(newFormatSource)).resolves.toBe(true);
+    const asset = await parseRaw4D(newFormatSource, { sourceName: 'non-aliased-base.raw4d' });
+    expect(asset.position.values[0][0]).toBe(0);
+    expect(asset.colorDc.values[0][0]).toBe(0);
+    expect(asset.scale.values[0][0]).toBe(0);
+    expect(asset.opacity.values[0][0]).toBe(0);
+    expect(asset.bounds.min[0]).toBe(-2);
   });
 
   it('keeps the new ushort-backed fp16 RAW4D layout bit-exact in one compact backing store', async () => {

@@ -139,7 +139,6 @@ function requiredPropertyNames(header: Raw4DHeader): string[] {
 }
 
 interface Raw4DCanonicalValidationPlan {
-  readonly aliases: readonly (readonly [number, number, string])[];
   readonly normals: readonly number[];
   readonly rotations: readonly (readonly number[])[];
   readonly opacity: readonly number[];
@@ -156,20 +155,6 @@ function canonicalValidationPlan(header: Raw4DValidationHeader): Raw4DCanonicalV
     if (value === undefined) throw new Error(`RAW4D is missing canonical property ${name}.`);
     return value;
   };
-  const aliases: Array<readonly [number, number, string]> = [];
-  for (const definition of [
-    RAW4D_TRACK_DEFINITIONS.position,
-    RAW4D_TRACK_DEFINITIONS.colorDc,
-    RAW4D_TRACK_DEFINITIONS.scale,
-    RAW4D_TRACK_DEFINITIONS.opacity,
-  ]) {
-    if (raw4DBankCount(header.propertyNames, definition) === 0) continue;
-    for (let component = 0; component < definition.components.length; component += 1) {
-      const baseName = definition.baseProperties[component];
-      const bankName = raw4DTrackPropertyName(definition, 0, definition.components[component]);
-      aliases.push([requireIndex(baseName), requireIndex(bankName), `${baseName} == ${bankName}`]);
-    }
-  }
   const rotation = RAW4D_TRACK_DEFINITIONS.rotation;
   const rotationBankCount = raw4DBankCount(header.propertyNames, rotation);
   const rotations = rotationBankCount > 0
@@ -180,7 +165,6 @@ function canonicalValidationPlan(header: Raw4DValidationHeader): Raw4DCanonicalV
   const opacity = RAW4D_TRACK_DEFINITIONS.opacity;
   const opacityBankCount = raw4DBankCount(header.propertyNames, opacity);
   return {
-    aliases,
     normals: ['nx', 'ny', 'nz'].map(requireIndex),
     rotations,
     opacity: opacityBankCount > 0
@@ -204,15 +188,7 @@ function validateCanonicalChunk(
   const signMask = header.scalarEncoding === 'float16' ? 0x7fff : 0x7fffffff;
   for (let row = 0; row < rowCount; row += 1) {
     const offset = row * header.propertyNames.length;
-    for (const [base, bank, label] of plan.aliases) {
-      const baseValue = headerlessValue(chunk, offset + base, header.scalarEncoding);
-      const bankValue = headerlessValue(chunk, offset + bank, header.scalarEncoding);
-      const toleranceScale = Math.max(1, Math.abs(baseValue), Math.abs(bankValue));
-      const tolerance = toleranceScale * (header.scalarEncoding === 'float16' ? 1e-3 : 1e-6);
-      if (baseValue !== bankValue && Math.abs(baseValue - bankValue) > tolerance) {
-        throw new Error(`RAW4D canonical snapshot mismatch at row ${firstRow + row}: ${label}.`);
-      }
-    }
+    // #WDD-gpt 2026-09-06 - 新 RAW4D 允许基础 x/DC/scale/opacity 保存参考快照而不等于 bank0；存在 bank 时渲染只以 bank 为权威，故不再把冗余基础列误判为文件损坏。
     for (const normal of plan.normals) {
       if ((encoded[offset + normal] & signMask) !== 0) {
         throw new Error(`RAW4D normal placeholders must be zero at row ${firstRow + row}.`);
