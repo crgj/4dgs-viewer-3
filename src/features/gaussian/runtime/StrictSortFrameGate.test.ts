@@ -3,8 +3,6 @@ import { StrictSortFrameGate, type StrictSortFrameGateHost } from './StrictSortF
 
 function createHost() {
   const host: StrictSortFrameGateHost = {
-    prepareFrame: vi.fn((frame: number) => Math.max(0, Math.min(9, frame))),
-    revealFrame: vi.fn(),
     applyFrameDirect: vi.fn(),
   };
   return host;
@@ -17,36 +15,33 @@ describe('StrictSortFrameGate', () => {
     gate.request(3);
     gate.request(5);
     expect(host.applyFrameDirect).toHaveBeenCalledTimes(2);
-    expect(host.prepareFrame).not.toHaveBeenCalled();
     expect(gate.heldFrame).toBeNull();
   });
 
-  it('prepares without revealing and keeps only the newest queued request', () => {
+  it('submits one complete frame and keeps only the newest queued request', () => {
     const host = createHost();
     const gate = new StrictSortFrameGate(host);
     gate.setEnabled(true);
     gate.request(4);
-    expect(host.prepareFrame).toHaveBeenCalledWith(4);
-    expect(host.revealFrame).not.toHaveBeenCalled();
+    expect(host.applyFrameDirect).toHaveBeenCalledWith(4);
     expect(gate.heldFrame).toBe(4);
     gate.request(7);
     gate.request(8);
-    expect(host.prepareFrame).toHaveBeenCalledTimes(1);
+    expect(host.applyFrameDirect).toHaveBeenCalledTimes(1);
     expect(gate.heldFrame).toBe(8);
   });
 
-  it('drops an obsolete sorted frame and reveals only the latest queued frame', () => {
+  it('drops the obsolete callback and submits only the latest queued frame', () => {
     const host = createHost();
     const gate = new StrictSortFrameGate(host);
     gate.setEnabled(true);
     gate.request(4);
     gate.request(6);
     expect(gate.onSorted()).toBe(true);
-    expect(host.revealFrame).not.toHaveBeenCalled();
-    expect(host.prepareFrame).toHaveBeenLastCalledWith(6);
+    expect(host.applyFrameDirect).toHaveBeenLastCalledWith(6);
     expect(gate.heldFrame).toBe(6);
     expect(gate.onSorted()).toBe(true);
-    expect(host.revealFrame).toHaveBeenLastCalledWith(6);
+    expect(host.applyFrameDirect).toHaveBeenCalledTimes(2);
     expect(gate.heldFrame).toBeNull();
     expect(gate.onSorted()).toBe(false);
   });
@@ -60,7 +55,18 @@ describe('StrictSortFrameGate', () => {
     gate.setEnabled(false);
     expect(host.applyFrameDirect).toHaveBeenCalledWith(5);
     expect(gate.heldFrame).toBeNull();
-    expect(host.revealFrame).not.toHaveBeenCalled();
+    expect(host.applyFrameDirect).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not resubmit the current complete frame when pacing is disabled mid-flight', () => {
+    const host = createHost();
+    const gate = new StrictSortFrameGate(host);
+    const displayed: number[] = [];
+    gate.setEnabled(true);
+    gate.request(4, () => displayed.push(4));
+    gate.setEnabled(false);
+    expect(host.applyFrameDirect).toHaveBeenCalledTimes(1);
+    expect(displayed).toEqual([4]);
   });
 
   it('drops stale gate state when the active dataset is replaced', () => {
@@ -71,6 +77,8 @@ describe('StrictSortFrameGate', () => {
     gate.reset();
     expect(gate.heldFrame).toBeNull();
     expect(gate.onSorted()).toBe(false);
+    gate.request(3);
+    expect(host.applyFrameDirect).toHaveBeenLastCalledWith(3);
   });
 
   it('commits the matching derived frame only when that Gaussian frame becomes visible', () => {

@@ -6,7 +6,7 @@ import type {
 } from '../../features/viewport/runtime/ViewportRuntime';
 
 export const WORKSPACE_DRAFT_KEY = 'dong-editor-3-autosave';
-export const FORCE_SORT_SYNC_REVISION = 2;
+export const FORCE_SORT_SYNC_REVISION = 3;
 const WORKSPACE_DATABASE = 'dong-editor-3-workspaces';
 const WORKSPACE_STORE = 'drafts';
 
@@ -48,13 +48,13 @@ export interface WorkspaceDraft {
   readonly edits: readonly ViewportGaussianEditSnapshot[];
 }
 
-// #WDD-gpt 2026-09-07 - 修订 2 将旧工作区的正确性优先默认迁移为流畅播放；迁移后仍持久化用户对强制排序的显式选择。
+// #WDD-gpt 2026-09-08 - 修订 3 将旧工作区迁移回正确性优先；迁移后仍持久化用户对流畅/强制排序的显式选择。
 export function restoreWorkspaceForceSortSync(view: Pick<
   WorkspaceViewState,
   'forceSortSync' | 'forceSortSyncRevision'
 >): boolean {
-  if (view.forceSortSyncRevision !== FORCE_SORT_SYNC_REVISION) return false;
-  return view.forceSortSync ?? false;
+  if (view.forceSortSyncRevision !== FORCE_SORT_SYNC_REVISION) return true;
+  return view.forceSortSync ?? true;
 }
 
 export function workspaceSourceIdentities(files: readonly File[]): readonly WorkspaceSourceIdentity[] {

@@ -507,8 +507,8 @@ export function App() {
   const [frameReadyRequestId, setFrameReadyRequestId] = useState(0);
   // #WDD-gpt 2026-08-16 - 播放速率独立于文件元数据并默认 30 FPS，允许用户按检查需求降速或加速。
   const [playbackFps, setPlaybackFps] = useState(30);
-  // #WDD-gpt 2026-09-07 - 真实 180 段 Bundle 的 CPU 排序吞吐仅约 4 FPS；桌面端默认改为异步排序流畅播放，精确逐帧排序仍可手动开启。
-  const [forceSortSync, setForceSortSync] = useState(false);
+  // #WDD-gpt 2026-09-08 - 默认恢复正确性优先的逐帧排序；流畅模式仍可手动选择，但会明确提示可能使用旧遮挡顺序。
+  const [forceSortSync, setForceSortSync] = useState(true);
   // Mobile playback always waits for the current frame's depth sort. The stored
   // desktop preference remains independent so responsive layout changes are reversible.
   const effectiveForceSortSync = resolveForceSortSync(mobilePlayerMode, forceSortSync);
@@ -1112,6 +1112,8 @@ export function App() {
       void step();
       return () => {
         stopped = true;
+        // #WDD-gpt 2026-09-08 - 暂停若落在 frame:ready 之前，丢弃旧节拍标记，避免续播把新帧永久排在已结束会话之后。
+        viewportRuntime?.cancelFramePacing();
         const pending = pendingDisplayedFrameRef.current;
         if (!pending) return;
         window.clearTimeout(pending.timeoutId);
@@ -1148,7 +1150,7 @@ export function App() {
     };
     animationFrame = window.requestAnimationFrame(updatePlayback);
     return () => window.cancelAnimationFrame(animationFrame);
-  }, [effectiveForceSortSync, isLooping, isPlaying, playbackFps, timelineEndFrame]);
+  }, [effectiveForceSortSync, isLooping, isPlaying, playbackFps, timelineEndFrame, viewportRuntime]);
 
   useEffect(() => {
     setCurrentFrame((frame) => Math.min(frame, timelineEndFrame));
@@ -3360,7 +3362,7 @@ export function App() {
               <section aria-labelledby="inspector-tab-performance" className="inspector-section memory-settings" id="inspector-panel-performance" role="tabpanel">
                 <h3><Icon name="chevron" size={13} />{copy.memoryAndVram}</h3>
                 <PerformanceDiagnosticsPanel snapshot={performanceSnapshot} />
-                {/* #WDD-gpt 2026-08-21 - 强制排序开关随 IndexedDB 工作区草稿持久化，播放与拖帧都必须等排序提交。 */}
+                {/* #WDD-gpt 2026-09-08 - 默认逐帧等待提交版原有排序门闩，避免播放时用旧遮挡顺序；流畅模式保留为显式选择。 */}
                 <div className="scale-link-row force-sort-toggle-row">
                   <span>{copy.forceSortSync}</span>
                   <button
@@ -3620,7 +3622,16 @@ export function App() {
               aria-label={copy.currentFrame}
               max={timelineEndFrame}
               min="0"
-              onChange={(event) => { setCurrentFrame(Number(event.target.value)); stopPlayback(); }}
+              onChange={(event) => {
+                const frame = Number(event.target.value);
+                stopPlayback();
+                // #WDD-gpt 2026-09-08 - range 的每个 input 都提交真实帧；运行时单飞排序并用完整帧覆盖中间态。
+                setCurrentFrame(frame);
+              }}
+              onPointerDown={() => {
+                // #WDD-gpt 2026-09-08 - 拖动开始只停止自动播放；随后每个滑块值立即驱动实际渲染。
+                stopPlayback();
+              }}
               style={{ '--timeline-progress': `${(currentFrame / Math.max(1, timelineEndFrame)) * 100}%` } as React.CSSProperties}
               type="range"
               value={currentFrame}

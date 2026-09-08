@@ -20,9 +20,9 @@ describe('WorkspaceState source identity', () => {
 });
 
 describe('WorkspaceState frame sort migration', () => {
-  it('migrates legacy drafts to smooth asynchronous sorting', () => {
-    expect(restoreWorkspaceForceSortSync({})).toBe(false);
-    expect(restoreWorkspaceForceSortSync({ forceSortSync: true, forceSortSyncRevision: 1 })).toBe(false);
+  it('migrates legacy drafts to correctness-first sorting', () => {
+    expect(restoreWorkspaceForceSortSync({})).toBe(true);
+    expect(restoreWorkspaceForceSortSync({ forceSortSync: false, forceSortSyncRevision: 2 })).toBe(true);
   });
 
   it('preserves an explicit user choice after the correctness-first revision is recorded', () => {
@@ -37,6 +37,6 @@ describe('WorkspaceState frame sort migration', () => {
     expect(restoreWorkspaceForceSortSync({
       forceSortSync: undefined,
       forceSortSyncRevision: FORCE_SORT_SYNC_REVISION,
-    })).toBe(false);
+    })).toBe(true);
   });
 });

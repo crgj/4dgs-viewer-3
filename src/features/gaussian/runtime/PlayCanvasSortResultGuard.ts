@@ -24,9 +24,15 @@ interface GuardedSorter {
   releaseOrderData(orderData: Uint32Array): void;
 }
 
+interface QueuedSortParameters {
+  readonly params: readonly unknown[];
+  readonly radialSorting: boolean;
+}
+
 interface GuardedSorterPrototype {
   applyPendingSorted(this: GuardedSorter): void;
   setSortParameters(this: GuardedSorter, payload: SortParameters): void;
+  setSortParams(this: GuardedSorter, params: readonly unknown[], radialSorting: boolean): void;
   onSorted(this: GuardedSorter, message: SortMessage): void;
 }
 
@@ -41,6 +47,7 @@ interface GuardedManagerPrototype {
 }
 
 const latestVersionBySorter = new WeakMap<GuardedSorter, number>();
+const queuedSortBySorter = new WeakMap<GuardedSorter, QueuedSortParameters>();
 let installed = false;
 
 export function isStalePlayCanvasSortResult(version: number, latestVersion: number): boolean {
@@ -51,6 +58,10 @@ export function canApplyPlayCanvasSortResult(jobsInFlight: number): boolean {
   return jobsInFlight === 0;
 }
 
+export function shouldQueuePlayCanvasSort(jobsInFlight: number): boolean {
+  return jobsInFlight > 0;
+}
+
 export function installPlayCanvasSortResultGuard(): void {
   if (installed) return;
   installed = true;
@@ -58,6 +69,7 @@ export function installPlayCanvasSortResultGuard(): void {
   const prototype = GSplatUnifiedSorter.prototype as unknown as GuardedSorterPrototype;
   const originalApplyPendingSorted = prototype.applyPendingSorted;
   const originalSetSortParameters = prototype.setSortParameters;
+  const originalSetSortParams = prototype.setSortParams;
   const originalOnSorted = prototype.onSorted;
 
   prototype.applyPendingSorted = function applyPendingSorted(): void {
@@ -76,15 +88,34 @@ export function installPlayCanvasSortResultGuard(): void {
     originalSetSortParameters.call(this, payload);
   };
 
+  // #WDD-gpt 2026-09-08 - PlayCanvas 虽只创建一个 CPU Sort Worker，却允许多个版本同时在途；
+  // 这里把它收敛为单飞队列并只保留最新参数，防止旧帧排序在快速切帧期间排队回写。
+  prototype.setSortParams = function setSortParams(
+    params: readonly unknown[],
+    radialSorting: boolean,
+  ): void {
+    if (shouldQueuePlayCanvasSort(this.jobsInFlight)) {
+      queuedSortBySorter.set(this, { params, radialSorting });
+      return;
+    }
+    originalSetSortParams.call(this, params, radialSorting);
+  };
+
   prototype.onSorted = function onSorted(message: SortMessage): void {
     const version = Number(message.data?.version ?? message.version);
     originalOnSorted.call(this, message);
     const latestVersion = latestVersionBySorter.get(this);
-    if (latestVersion === undefined || !isStalePlayCanvasSortResult(version, latestVersion)) return;
-    const pending = this.pendingSorted;
-    if (!pending || pending.version !== version) return;
-    this.pendingSorted = null;
-    this.releaseOrderData(pending.orderData);
+    if (latestVersion !== undefined && isStalePlayCanvasSortResult(version, latestVersion)) {
+      const pending = this.pendingSorted;
+      if (pending?.version === version) {
+        this.pendingSorted = null;
+        this.releaseOrderData(pending.orderData);
+      }
+    }
+    const queued = queuedSortBySorter.get(this);
+    if (!queued || shouldQueuePlayCanvasSort(this.jobsInFlight)) return;
+    queuedSortBySorter.delete(this);
+    originalSetSortParams.call(this, queued.params, queued.radialSorting);
   };
 
   const managerPrototype = GSplatManager.prototype as unknown as GuardedManagerPrototype;
