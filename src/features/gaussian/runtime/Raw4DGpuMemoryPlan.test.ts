@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { Raw4DAsset, Raw4DScalarEncoding, Raw4DTrack } from '../formats/raw4d/Raw4DTypes';
+import { estimateRaw4DGaussianGpuBytes } from './createRaw4DGaussian';
 import { createRaw4DGpuMemoryPlan } from './Raw4DGpuMemoryPlan';
 
 function track(pointCount: number, components: number, keys: number, encoding: Raw4DScalarEncoding): Raw4DTrack {
@@ -36,5 +37,11 @@ describe('RAW4D WebGPU memory plan', () => {
     expect(floatPlan.totalBytes).toBe(51_676_740);
     expect(halfPlan.totalBytes).toBe(25_838_380);
     expect(halfPlan.totalBytes).toBeLessThan(96_463_248 * 0.27);
+  });
+
+  it('removes the SH3-only textures from a SH2 residency estimate', () => {
+    const asset = masterShape('float16');
+    expect(estimateRaw4DGaussianGpuBytes(asset, 3) - estimateRaw4DGaussianGpuBytes(asset, 2))
+      .toBe(asset.splatCount * 28);
   });
 });

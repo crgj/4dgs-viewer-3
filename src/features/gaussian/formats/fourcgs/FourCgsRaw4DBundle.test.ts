@@ -4,7 +4,9 @@ import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { FOUR_CGS_HEADER_BYTES, readFourCgsManifest } from './FourCgsContainer';
 import {
+  createRaw4DRawBundleFiles,
   paddedEvenLength,
+  RAW4D_RAW_BUNDLE_CODEC_NAME,
   raw4DBundleMetadata,
   raw4DBundleOutputName,
   shuffle16WithPadding,
@@ -132,6 +134,57 @@ describe('RAW4D 4CGS bundle helpers', () => {
     expect(raw4DBundleOutputName(['take.raw4d'], 0, 30)).toBe('take.4cgs');
     expect(raw4DBundleOutputName(['segment_180_210.raw4d', 'segment_210_240.raw4d'], 180, 240))
       .toBe('raw4d_sequence_180_240.4cgs');
+  });
+
+  it('restores raw bundle segments as source-backed File slices', async () => {
+    const payloads = [new Uint8Array([1, 2, 3, 4, 5]), new Uint8Array([6, 7, 8, 9, 10, 11])];
+    const bundleSegments = [
+      { name: 'first', firstFrame: 0, lastFrame: 0, gaussianCount: 1, totalFrames: 1, bankCounts: { position: 1, rotation: 1, colorDc: 1, scale: 1, opacity: 1 } },
+      { name: 'second', firstFrame: 1, lastFrame: 1, gaussianCount: 1, totalFrames: 1, bankCounts: { position: 1, rotation: 1, colorDc: 1, scale: 1, opacity: 1 } },
+    ];
+    const manifest = {
+      format: '4CGS' as const,
+      version: 2,
+      codecName: RAW4D_RAW_BUNDLE_CODEC_NAME,
+      slotCount: 1,
+      firstFrame: 0,
+      lastFrame: 1,
+      uniqueFrameCount: 2,
+      segments: bundleSegments,
+      streams: payloads.map((payload, index) => ({
+        name: `raw4d_segment:${index}:0`,
+        compression: 'raw' as const,
+        rawBytes: payload.byteLength,
+        storedBytes: payload.byteLength,
+        rawSha256: `${index + 1}`.repeat(64),
+        storedSha256: `${index + 1}`.repeat(64),
+      })),
+      crop: { center: [0, 0, 0] as const, halfExtent: 1 },
+      prs: { mode: 'raw4d-raw-bundle' },
+      metadata: {
+        raw4dBundle: {
+          version: 1 as const,
+          chunkBytes: 8,
+          segmentChunkCounts: [1, 1],
+          sourceNames: ['first.raw4d', 'nested/second.raw4d'],
+          sourceByteLengths: payloads.map((payload) => payload.byteLength),
+          sourceSha256: ['a'.repeat(64), 'b'.repeat(64)],
+          exactSourceBytes: true as const,
+        },
+      },
+    };
+    const manifestBytes = new TextEncoder().encode(JSON.stringify(manifest));
+    const header = new Uint8Array(12);
+    header.set(new TextEncoder().encode('4CGSPRS2'));
+    new DataView(header.buffer).setUint32(8, manifestBytes.byteLength, true);
+    const source = new File([header, manifestBytes, ...payloads], 'raw-bundle.4cgs');
+
+    const directory = await readFourCgsManifest(source);
+    const files = createRaw4DRawBundleFiles(source, directory.manifest, FOUR_CGS_HEADER_BYTES + directory.manifestBytes);
+
+    expect(files.map((file) => file.name)).toEqual(['first.raw4d', 'second.raw4d']);
+    expect(await Promise.all(files.map(async (file) => [...new Uint8Array(await file.arrayBuffer())])))
+      .toEqual(payloads.map((payload) => [...payload]));
   });
 
   it('physically removes deleted stable IDs before compressing the export', async () => {

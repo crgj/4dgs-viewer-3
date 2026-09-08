@@ -17,7 +17,7 @@ import type { Raw4DAsset, Raw4DTrack } from '../formats/raw4d/Raw4DTypes';
 import { readRaw4DScalar, readRaw4DTrack, raw4DScalarBits } from '../formats/raw4d/Raw4DValues';
 import type { GpuBufferAllocation, GpuBufferPool } from '../memory/GpuBufferPool';
 import { KeyframeSlotCache, keyframeRequirements } from './KeyframeSlotCache';
-import type { Raw4DFrameSampler } from './Raw4DFrameSampler';
+import type { Raw4DSortCenterSampler } from './Raw4DFrameSampler';
 import { createRaw4DGpuMemoryPlan } from './Raw4DGpuMemoryPlan';
 
 const TEXTURE_WIDTH = 4096;
@@ -939,7 +939,7 @@ export class Raw4DGpuPlayback {
   private constructor(
     private readonly entity: Entity,
     private readonly resource: GSplatResourceBase,
-    private readonly sampler: Raw4DFrameSampler | null,
+    private readonly sampler: Raw4DSortCenterSampler | null,
     private readonly asset: Raw4DAsset,
     private readonly edits: GaussianEditStore,
     private readonly textures: Texture[],
@@ -962,12 +962,15 @@ export class Raw4DGpuPlayback {
   static async create(
     entity: Entity,
     resource: GSplatResourceBase,
-    sampler: Raw4DFrameSampler | null,
+    sampler: Raw4DSortCenterSampler | null,
     asset: Raw4DAsset,
     edits: GaussianEditStore,
     device: GraphicsDevice,
     gpuPool: GpuBufferPool,
-    options: { readonly streamTextureKeyframes?: boolean } = {},
+    options: {
+      readonly releaseTextureUploadSources?: boolean;
+      readonly streamTextureKeyframes?: boolean;
+    } = {},
   ): Promise<Raw4DGpuPlayback> {
     const width = Math.min(TEXTURE_WIDTH, device.maxTextureSize);
     const deletionTexture = createDeletionTexture(device, edits, width);
@@ -980,6 +983,10 @@ export class Raw4DGpuPlayback {
           width, gpuPool, storageResources, null,
         );
         playback.configureStorageBuffers(storageResources);
+        if (options.releaseTextureUploadSources) {
+          deletionTexture._clearLevels();
+          selectionTexture._clearLevels();
+        }
         return playback;
       } catch (error) {
         // #WDD-gpt 2026-08-16 - 显存预算/OOM 必须交给段落缓存淘汰后重试，禁止回退到更占显存的全量纹理路径。
@@ -1004,6 +1011,7 @@ export class Raw4DGpuPlayback {
           width, null, null, streaming,
         );
         playback.configureStreamingTextures(streaming, lifetimeTexture);
+        if (options.releaseTextureUploadSources) lifetimeTexture._clearLevels();
         return playback;
       }
       const positionTexture = createTrackTexture(device, asset.position, 'RAW4D Position Banks', width, [0, 1, 2], false);
@@ -1034,6 +1042,10 @@ export class Raw4DGpuPlayback {
       component.setParameter('dongRaw4dSelectionMaskTex', selectionTexture);
       component.setParameter('dongRaw4dTextureWidth', width);
       component.workBufferUpdate = WORKBUFFER_UPDATE_ONCE;
+      if (options.releaseTextureUploadSources) {
+        // #WDD-gpt 2026-09-07 - 全显存序列丢弃可由 Canonical 重建的一次性上传数组，避免 GPU 纹理在 JS Heap 再复制一份。
+        for (const texture of textures.slice(2)) texture._clearLevels();
+      }
       return playback;
     } catch (error) {
       for (const texture of textures) texture.destroy();
@@ -1377,12 +1389,6 @@ export class Raw4DGpuPlayback {
   private refreshSortCenters(frame: number): void {
     if (this.resource.centers && this.sampler && raw4DSortCentersNeedRefresh(frame, this.lastCenterFrame)) {
       this.sampler.samplePosition(frame);
-      const { x, y, z } = this.sampler.properties;
-      for (let index = 0; index < this.asset.splatCount; index += 1) {
-        this.resource.centers[index * 3] = x[index];
-        this.resource.centers[index * 3 + 1] = y[index];
-        this.resource.centers[index * 3 + 2] = z[index];
-      }
       this.resource.centersVersion += 1;
       this.lastCenterFrame = frame;
     }

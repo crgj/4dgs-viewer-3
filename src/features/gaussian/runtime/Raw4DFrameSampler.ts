@@ -314,3 +314,44 @@ export class Raw4DFrameSampler {
     }
   }
 }
+
+// #WDD-gpt 2026-09-07 - 渲染排序只需要 XYZ，禁止为 180 个隐藏段重复解码旋转、外观与 SH 全属性。
+export class Raw4DSortCenterSampler {
+  readonly centers: Float32Array;
+  private sampledFrame = Number.NaN;
+
+  constructor(private readonly asset: Raw4DAsset) {
+    this.centers = new Float32Array(asset.splatCount * 3);
+    this.samplePosition(0);
+  }
+
+  samplePosition(requestedFrame: number): void {
+    const frame = Math.min(this.asset.totalFrames - 1, Math.max(0, requestedFrame));
+    if (frame === this.sampledFrame) return;
+    const track = this.asset.position;
+    if (this.asset.positionTiming === 'per-point-lifetime-endpoints') {
+      for (let index = 0; index < this.asset.splatCount; index += 1) {
+        const center = readRaw4DScalar(this.asset.lifetimeMu, index, this.asset.sourceEncoding);
+        const halfWidth = Math.max(0, readRaw4DScalar(this.asset.lifetimeW, index, this.asset.sourceEncoding));
+        const start = center - halfWidth;
+        const end = center + halfWidth;
+        const alpha = end > start ? Math.max(0, Math.min(1, (frame - start) / (end - start))) : 0;
+        for (let component = 0; component < 3; component += 1) {
+          const left = readRaw4DTrack(track, component, index);
+          const right = readRaw4DTrack(track, 3 + component, index);
+          this.centers[index * 3 + component] = left + (right - left) * alpha;
+        }
+      }
+    } else {
+      const span = trackSpan(track, frame);
+      for (let index = 0; index < this.asset.splatCount; index += 1) {
+        for (let component = 0; component < 3; component += 1) {
+          const left = readRaw4DTrack(track, span.left * track.components + component, index);
+          const right = readRaw4DTrack(track, span.right * track.components + component, index);
+          this.centers[index * 3 + component] = left + (right - left) * span.alpha;
+        }
+      }
+    }
+    this.sampledFrame = frame;
+  }
+}

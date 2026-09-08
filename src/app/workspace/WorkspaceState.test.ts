@@ -20,9 +20,9 @@ describe('WorkspaceState source identity', () => {
 });
 
 describe('WorkspaceState frame sort migration', () => {
-  it('enables correct per-frame sorting for legacy drafts, including their old persisted false default', () => {
-    expect(restoreWorkspaceForceSortSync({})).toBe(true);
-    expect(restoreWorkspaceForceSortSync({ forceSortSync: false })).toBe(true);
+  it('migrates legacy drafts to smooth asynchronous sorting', () => {
+    expect(restoreWorkspaceForceSortSync({})).toBe(false);
+    expect(restoreWorkspaceForceSortSync({ forceSortSync: true, forceSortSyncRevision: 1 })).toBe(false);
   });
 
   it('preserves an explicit user choice after the correctness-first revision is recorded', () => {
@@ -34,5 +34,9 @@ describe('WorkspaceState frame sort migration', () => {
       forceSortSync: true,
       forceSortSyncRevision: FORCE_SORT_SYNC_REVISION,
     })).toBe(true);
+    expect(restoreWorkspaceForceSortSync({
+      forceSortSync: undefined,
+      forceSortSyncRevision: FORCE_SORT_SYNC_REVISION,
+    })).toBe(false);
   });
 });

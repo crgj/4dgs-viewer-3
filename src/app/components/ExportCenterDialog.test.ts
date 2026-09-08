@@ -2,10 +2,14 @@ import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it, vi } from 'vitest';
 import { ExportCenterDialog } from './ExportCenterDialog';
-import { supportsFourCgsSceneExport, supportsRaw4DSceneExport } from './ExportCenterModel';
+import {
+  supportsFourCgsRaw4DZipExport,
+  supportsFourCgsSceneExport,
+  supportsRaw4DSceneExport,
+} from './ExportCenterModel';
 
 describe('ExportCenterDialog', () => {
-  it('offers .4CGS, segmented .RAW4D, and PLY sequence for an imported PLY4 scene', () => {
+  it('offers binary 4CGS, RAW4D ZIP 4CGS, segmented RAW4D, and PLY sequence', () => {
     const markup = renderToStaticMarkup(createElement(ExportCenterDialog, {
       deletedCount: 0,
       format: 'PLY4',
@@ -25,8 +29,12 @@ describe('ExportCenterDialog', () => {
     expect(supportsFourCgsSceneExport('PLY4')).toBe(true);
     expect(supportsRaw4DSceneExport('RAW4D')).toBe(true);
     expect(supportsFourCgsSceneExport('4GS')).toBe(true);
-    expect(markup.match(/role="radio"/g)).toHaveLength(3);
-    expect(markup).toContain('.4CGS');
+    expect(supportsFourCgsRaw4DZipExport('PLY4', 2)).toBe(true);
+    expect(supportsFourCgsRaw4DZipExport('PLY4', 1)).toBe(false);
+    expect(markup.match(/role="radio"/g)).toHaveLength(4);
+    expect(markup).toContain('.4CGS · V2.6');
+    expect(markup).toContain('.4CGS · RAW4D ZIP');
+    expect(markup).toContain('一个 .4cgs ZIP 内按时间轴写入 2 个独立 .raw4d');
     expect(markup).toContain('.RAW4D');
     expect(markup).toContain('PLY 序列');
     expect(markup).toContain('从 PLY4 编码完整场景与全部片段');

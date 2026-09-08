@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import type { Raw4DAsset, Raw4DTrack } from '../../../gaussian/formats/raw4d/Raw4DTypes';
-import { Raw4DFrameSampler } from '../../../gaussian/runtime/Raw4DFrameSampler';
+import {
+  Raw4DFrameSampler,
+  Raw4DSortCenterSampler,
+} from '../../../gaussian/runtime/Raw4DFrameSampler';
 import { Raw4DSelectionFrameSampler } from './Raw4DSelectionFrameSampler';
 
 function track(components: number, values: number[][], keyframes = [0]): Raw4DTrack {
@@ -39,13 +42,19 @@ describe('Raw4DSelectionFrameSampler', () => {
     const asset = testAsset();
     const selection = new Raw4DSelectionFrameSampler(asset);
     const renderer = new Raw4DFrameSampler(asset);
+    const sortCenters = new Raw4DSortCenterSampler(asset);
 
     selection.sample(1);
     renderer.sample(1);
+    sortCenters.samplePosition(1);
 
     for (const property of ['x', 'y', 'z', 'opacity'] as const) {
       expect([...selection.properties[property]]).toEqual([...renderer.properties[property]]);
     }
+    expect([...sortCenters.centers]).toEqual([
+      renderer.properties.x[0], renderer.properties.y[0], renderer.properties.z[0],
+      renderer.properties.x[1], renderer.properties.y[1], renderer.properties.z[1],
+    ]);
   });
 
   it('matches per-point lifetime endpoint positions and does not gate baked opacity twice', () => {
@@ -63,14 +72,17 @@ describe('Raw4DSelectionFrameSampler', () => {
     };
     const selection = new Raw4DSelectionFrameSampler(asset);
     const renderer = new Raw4DFrameSampler(asset);
+    const sortCenters = new Raw4DSortCenterSampler(asset);
 
     selection.sample(1);
     renderer.sample(1);
+    sortCenters.samplePosition(1);
 
     for (const property of ['x', 'y', 'z', 'opacity'] as const) {
       expect([...selection.properties[property]]).toEqual([...renderer.properties[property]]);
     }
     expect([...selection.properties.x]).toEqual([2, 12]);
     expect([...selection.properties.opacity]).toEqual([0.5, 0.5]);
+    expect([...sortCenters.centers]).toEqual([2, 0, 0, 12, 0, 0]);
   });
 });

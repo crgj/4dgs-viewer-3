@@ -78,10 +78,16 @@ import {
   type Gaussian4DMemoryPolicy,
 } from '../../gaussian/memory/Gaussian4DMemoryPolicy';
 import type { GaussianRuntimeProfile } from '../../gaussian/memory/GaussianRuntimeProfile';
-import { chooseRaw4DGpuEviction } from '../../gaussian/memory/Raw4DGpuResidencyPolicy';
+import {
+  chooseRaw4DGpuEviction,
+  planRaw4DGpuPreload,
+  raw4DGpuWindowContains,
+  type Raw4DGpuPreloadPlan,
+} from '../../gaussian/memory/Raw4DGpuResidencyPolicy';
 import {
   createRaw4DGaussian,
-  estimateRaw4DGaussianGpuBytes,
+  estimateRaw4DGaussianGpuWorkBytes,
+  estimateRaw4DGaussianResidentGpuBytes,
   type Raw4DGaussian,
 } from '../../gaussian/runtime/createRaw4DGaussian';
 import { Raw4DFrameSampler } from '../../gaussian/runtime/Raw4DFrameSampler';
@@ -189,6 +195,7 @@ export interface ViewportStatus {
   sourceName?: string;
   objectName?: string;
   format?: 'Procedural' | GaussianSourceFormat | '4CGS';
+  fourCgsContainer?: 'binary' | 'raw4d-zip' | 'raw4d-bundle';
   bufferId?: string;
   sourceToResidentRatio?: number;
   memoryTransport?: 'shared-array-buffer' | 'transferable';
@@ -241,6 +248,15 @@ export interface ViewportRaw4DResidencyProgress {
   readonly segmentIndex: number;
   readonly segmentCount: number;
   readonly ratio: number;
+  readonly message: string;
+}
+
+export interface ViewportRaw4DGpuPreloadProgress {
+  readonly completedSegments: number;
+  readonly segmentCount: number;
+  readonly ratio: number;
+  readonly requiredBytes: number;
+  readonly budgetBytes: number;
   readonly message: string;
 }
 
@@ -508,6 +524,10 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost, Semanti
   private readonly residentRaw4DGpuLoads = new Map<string, ResidentRaw4DGpuLoad>();
   private raw4DSequenceGpuOrder: readonly string[] = [];
   private raw4DSequenceActiveIndex = -1;
+  private raw4DSequenceMaxFutureGpuSegments = Number.POSITIVE_INFINITY;
+  private raw4DSequenceMaxShBands: number | undefined;
+  private raw4DSequenceGpuWorkReserveBytes = 0;
+  private raw4DSequenceReleaseTextureUploadSources = false;
   private raw4DGpuUseClock = 0;
   private raw4DPrefetchGeneration = 0;
   private gaussianVisible = true;
@@ -1576,7 +1596,7 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost, Semanti
       // #WDD-gpt 2026-08-16 - 运行中降低显存预算时保留当前段和最近未来段，先清理已播放段，再清理最远未来段。
       const residentBytes = () => [...this.residentRaw4DGpuCache.values()]
         .reduce((total, entry) => total + entry.estimatedGpuBytes, 0);
-      while (residentBytes() > policy.gpuBudgetBytes) {
+      while (residentBytes() + this.raw4DSequenceGpuWorkReserveBytes > policy.gpuBudgetBytes) {
         if (!this.evictRaw4DGpuCacheEntry(this.raw4DSequenceActiveIndex, true)) break;
       }
       this.memoryCoordinator?.gpuPool.trim();
@@ -3154,7 +3174,14 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost, Semanti
     };
   }
 
-  configureRaw4DSequenceGpuCache(handles: readonly ViewportResidentRaw4DSegment[]): void {
+  configureRaw4DSequenceGpuCache(
+    handles: readonly ViewportResidentRaw4DSegment[],
+    options: {
+      readonly maxFutureSegments?: number;
+      readonly maxShBands?: number;
+      readonly releaseTextureUploadSources?: boolean;
+    } = {},
+  ): void {
     const order = handles.map((handle) => {
       const entry = this.residentRaw4DSegments.get(handle.residentId);
       if (!entry || entry.handle !== handle) throw new Error(`${handle.file.name} 已不在系统内存驻留池。`);
@@ -3197,8 +3224,77 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost, Semanti
     this.history.clear();
     this.raw4DSequenceGpuOrder = order;
     this.raw4DSequenceActiveIndex = -1;
+    // #WDD-gpt 2026-09-07 - 普通序列保持既有全预算预取；超长容器可显式收紧为小型前向滑窗。
+    this.raw4DSequenceMaxFutureGpuSegments = options.maxFutureSegments === undefined
+      ? Number.POSITIVE_INFINITY
+      : Math.max(0, Math.floor(options.maxFutureSegments));
+    this.raw4DSequenceMaxShBands = options.maxShBands === undefined
+      ? undefined
+      : Math.max(0, Math.round(options.maxShBands));
+    this.raw4DSequenceReleaseTextureUploadSources = options.releaseTextureUploadSources ?? false;
+    // #WDD-gpt 2026-09-07 - PlayCanvas 统一渲染器只有一份可见 WorkBuffer，按最大单段保留峰值而不按隐藏段累加。
+    this.raw4DSequenceGpuWorkReserveBytes = order.reduce((maximum, residentId) => (
+      Math.max(maximum, estimateRaw4DGaussianGpuWorkBytes(
+        this.residentRaw4DSegments.get(residentId)!.loaded.asset,
+      ))
+    ), 0);
     this.assetDisposer = this.raw4DSequenceAssetDisposer;
     this.requestGaussianEnvelopeUpdate(0);
+  }
+
+  getRaw4DSequenceGpuPreloadPlan(
+    handles: readonly ViewportResidentRaw4DSegment[],
+    maxShBands?: number,
+  ): Raw4DGpuPreloadPlan {
+    const segmentBytes = handles.map((handle) => {
+      const entry = this.residentRaw4DSegments.get(handle.residentId);
+      if (!entry || entry.handle !== handle) throw new Error(`${handle.file.name} 已不在系统内存驻留池。`);
+      return estimateRaw4DGaussianResidentGpuBytes(entry.loaded.asset, maxShBands);
+    });
+    const workReserveBytes = handles.reduce((maximum, handle) => {
+      const entry = this.residentRaw4DSegments.get(handle.residentId)!;
+      return Math.max(maximum, estimateRaw4DGaussianGpuWorkBytes(entry.loaded.asset));
+    }, 0);
+    if (segmentBytes.length > 0) segmentBytes[0] += workReserveBytes;
+    return planRaw4DGpuPreload(
+      segmentBytes,
+      this.memoryCoordinator?.getStats().gpuBudgetBytes ?? 0,
+    );
+  }
+
+  // #WDD-gpt 2026-09-07 - 在首帧显示前串行建立全部隐藏 GPU 实体，播放期间只做实体切换而不再上传。
+  async preloadRaw4DSequenceGpu(
+    handles: readonly ViewportResidentRaw4DSegment[],
+    onProgress?: (progress: ViewportRaw4DGpuPreloadProgress) => void,
+    signal?: AbortSignal,
+  ): Promise<Raw4DGpuPreloadPlan> {
+    const plan = this.getRaw4DSequenceGpuPreloadPlan(handles, this.raw4DSequenceMaxShBands);
+    if (!plan.fits) return plan;
+    if (handles.length !== this.raw4DSequenceGpuOrder.length
+      || handles.some((handle, index) => handle.residentId !== this.raw4DSequenceGpuOrder[index])) {
+      throw new Error('RAW4D 全量显存预读必须在配置同一序列后执行。');
+    }
+    const generation = ++this.raw4DPrefetchGeneration;
+    for (let index = 0; index < handles.length; index += 1) {
+      if (signal?.aborted || generation !== this.raw4DPrefetchGeneration || this.destroyRequested) {
+        throw new DOMException('RAW4D 全量显存预读已取消。', 'AbortError');
+      }
+      const handle = handles[index];
+      const resident = this.residentRaw4DSegments.get(handle.residentId);
+      if (!resident || resident.handle !== handle) throw new Error(`${handle.file.name} 已不在系统内存驻留池。`);
+      await this.getOrCreateResidentRaw4DGpu(resident, index, true, signal);
+      const completedSegments = index + 1;
+      onProgress?.({
+        completedSegments,
+        segmentCount: handles.length,
+        ratio: completedSegments / Math.max(1, handles.length),
+        requiredBytes: plan.requiredBytes,
+        budgetBytes: plan.budgetBytes,
+        message: `正在预读全部 GPU 片段 ${completedSegments}/${handles.length}`,
+      });
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    }
+    return plan;
   }
 
   isResidentRaw4DGpuReady(handle: ViewportResidentRaw4DSegment): boolean {
@@ -3250,6 +3346,7 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost, Semanti
     }
     const status = this.activateResidentRaw4DGpuEntry(gpuEntry, targetIndex, initialFrame, onDisplayed);
     if (this.importController === controller) this.importController = null;
+    this.trimRaw4DGpuCacheWindow(targetIndex);
     this.scheduleRaw4DFuturePrefetch(targetIndex);
     return status;
   }
@@ -3289,7 +3386,10 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost, Semanti
     const controller = new AbortController();
     const abortFromCaller = () => controller.abort();
     callerSignal?.addEventListener('abort', abortFromCaller, { once: true });
-    const estimatedGpuBytes = estimateRaw4DGaussianGpuBytes(resident.loaded.asset);
+    const estimatedGpuBytes = estimateRaw4DGaussianResidentGpuBytes(
+      resident.loaded.asset,
+      this.raw4DSequenceMaxShBands,
+    );
     const hasCapacity = this.makeRaw4DGpuCacheCapacity(estimatedGpuBytes, targetIndex, !prefetch);
     if (prefetch && !hasCapacity) {
       callerSignal?.removeEventListener('abort', abortFromCaller);
@@ -3342,6 +3442,8 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost, Semanti
       {
         enabled: false,
         edits: sequenceEdits,
+        maxShBands: this.raw4DSequenceMaxShBands,
+        releaseTextureUploadSources: this.raw4DSequenceReleaseTextureUploadSources,
         streamTextureKeyframes: this.options.runtimeProfile?.streamTextureKeyframes,
       },
     );
@@ -3427,7 +3529,7 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost, Semanti
     const asset = gpuEntry.resident.loaded.asset;
     return {
       phase: 'ready', renderer: this.rendererLabel, splatCount: asset.splatCount,
-      totalFrames: asset.totalFrames, keyframeCount: raw4DAssetKeyframeCount(asset), fps: 30, shBands: asset.shBands,
+      totalFrames: asset.totalFrames, keyframeCount: raw4DAssetKeyframeCount(asset), fps: 30, shBands: gpuEntry.raw4D.shBands,
       sourceName: asset.sourceName, objectName: asset.sourceName.replace(/\.[^.]+$/, ''),
       format: 'RAW4D', bufferId: gpuEntry.resident.loaded.bufferId,
       sourceToResidentRatio: gpuEntry.resident.loaded.sourceToResidentRatio,
@@ -3440,8 +3542,15 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost, Semanti
   private scheduleRaw4DFuturePrefetch(activeIndex: number): void {
     if (this.memoryPolicy?.preloadAllKeyframes === false) return;
     const generation = ++this.raw4DPrefetchGeneration;
+    const lastPrefetchIndex = Number.isFinite(this.raw4DSequenceMaxFutureGpuSegments)
+      ? Math.min(
+        this.raw4DSequenceGpuOrder.length - 1,
+        activeIndex + this.raw4DSequenceMaxFutureGpuSegments,
+      )
+      : this.raw4DSequenceGpuOrder.length - 1;
     void (async () => {
-      for (let index = activeIndex + 1; index < this.raw4DSequenceGpuOrder.length; index += 1) {
+      // #WDD-gpt 2026-09-07 - 只预取滑窗内未来段，禁止 180 段 Bundle 在用户播放前持续制造 world/sort 版本。
+      for (let index = activeIndex + 1; index <= lastPrefetchIndex; index += 1) {
         if (generation !== this.raw4DPrefetchGeneration || this.raw4DSequenceActiveIndex !== activeIndex) return;
         const residentId = this.raw4DSequenceGpuOrder[index];
         if (this.residentRaw4DGpuCache.has(residentId)) continue;
@@ -3461,6 +3570,24 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost, Semanti
     })();
   }
 
+  private trimRaw4DGpuCacheWindow(activeIndex: number): void {
+    if (!Number.isFinite(this.raw4DSequenceMaxFutureGpuSegments)) return;
+    const orderIndex = new Map(this.raw4DSequenceGpuOrder.map((residentId, index) => [residentId, index]));
+    for (const [residentId, load] of this.residentRaw4DGpuLoads) {
+      const index = orderIndex.get(residentId);
+      if (index === undefined || !raw4DGpuWindowContains(
+        index, activeIndex, this.raw4DSequenceMaxFutureGpuSegments,
+      )) load.controller.abort();
+    }
+    for (const [residentId, entry] of [...this.residentRaw4DGpuCache]) {
+      const index = orderIndex.get(residentId);
+      if (index === undefined || !raw4DGpuWindowContains(
+        index, activeIndex, this.raw4DSequenceMaxFutureGpuSegments,
+      )) this.disposeRaw4DGpuEntry(residentId, entry);
+    }
+    this.memoryCoordinator?.gpuPool.trim();
+  }
+
   private makeRaw4DGpuCacheCapacity(
     requiredBytes: number,
     targetIndex: number,
@@ -3469,7 +3596,7 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost, Semanti
     const budget = this.memoryCoordinator?.getStats().gpuBudgetBytes ?? 0;
     const residentBytes = () => [...this.residentRaw4DGpuCache.values()]
       .reduce((total, entry) => total + entry.estimatedGpuBytes, 0);
-    while (residentBytes() + requiredBytes > budget) {
+    while (residentBytes() + requiredBytes + this.raw4DSequenceGpuWorkReserveBytes > budget) {
       if (!this.evictRaw4DGpuCacheEntry(targetIndex, allowActiveEviction)) return false;
     }
     return true;
@@ -3524,6 +3651,9 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost, Semanti
     }
     this.raw4DSequenceGpuOrder = [];
     this.raw4DSequenceActiveIndex = -1;
+    this.raw4DSequenceMaxShBands = undefined;
+    this.raw4DSequenceGpuWorkReserveBytes = 0;
+    this.raw4DSequenceReleaseTextureUploadSources = false;
     this.clearGaussianEnvelope();
     this.memoryCoordinator?.gpuPool.trim();
   }

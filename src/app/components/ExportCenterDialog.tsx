@@ -3,6 +3,7 @@ import type { UiLanguage } from '../i18n';
 import { uniqueRaw4DExportFilenames } from '../raw4dFileSave';
 import {
   supportsFourCgsSceneExport,
+  supportsFourCgsRaw4DZipExport,
   supportsRaw4DSceneExport,
   type ExportTarget,
 } from './ExportCenterModel';
@@ -40,13 +41,23 @@ export function ExportCenterDialog(props: ExportCenterDialogProps) {
   const options: readonly { id: ExportTarget; title: string; detail: string; disabled?: boolean }[] = [
     {
       id: 'fourcgs',
-      title: '.4CGS',
+      title: '.4CGS · V2.6',
       detail: supportsFourCgsSceneExport(props.format)
         ? (zh
             ? `从 ${props.format} 编码完整场景与全部片段${props.format === 'PLY4' || props.format === '4GS' ? '；Float32 输入会在 Worker 编码副本中量化为 FP16' : ''}`
             : `Encode the complete ${props.format} scene and all segments${props.format === 'PLY4' || props.format === '4GS' ? '; Float32 input is quantized to an FP16 Worker copy' : ''}`)
         : (zh ? `${props.format} 暂不支持编码为 .4cgs` : `${props.format} cannot currently be encoded as .4cgs`),
       disabled: !supportsFourCgsSceneExport(props.format),
+    },
+    {
+      id: 'fourcgs-raw4d-zip',
+      title: '.4CGS · RAW4D ZIP',
+      detail: supportsFourCgsRaw4DZipExport(props.format, props.segmentCount)
+        ? (zh
+            ? `一个 .4cgs ZIP 内按时间轴写入 ${props.segmentCount} 个独立 .raw4d`
+            : `Store ${props.segmentCount} timeline-ordered .raw4d segments inside one .4cgs ZIP`)
+        : (zh ? 'RAW4D ZIP 版 4CGS 至少需要两个时序片段' : 'A RAW4D ZIP 4CGS requires at least two timeline segments'),
+      disabled: !supportsFourCgsRaw4DZipExport(props.format, props.segmentCount),
     },
     {
       id: 'raw4d',
@@ -80,11 +91,17 @@ export function ExportCenterDialog(props: ExportCenterDialogProps) {
             <dl>
               <div><dt>{zh ? '范围' : 'Scope'}</dt><dd>{zh ? '完整场景' : 'Full scene'}</dd></div>
               <div><dt>{zh ? '片段 / 帧' : 'Segments / frames'}</dt><dd>{`${props.segmentCount} / ${props.frameCount}`}</dd></div>
-              <div><dt>{zh ? '输出文件' : 'Output files'}</dt><dd>{target === 'raw4d' ? `${props.segmentCount} × .raw4d` : target === 'fourcgs' ? '1 × .4cgs' : `${props.frameCount} × .ply`}</dd></div>
+              <div><dt>{zh ? '输出文件' : 'Output files'}</dt><dd>{target === 'raw4d'
+                ? `${props.segmentCount} × .raw4d`
+                : target === 'fourcgs'
+                  ? '1 × .4cgs (V2.6)'
+                  : target === 'fourcgs-raw4d-zip'
+                    ? `1 × .4cgs ZIP (${props.segmentCount} RAW4D)`
+                    : `${props.frameCount} × .ply`}</dd></div>
               <div><dt>{zh ? '软删除' : 'Soft deleted'}</dt><dd>{props.deletedCount.toLocaleString()}</dd></div>
               <div><dt>{zh ? '场景变换' : 'Scene transform'}</dt><dd>{target === 'fourcgs'
                 ? (zh ? '写入元数据' : 'Stored in metadata')
-                : target === 'raw4d'
+                : target === 'raw4d' || target === 'fourcgs-raw4d-zip'
                   ? (zh ? '不写入；可先重设原点' : 'Not stored; bake first')
                   : (zh ? '按导出器坐标' : 'Exporter coordinates')}</dd></div>
               <div><dt>{zh ? '输入大小' : 'Input size'}</dt><dd>{props.inputBytes > 0 ? `${(props.inputBytes / 1_000_000).toFixed(2)} MB` : '—'}</dd></div>
@@ -104,6 +121,10 @@ export function ExportCenterDialog(props: ExportCenterDialogProps) {
               ? (zh
                   ? `4CGS 会保留完整场景变换；软删除点在重新编码时压实。${props.format === 'PLY4' || props.format === '4GS' ? '场景内存保持 Float32，不会被原地改写。' : ''}`
                   : `4CGS preserves the full scene transform and compacts soft-deleted points when re-encoding.${props.format === 'PLY4' || props.format === '4GS' ? ' Scene memory remains Float32 and is not modified in place.' : ''}`)
+              : target === 'fourcgs-raw4d-zip'
+                ? (zh
+                    ? '浏览器会申请一个 .4cgs 文件，并将各段 RAW4D 以 Stored ZIP 条目逐块直接写入；保留片段边界和源精度，不需要独立服务。'
+                    : 'The browser writes each RAW4D segment directly into one stored-entry .4cgs ZIP, preserving segment boundaries and source precision without a separate service.')
               : target === 'raw4d'
                 ? (props.segmentCount > 1
                     ? (zh

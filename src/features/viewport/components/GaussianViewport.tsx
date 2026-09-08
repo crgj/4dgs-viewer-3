@@ -1,10 +1,20 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
+  FOUR_CGS_HEADER_BYTES,
   fourCgsSceneTransformToInput,
   locateFourCgsFrame,
+  readFourCgsManifest,
 } from '../../gaussian/formats/fourcgs/FourCgsContainer';
 import { FourCgsDecoderClient } from '../../gaussian/formats/fourcgs/FourCgsDecoderClient';
 import { fourCgsRaw4DKeyframeStrides } from '../../gaussian/formats/fourcgs/FourCgsRaw4D';
+import {
+  createRaw4DRawBundleFiles,
+  raw4DBundleStorage,
+} from '../../gaussian/formats/fourcgs/FourCgsRaw4DBundle';
+import {
+  extractRaw4DFilesFromFourCgsZip,
+  isFourCgsRaw4DZip,
+} from '../../gaussian/formats/fourcgs/FourCgsRaw4DZip';
 import type { FourCgsDescriptor } from '../../gaussian/formats/fourcgs/FourCgsTypes';
 import { locateRaw4DSequenceFrame } from '../../gaussian/formats/raw4d/Raw4DSequence';
 import { raw4DCanonicalKeyframes } from '../../gaussian/formats/raw4d/Raw4DSchema';
@@ -77,9 +87,25 @@ interface ActiveFourCgsSession {
 
 interface ActiveRaw4DSequenceSession {
   readonly client: Raw4DSequenceClient;
+  readonly containerFile?: File;
   readonly descriptor: Raw4DSequenceDescriptor;
+  readonly presentation: 'raw4d' | 'fourcgs-raw4d-zip' | 'fourcgs-raw4d-bundle';
   readonly residentSegments: readonly ViewportResidentRaw4DSegment[];
   segmentIndex: number;
+}
+
+function packagedRaw4DContainer(
+  presentation: ActiveRaw4DSequenceSession['presentation'],
+): 'raw4d-zip' | 'raw4d-bundle' | undefined {
+  if (presentation === 'fourcgs-raw4d-zip') return 'raw4d-zip';
+  if (presentation === 'fourcgs-raw4d-bundle') return 'raw4d-bundle';
+  return undefined;
+}
+
+function packagedRaw4DLabel(presentation: ActiveRaw4DSequenceSession['presentation']): string {
+  if (presentation === 'fourcgs-raw4d-zip') return '4CGS ZIP';
+  if (presentation === 'fourcgs-raw4d-bundle') return '4CGS RAW4D Bundle';
+  return 'RAW4D';
 }
 
 function raw4DSequenceTimeline(descriptor: Raw4DSequenceDescriptor): {
@@ -248,6 +274,7 @@ export function GaussianViewport({
     const mappedStatus = (status: ViewportStatus): ViewportStatus => ({
       ...status,
       format: '4CGS',
+      fourCgsContainer: 'binary',
       sourceName: session.sourceFile.name,
       objectName: session.sourceFile.name.replace(/\.4cgs$/i, ''),
       totalFrames: session.descriptor.totalFrames,
@@ -263,7 +290,7 @@ export function GaussianViewport({
         phase: 'loading', renderer: '4CGS V2.4', splatCount: segment.gaussianCount,
         progress: 0.98, totalFrames: session.descriptor.totalFrames, keyframeCount: sequenceStatus.keyframes.length, fps: 30, shBands: 3,
         sourceName: session.sourceFile.name, objectName: session.sourceFile.name.replace(/\.4cgs$/i, ''),
-        format: '4CGS', raw4dSequence: sequenceStatus, message: `正在从系统内存准备 4CGS ${segment.name}`,
+        format: '4CGS', fourCgsContainer: 'binary', raw4dSequence: sequenceStatus, message: `正在从系统内存准备 4CGS ${segment.name}`,
       });
     }
     try {
@@ -306,6 +333,14 @@ export function GaussianViewport({
     const residentSegment = session.residentSegments[location.segmentIndex];
     const gpuReady = runtime.isResidentRaw4DGpuReady(residentSegment);
     const timeline = raw4DSequenceTimeline(session.descriptor);
+    const fourCgsContainer = packagedRaw4DContainer(session.presentation);
+    const packagedAsFourCgs = Boolean(fourCgsContainer);
+    const presentationLabel = packagedRaw4DLabel(session.presentation);
+    const presentedSourceName = session.containerFile?.name ?? session.descriptor.sourceName;
+    const presentedObjectName = session.containerFile
+      ? session.containerFile.name.replace(/\.4cgs$/i, '')
+      : session.descriptor.sourceName;
+    const presentedFormat = packagedAsFourCgs ? '4CGS' : 'RAW4D';
     const sequenceStatus = {
       segmentIndex: location.segmentIndex,
       segmentCount: session.descriptor.segments.length,
@@ -327,22 +362,23 @@ export function GaussianViewport({
     } as const;
     const mappedStatus = (status: ViewportStatus): ViewportStatus => ({
       ...status,
-      sourceName: session.descriptor.sourceName,
-      objectName: session.descriptor.sourceName,
+      sourceName: presentedSourceName,
+      objectName: presentedObjectName,
       totalFrames: session.descriptor.totalFrames,
       keyframeCount: sequenceStatus.keyframes.length,
-      format: 'RAW4D',
+      format: presentedFormat,
+      ...(fourCgsContainer ? { fourCgsContainer } : {}),
       raw4dSequence: sequenceStatus,
       message: status.phase === 'loading'
-        ? `正在载入 RAW4D ${segment.name}：${status.message ?? ''}`
-        : `RAW4D ${segment.name} · 源帧 ${segment.firstFrame}-${segment.lastFrame}`,
+        ? `正在载入 ${presentationLabel} ${segment.name}：${status.message ?? ''}`
+        : `${presentationLabel} ${segment.name} · 源帧 ${segment.firstFrame}-${segment.lastFrame}`,
     });
     if (!gpuReady) {
       onStatusChange({
-        phase: 'loading', renderer: 'RAW4D 多段序列', splatCount: segment.splatCount,
+        phase: 'loading', renderer: packagedAsFourCgs ? presentationLabel : 'RAW4D 多段序列', splatCount: segment.splatCount,
         progress: 0.96, totalFrames: session.descriptor.totalFrames, keyframeCount: sequenceStatus.keyframes.length, fps: 30, shBands: segment.shBands,
-        sourceName: session.descriptor.sourceName, objectName: session.descriptor.sourceName,
-        format: 'RAW4D', raw4dSequence: sequenceStatus,
+        sourceName: presentedSourceName, objectName: presentedObjectName,
+        format: presentedFormat, ...(fourCgsContainer ? { fourCgsContainer } : {}), raw4dSequence: sequenceStatus,
         message: `正在准备第 ${location.segmentIndex + 1}/${session.descriptor.segments.length} 段 ${segment.name}`,
       });
     }
@@ -501,11 +537,16 @@ export function GaussianViewport({
       });
     } else if (raw4DSequenceSessionRef.current) {
       application = activateRaw4DSequenceFrameRef.current(currentFrame).catch((error: unknown) => {
+        const session = raw4DSequenceSessionRef.current;
+        const fourCgsContainer = session ? packagedRaw4DContainer(session.presentation) : undefined;
+        const packagedAsFourCgs = Boolean(fourCgsContainer);
+        const presentationLabel = session ? packagedRaw4DLabel(session.presentation) : 'RAW4D';
         onStatusChange({
-          phase: 'error', renderer: 'RAW4D 段切换失败', splatCount: 0,
+          phase: 'error', renderer: `${presentationLabel} 段切换失败`, splatCount: 0,
           message: error instanceof Error ? error.message : String(error),
-          sourceName: raw4DSequenceSessionRef.current?.descriptor.sourceName,
-          format: 'RAW4D',
+          sourceName: session?.containerFile?.name ?? session?.descriptor.sourceName,
+          format: packagedAsFourCgs ? '4CGS' : 'RAW4D',
+          ...(fourCgsContainer ? { fourCgsContainer } : {}),
         });
       });
     } else {
@@ -593,7 +634,7 @@ export function GaussianViewport({
         // #WDD-gpt 2026-08-16 - 时间顺序交给运行时建立显存滑动窗口，当前段激活后自动预取未来段。
         runtime.configureRaw4DSequenceGpuCache(residentSegments);
         raw4DSequenceSessionRef.current = {
-          client, descriptor, residentSegments, segmentIndex: -1,
+          client, descriptor, presentation: 'raw4d', residentSegments, segmentIndex: -1,
         };
         await activateRaw4DSequenceFrameRef.current(pendingFrameRef.current);
       }).catch((error: unknown) => {
@@ -615,22 +656,176 @@ export function GaussianViewport({
       };
     }
     if (sourceFile.name.toLowerCase().endsWith('.4cgs')) {
-      const decoder = new FourCgsDecoderClient();
+      const containerAbortController = new AbortController();
       const openStartedAt = performance.now();
+      let decoder: FourCgsDecoderClient | null = null;
+      let sequenceClient: Raw4DSequenceClient | null = null;
+      let detectedContainer: 'binary' | 'raw4d-zip' | 'raw4d-bundle' = 'binary';
       let residentSegments: readonly ViewportResidentRaw4DSegment[] = [];
       onStatusChange({
-        phase: 'loading', renderer: '4CGS V2.4', splatCount: 0, progress: 0,
-        message: '正在打开 4CGS 文件', sourceName: sourceFile.name,
+        phase: 'loading', renderer: '4CGS 自动识别', splatCount: 0, progress: 0,
+        message: '正在识别 4CGS 容器', sourceName: sourceFile.name,
         objectName: sourceFile.name.replace(/\.4cgs$/i, ''), format: '4CGS',
       });
-      decoder.open(sourceFile, ({ message, ratio }) => {
+      void (async () => {
+        const openPackagedRaw4DSequence = async (
+          decodedSegments: readonly File[],
+          presentation: 'fourcgs-raw4d-zip' | 'fourcgs-raw4d-bundle',
+          preprocessingRatio: number,
+        ): Promise<void> => {
+          const fourCgsContainer = packagedRaw4DContainer(presentation)!;
+          const presentationLabel = packagedRaw4DLabel(presentation);
+          sequenceClient = new Raw4DSequenceClient();
+          const client = sequenceClient;
+          const descriptor = await client.open(decodedSegments, ({ message, ratio }) => {
+            if (!active) return;
+            onStatusChange({
+              phase: 'loading', renderer: presentationLabel, splatCount: 0,
+              progress: preprocessingRatio + ratio * (0.46 - preprocessingRatio), message,
+              sourceName: sourceFile.name, objectName: sourceFile.name.replace(/\.4cgs$/i, ''),
+              format: '4CGS', fourCgsContainer,
+            });
+          });
+          if (!active) return;
+          const sourceOrderResidentSegments = await runtime.preloadRaw4DSequence(decodedSegments, ({ message, ratio }) => {
+            if (!active) return;
+            onStatusChange({
+              phase: 'loading', renderer: `${presentationLabel} 系统内存驻留`, splatCount: 0,
+              progress: 0.46 + ratio * 0.5, message,
+              sourceName: sourceFile.name, objectName: sourceFile.name.replace(/\.4cgs$/i, ''),
+              format: '4CGS', fourCgsContainer,
+            });
+          });
+          residentSegments = descriptor.segments.map((segment) => sourceOrderResidentSegments[segment.fileIndex]);
+          if (!active) {
+            runtime.releaseRaw4DSequence(residentSegments);
+            residentSegments = [];
+            return;
+          }
+          const rawBundleMaxShBands = presentation === 'fourcgs-raw4d-bundle' ? 2 : undefined;
+          const fullGpuPlan = presentation === 'fourcgs-raw4d-bundle'
+            ? runtime.getRaw4DSequenceGpuPreloadPlan(residentSegments, rawBundleMaxShBands)
+            : null;
+          const preloadAllGpuSegments = Boolean(fullGpuPlan?.fits);
+          // #WDD-gpt 2026-09-07 - Raw Bundle 先以 SH2 试算 180 段整体显存；足够则首帧前全部建好，不足才回退当前+下一段。
+          runtime.configureRaw4DSequenceGpuCache(residentSegments, {
+            ...(presentation === 'fourcgs-raw4d-bundle'
+              ? {
+                maxFutureSegments: preloadAllGpuSegments ? Number.POSITIVE_INFINITY : 1,
+                releaseTextureUploadSources: preloadAllGpuSegments,
+              }
+              : {}),
+            ...(rawBundleMaxShBands === undefined ? {} : { maxShBands: rawBundleMaxShBands }),
+          });
+          if (presentation === 'fourcgs-raw4d-bundle' && fullGpuPlan) {
+            const requiredGiB = fullGpuPlan.requiredBytes / 1024 ** 3;
+            const budgetGiB = fullGpuPlan.budgetBytes / 1024 ** 3;
+            if (preloadAllGpuSegments) {
+              try {
+                await runtime.preloadRaw4DSequenceGpu(residentSegments, (progress) => {
+                  if (!active) return;
+                  onStatusChange({
+                    phase: 'loading', renderer: `${presentationLabel} 全显存驻留`, splatCount: 0,
+                    progress: 0.96 + progress.ratio * 0.035,
+                    message: `${progress.message} · SH2 试算 ${requiredGiB.toFixed(2)} / ${budgetGiB.toFixed(2)} GiB`,
+                    sourceName: sourceFile.name, objectName: sourceFile.name.replace(/\.4cgs$/i, ''),
+                    format: '4CGS', fourCgsContainer,
+                  });
+                }, containerAbortController.signal);
+                console.info(`${presentationLabel} GPU preload ${JSON.stringify({
+                  segmentCount: residentSegments.length,
+                  shBands: rawBundleMaxShBands,
+                  requiredBytes: fullGpuPlan.requiredBytes,
+                  budgetBytes: fullGpuPlan.budgetBytes,
+                  completed: true,
+                })}`);
+              } catch (error) {
+                if (error instanceof DOMException && error.name === 'AbortError') throw error;
+                console.warn(`${presentationLabel} 全量显存预读失败，回退当前+下一段。`, error);
+                runtime.configureRaw4DSequenceGpuCache(residentSegments, {
+                  maxFutureSegments: 1,
+                  maxShBands: rawBundleMaxShBands,
+                });
+              }
+            } else {
+              console.warn(`${presentationLabel} GPU preload skipped ${JSON.stringify({
+                segmentCount: residentSegments.length,
+                shBands: rawBundleMaxShBands,
+                requiredBytes: fullGpuPlan.requiredBytes,
+                budgetBytes: fullGpuPlan.budgetBytes,
+              })}`);
+            }
+          }
+          raw4DSequenceSessionRef.current = {
+            client,
+            containerFile: sourceFile,
+            descriptor,
+            presentation,
+            residentSegments,
+            segmentIndex: -1,
+          };
+          await activateRaw4DSequenceFrameRef.current(pendingFrameRef.current);
+          console.info(`${presentationLabel} open timings ${JSON.stringify({
+            segmentCount: decodedSegments.length,
+            sourceBytes: sourceFile.size,
+            raw4DBytes: decodedSegments.reduce((sum, file) => sum + file.size, 0),
+            totalMs: performance.now() - openStartedAt,
+          })}`);
+        };
+
+        const zipDetected = await isFourCgsRaw4DZip(sourceFile);
         if (!active) return;
-        onStatusChange({
-          phase: 'loading', renderer: '4CGS V2.4', splatCount: 0, progress: ratio * 0.55,
-          message, sourceName: sourceFile.name,
-          objectName: sourceFile.name.replace(/\.4cgs$/i, ''), format: '4CGS',
+        if (zipDetected) {
+          detectedContainer = 'raw4d-zip';
+          // #WDD-gpt 2026-09-07 - ZIP 版 4CGS 自动提取内部 RAW4D，后续完全复用多段顺序、边界与驻留链路。
+          const decodedSegments = await extractRaw4DFilesFromFourCgsZip(sourceFile, {
+            signal: containerAbortController.signal,
+            onProgress: (progress) => {
+              if (!active) return;
+              onStatusChange({
+                phase: 'loading', renderer: '4CGS RAW4D ZIP', splatCount: 0,
+                progress: progress.ratio * 0.18,
+                message: progress.entryName
+                  ? `已解包 ${progress.completedSegments}/${progress.discoveredSegments} · ${progress.entryName}`
+                  : `正在解包 4CGS ZIP · ${(progress.ratio * 100).toFixed(0)}%`,
+                sourceName: sourceFile.name, objectName: sourceFile.name.replace(/\.4cgs$/i, ''),
+                format: '4CGS', fourCgsContainer: 'raw4d-zip',
+              });
+            },
+          });
+          if (!active) return;
+          await openPackagedRaw4DSequence(decodedSegments, 'fourcgs-raw4d-zip', 0.18);
+          return;
+        }
+
+        const directory = await readFourCgsManifest(sourceFile);
+        if (raw4DBundleStorage(directory.manifest) === 'raw') {
+          detectedContainer = 'raw4d-bundle';
+          // #WDD-gpt 2026-09-07 - Raw Bundle 的每段由源文件 Blob slice 直接组成，不读取或复制 7GB 级容器载荷。
+          const decodedSegments = createRaw4DRawBundleFiles(
+            sourceFile,
+            directory.manifest,
+            FOUR_CGS_HEADER_BYTES + directory.manifestBytes,
+          );
+          onStatusChange({
+            phase: 'loading', renderer: '4CGS RAW4D Bundle', splatCount: 0, progress: 0.02,
+            message: `已建立 ${decodedSegments.length} 个零拷贝 RAW4D 片段视图`,
+            sourceName: sourceFile.name, objectName: sourceFile.name.replace(/\.4cgs$/i, ''),
+            format: '4CGS', fourCgsContainer: 'raw4d-bundle',
+          });
+          await openPackagedRaw4DSequence(decodedSegments, 'fourcgs-raw4d-bundle', 0.02);
+          return;
+        }
+
+        decoder = new FourCgsDecoderClient();
+        const descriptor = await decoder.open(sourceFile, ({ message, ratio }) => {
+          if (!active) return;
+          onStatusChange({
+            phase: 'loading', renderer: '4CGS V2.4', splatCount: 0, progress: ratio * 0.55,
+            message, sourceName: sourceFile.name,
+            objectName: sourceFile.name.replace(/\.4cgs$/i, ''), format: '4CGS', fourCgsContainer: 'binary',
+          });
         });
-      }).then(async (descriptor) => {
         if (!active) return;
         // #WDD-gpt 2026-08-16 - 保留实际 bitstream 解码阶段计时，便于评估多线程是否真正缩短等待。
         console.info(`4CGS decode timings ${JSON.stringify(descriptor.decodeTimings)}`);
@@ -644,14 +839,15 @@ export function GaussianViewport({
         let extractedCount = 0;
         // #WDD-gpt 2026-08-16 - 一次提交全部片段请求，减少六次主线程往返并让后续 Loader 池尽早接手。
         const decodedSegments = await Promise.all(descriptor.segments.map(async (_segment, segmentIndex) => {
-          const decoded = await decoder.getSegment(segmentIndex);
+          const decoded = await decoder!.getSegment(segmentIndex);
           if (!active) throw new DOMException('4CGS 片段提取已取消。', 'AbortError');
           extractedCount += 1;
           onStatusChange({
             phase: 'loading', renderer: '4CGS 系统内存预读', splatCount: 0,
             progress: 0.55 + 0.1 * extractedCount / descriptor.segments.length,
             message: `正在并行提取 4CGS 片段 ${extractedCount}/${descriptor.segments.length}`,
-            sourceName: sourceFile.name, objectName: sourceFile.name.replace(/\.4cgs$/i, ''), format: '4CGS',
+            sourceName: sourceFile.name, objectName: sourceFile.name.replace(/\.4cgs$/i, ''),
+            format: '4CGS', fourCgsContainer: 'binary',
           });
           return decoded;
         }));
@@ -662,7 +858,8 @@ export function GaussianViewport({
           onStatusChange({
             phase: 'loading', renderer: '4CGS 系统内存驻留', splatCount: 0,
             progress: 0.65 + ratio * 0.33, message,
-            sourceName: sourceFile.name, objectName: sourceFile.name.replace(/\.4cgs$/i, ''), format: '4CGS',
+            sourceName: sourceFile.name, objectName: sourceFile.name.replace(/\.4cgs$/i, ''),
+            format: '4CGS', fourCgsContainer: 'binary',
           });
         });
         const residencyMs = performance.now() - residencyStartedAt;
@@ -687,22 +884,27 @@ export function GaussianViewport({
           activationMs: performance.now() - activationStartedAt,
           totalMs: performance.now() - openStartedAt,
         })}`);
-      }).catch((error: unknown) => {
+      })().catch((error: unknown) => {
         if (!active || (error instanceof DOMException && error.name === 'AbortError')) return;
         onStatusChange({
-          phase: 'error', renderer: '4CGS 导入失败', splatCount: 0,
+          phase: 'error', renderer: detectedContainer === 'binary' ? '4CGS 导入失败' : `${detectedContainer === 'raw4d-zip' ? '4CGS RAW4D ZIP' : '4CGS RAW4D Bundle'} 导入失败`, splatCount: 0,
           message: error instanceof Error ? error.message : String(error),
           sourceName: sourceFile.name, objectName: sourceFile.name.replace(/\.4cgs$/i, ''), format: '4CGS',
+          fourCgsContainer: detectedContainer,
         });
       });
       return () => {
         active = false;
+        containerAbortController.abort();
         fourCgsLoadGenerationRef.current += 1;
+        raw4DSequenceLoadGenerationRef.current += 1;
         runtime.cancelImport();
         runtime.releaseRaw4DSequence(residentSegments);
         residentSegments = [];
-        decoder.close();
-        if (fourCgsSessionRef.current?.decoder === decoder) fourCgsSessionRef.current = null;
+        decoder?.close();
+        sequenceClient?.close();
+        if (decoder && fourCgsSessionRef.current?.decoder === decoder) fourCgsSessionRef.current = null;
+        if (sequenceClient && raw4DSequenceSessionRef.current?.client === sequenceClient) raw4DSequenceSessionRef.current = null;
       };
     }
     runtime.loadGaussianFile(sourceFile, (status) => {

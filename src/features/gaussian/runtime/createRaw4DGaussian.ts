@@ -14,7 +14,7 @@ import {
 import { Raw4DCanonicalDataset } from '../formats/raw4d/Raw4DCanonicalDataset';
 import type { Raw4DAsset, Raw4DBounds } from '../formats/raw4d/Raw4DTypes';
 import type { GpuBufferPool } from '../memory/GpuBufferPool';
-import { Raw4DFrameSampler } from './Raw4DFrameSampler';
+import { Raw4DSortCenterSampler } from './Raw4DFrameSampler';
 import { Raw4DGpuPlayback } from './Raw4DGpuPlayback';
 import { createRaw4DGpuMemoryPlan } from './Raw4DGpuMemoryPlan';
 import { Raw4DResource } from './Raw4DResource';
@@ -25,17 +25,35 @@ const PREFETCH_GPU_WORK_BYTES_PER_SPLAT = 192;
 export interface Raw4DGaussianCreateOptions {
   readonly enabled?: boolean;
   readonly edits?: GaussianEditStore;
+  readonly maxShBands?: number;
+  readonly releaseTextureUploadSources?: boolean;
   readonly streamTextureKeyframes?: boolean;
 }
 
-// #WDD-gpt 2026-08-16 - 预取窗口按完整渲染峰值估算，而不是只统计显式纹理，给 Sort/WorkBuffer 留出逐点余量。
-export function estimateRaw4DGaussianGpuBytes(asset: Raw4DAsset): number {
+export function estimateRaw4DGaussianGpuWorkBytes(asset: Raw4DAsset): number {
+  return asset.splatCount * PREFETCH_GPU_WORK_BYTES_PER_SPLAT;
+}
+
+export function estimateRaw4DGaussianResidentGpuBytes(
+  asset: Raw4DAsset,
+  maxShBands = asset.shBands,
+): number {
   const plan = createRaw4DGpuMemoryPlan(asset);
-  const shBytesPerTexel = asset.shBands === 0 ? 0 : asset.shBands === 1 ? 16 : asset.shBands === 2 ? 36 : 64;
+  const residentShBands = Math.max(0, Math.min(asset.shBands, Math.round(maxShBands)));
+  const shBytesPerTexel = residentShBands === 0 ? 0 : residentShBands === 1 ? 16 : residentShBands === 2 ? 36 : 64;
   const resourceBytes = asset.splatCount * (32 + shBytesPerTexel);
   const editMaskBytes = asset.splatCount * 2;
-  return plan.totalBytes + resourceBytes + editMaskBytes
-    + asset.splatCount * PREFETCH_GPU_WORK_BYTES_PER_SPLAT;
+  const orderBytes = asset.splatCount * 4;
+  return plan.totalBytes + resourceBytes + editMaskBytes + orderBytes;
+}
+
+// #WDD-gpt 2026-08-16 - 单段渲染峰值额外给 Sort/WorkBuffer 留出逐点余量。
+export function estimateRaw4DGaussianGpuBytes(
+  asset: Raw4DAsset,
+  maxShBands = asset.shBands,
+): number {
+  return estimateRaw4DGaussianResidentGpuBytes(asset, maxShBands)
+    + estimateRaw4DGaussianGpuWorkBytes(asset);
 }
 
 export interface Raw4DGaussian {
@@ -45,6 +63,7 @@ export interface Raw4DGaussian {
   readonly bounds: Raw4DBounds;
   readonly splatCount: number;
   readonly totalFrames: number;
+  readonly shBands: number;
   readonly gpuBackend: 'storage-buffer' | 'texture' | 'streaming-texture';
   readonly externalGpuByteSize: number;
   deleteStableIds(stableIds: readonly number[], deleted?: boolean): void;
@@ -75,9 +94,15 @@ export async function createRaw4DGaussian(
   if (edits.pointCount !== asset.splatCount) {
     throw new Error(`Gaussian edit store point count ${edits.pointCount} does not match asset ${asset.splatCount}.`);
   }
-  let sampler = app.graphicsDevice.isWebGPU ? null : new Raw4DFrameSampler(asset);
-  const resource = new Raw4DResource(app.graphicsDevice, asset);
-  if (sampler) resource.centers = sampler.gsplatData.getCenters();
+  let sampler = app.graphicsDevice.isWebGPU ? null : new Raw4DSortCenterSampler(asset);
+  // #WDD-gpt 2026-09-07 - 长序列可只建立 SH2 GPU 资源，但 canonical 仍保留源 SH3 以供编辑与导出。
+  const resource = new Raw4DResource(
+    app.graphicsDevice,
+    asset,
+    options.maxShBands,
+    options.releaseTextureUploadSources,
+  );
+  if (sampler) resource.centers = sampler.centers;
   resource.aabb.setMinMax(new Vec3(...asset.bounds.min), new Vec3(...asset.bounds.max));
 
   const entity = new Entity(asset.sourceName.replace(/\.[^.]+$/, ''));
@@ -95,7 +120,10 @@ export async function createRaw4DGaussian(
       edits,
       app.graphicsDevice,
       gpuPool,
-      { streamTextureKeyframes: options.streamTextureKeyframes },
+      {
+        releaseTextureUploadSources: options.releaseTextureUploadSources,
+        streamTextureKeyframes: options.streamTextureKeyframes,
+      },
     );
   } catch (error) {
     // #WDD-gpt 2026-08-25 - 异步创建失败也可能已有 GSplatWorld 快照，禁止同步销毁 placement 形成 resource=null 的悬空窗口。
@@ -115,6 +143,7 @@ export async function createRaw4DGaussian(
     bounds: asset.bounds,
     splatCount: asset.splatCount,
     totalFrames: asset.totalFrames,
+    shBands: resource.shBands,
     get gpuBackend() { return gpuPlayback.backend; },
     get externalGpuByteSize() { return resource.gpuByteSize + gpuPlayback.externalGpuByteSize; },
     deleteStableIds: (stableIds, deleted = true) => edits.setDeleted(stableIds, deleted),
@@ -147,12 +176,15 @@ export async function createRaw4DGaussian(
       gpuPlayback.destroy();
       // #WDD-gpt 2026-08-17 - Canonical 关键帧整体改写后重建 CPU Sampler，刷新 SLERP 对与静态 SH 视图，禁止继续复用旧旋转缓存。
       if (!app.graphicsDevice.isWebGPU) {
-        sampler = new Raw4DFrameSampler(asset);
-        resource.centers = sampler.gsplatData.getCenters();
+        sampler = new Raw4DSortCenterSampler(asset);
+        resource.centers = sampler.centers;
       }
       gpuPlayback = await Raw4DGpuPlayback.create(
         entity, resource, sampler, asset, edits, app.graphicsDevice, gpuPool,
-        { streamTextureKeyframes: options.streamTextureKeyframes },
+        {
+          releaseTextureUploadSources: options.releaseTextureUploadSources,
+          streamTextureKeyframes: options.streamTextureKeyframes,
+        },
       );
       gpuPlayback.setFrame(currentFrame);
     },

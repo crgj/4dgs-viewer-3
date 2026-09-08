@@ -22,6 +22,7 @@ import {
   type FourCgsEncodeResult,
 } from '../features/gaussian/formats/fourcgs/FourCgsEncoderClient';
 import type { FourCgsProgress } from '../features/gaussian/formats/fourcgs/FourCgsTypes';
+import { FourCgsRaw4DZipWriter } from '../features/gaussian/formats/fourcgs/FourCgsRaw4DZip';
 import { exportRaw4DSequenceAsPlyDirectory } from '../features/gaussian/formats/raw4d/Raw4DPlySequenceExportClient';
 import { GaussianViewport } from '../features/viewport/components/GaussianViewport';
 import { MemoryTelemetryPanel } from '../features/viewport/components/MemoryTelemetryPanel';
@@ -264,7 +265,7 @@ const transformAxes = ['x', 'y', 'z'] as const;
 const playbackFpsOptions = [1, 2, 4, 10, 15, 30, 60] as const;
 
 interface ExportMonitorState {
-  readonly kind: 'fourcgs' | 'raw4d' | 'ply-sequence';
+  readonly kind: 'fourcgs' | 'fourcgs-raw4d-zip' | 'raw4d' | 'ply-sequence';
   readonly phase: 'running' | 'success' | 'error' | 'cancelled';
   readonly inputBytes: number;
   readonly progress: FourCgsProgress;
@@ -506,8 +507,8 @@ export function App() {
   const [frameReadyRequestId, setFrameReadyRequestId] = useState(0);
   // #WDD-gpt 2026-08-16 - 播放速率独立于文件元数据并默认 30 FPS，允许用户按检查需求降速或加速。
   const [playbackFps, setPlaybackFps] = useState(30);
-  // #WDD-gpt 2026-09-06 - 播放默认逐帧等待正确深度排序；性能优先、允许丢帧只作为用户显式关闭后的选择。
-  const [forceSortSync, setForceSortSync] = useState(true);
+  // #WDD-gpt 2026-09-07 - 真实 180 段 Bundle 的 CPU 排序吞吐仅约 4 FPS；桌面端默认改为异步排序流畅播放，精确逐帧排序仍可手动开启。
+  const [forceSortSync, setForceSortSync] = useState(false);
   // Mobile playback always waits for the current frame's depth sort. The stored
   // desktop preference remains independent so responsive layout changes are reversible.
   const effectiveForceSortSync = resolveForceSortSync(mobilePlayerMode, forceSortSync);
@@ -1432,7 +1433,7 @@ export function App() {
   };
 
   // #WDD-gpt  2026-08-16 - RAW4D 保存时根据软删除位集输出压实文件；编辑中的源数据保持稳定 ID。
-  const exportWorkspace = async () => {
+  const exportWorkspace = async (forceFourCgsReencode = false) => {
     setOpenMenu(null);
     // #WDD-gpt 2026-08-17 - 所有场景文件导出在读取当前帧数据前先暂停，避免编码期间时间轴继续变化。
     setIsPlaying(false);
@@ -1451,14 +1452,14 @@ export function App() {
     const exportsFourCgs = supportsFourCgsSceneExport(status.format ?? '');
     let fourCgsFileHandle: FileSystemFileHandle | null = null;
     if (exportsFourCgs) {
-      if (status.format === '4CGS' && !canonicalDataDirty && !sourceFile) {
+      if (status.format === '4CGS' && !forceFourCgsReencode && !canonicalDataDirty && !sourceFile) {
         showAppNotice(
           language === 'zh' ? '当前 4CGS 场景缺少可保存的源文件。' : 'The current 4CGS scene has no source file to save.',
           language === 'zh' ? '无法导出 4CGS' : 'Cannot export 4CGS',
         );
         return;
       }
-      if (status.format === '4CGS' && !canonicalDataDirty && (viewportRuntime?.getGaussianDeletionCount() ?? 0) > 0) {
+      if (status.format === '4CGS' && !forceFourCgsReencode && !canonicalDataDirty && (viewportRuntime?.getGaussianDeletionCount() ?? 0) > 0) {
         showAppNotice(
           language === 'zh'
             ? '4CGS V2.4 前端当前采用只读压缩载荷。请撤销高斯删除后再无损另存；不会静默丢弃编辑。'
@@ -1484,12 +1485,13 @@ export function App() {
         fourCgsFileHandle = await window.showSaveFilePicker(createFourCgsSavePickerOptions(`${stem}.4cgs`));
       } catch (error) {
         if (isFilePickerAbort(error)) return;
-        showAppError(error, '4cgs-save-permission', () => { void exportWorkspace(); });
+        showAppError(error, '4cgs-save-permission', () => { void exportWorkspace(forceFourCgsReencode); });
         return;
       }
     }
     if (((status.format === 'RAW4D' || status.format === 'PLY4' || status.format === '4GS') && sourceFiles.length > 0)
-      || (status.format === '4CGS' && canonicalDataDirty)) {
+      // #WDD-gpt 2026-09-07 - 导出中心明确选择 V2.6 时强制重编码，避免把未编辑的 RAW4D ZIP 原样误当成 V2.6 输出。
+      || (status.format === '4CGS' && (canonicalDataDirty || forceFourCgsReencode))) {
       // #WDD-gpt 2026-08-16 - RAW4D 默认导出冻结当前 Canonical RAM 与编辑位集，不再回读拖入时的 File 属性载荷。
       const controller = new AbortController();
       exportAbortRef.current = controller;
@@ -1580,7 +1582,10 @@ export function App() {
       if (!sourceFile) return;
       setExportProgress(0.05);
       try {
-        const blob = await writeFourCgsFile(sourceFile, sceneTransform, cameraBookmarks);
+        // #WDD-gpt 2026-09-07 - RAW4D ZIP 版 4CGS 未编辑时原样另存；旧二进制容器仍更新其内嵌变换与书签元数据。
+        const blob = status.fourCgsContainer === 'raw4d-zip'
+          ? sourceFile
+          : await writeFourCgsFile(sourceFile, sceneTransform, cameraBookmarks);
         setExportProgress(1);
         const stem = (sceneName ?? status.objectName ?? 'dong-editor-3').replace(/\.4cgs$/i, '');
         await commitExportBlob(blob, `${stem}.4cgs`, fourCgsFileHandle);
@@ -1628,6 +1633,158 @@ export function App() {
     };
     const workspaceBlob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
     downloadBlob(workspaceBlob, 'dong-editor-3-workspace.json');
+  };
+
+  // #WDD-gpt 2026-09-07 - 新 4CGS ZIP 逐段压实 RAW4D 并直接流入单个已授权文件，避免大序列整包驻留 JS 内存。
+  const exportFourCgsRaw4DZip = async () => {
+    setOpenMenu(null);
+    setIsPlaying(false);
+    const runtime = viewportRuntime;
+    const segments = status.raw4dSequence?.segments ?? [];
+    if (!runtime || segments.length < 2) {
+      showAppNotice(
+        language === 'zh' ? 'RAW4D ZIP 版 4CGS 至少需要两个已驻留的时序片段。' : 'A RAW4D ZIP 4CGS requires at least two resident timeline segments.',
+        language === 'zh' ? '无法导出 4CGS ZIP' : 'Cannot export 4CGS ZIP',
+        'warning',
+      );
+      return;
+    }
+    if (typeof window.showSaveFilePicker !== 'function') {
+      showAppNotice(
+        language === 'zh' ? '当前浏览器不支持 4CGS ZIP 流式另存，请使用最新版 Chrome 或 Edge。' : 'This browser cannot stream a 4CGS ZIP to a save handle. Use a recent Chrome or Edge release.',
+        language === 'zh' ? '浏览器不支持选择保存位置' : 'Save location picker unavailable',
+        'warning',
+      );
+      return;
+    }
+    const stem = (sceneName ?? status.objectName ?? 'dong-editor-3').replace(/\.(?:4cgs|4gs|raw4d|ply4)$/i, '');
+    let handle: FileSystemFileHandle;
+    try {
+      handle = await window.showSaveFilePicker(createFourCgsSavePickerOptions(`${stem}.4cgs`));
+    } catch (error) {
+      if (isFilePickerAbort(error)) return;
+      showAppError(error, '4cgs-zip-save-permission', () => { void exportFourCgsRaw4DZip(); });
+      return;
+    }
+
+    const outputNames = uniqueRaw4DExportFilenames(segments.map((segment) => segment.name));
+    const controller = new AbortController();
+    exportAbortRef.current = controller;
+    exportStartedAtRef.current = performance.now();
+    setExportElapsedMs(0);
+    setExportProgress(0);
+    setExportMonitor({
+      kind: 'fourcgs-raw4d-zip',
+      phase: 'running',
+      inputBytes: sourceFiles.reduce((sum, file) => sum + file.size, 0),
+      progress: {
+        ratio: 0, message: `准备写入 ${outputNames.length} 个 RAW4D ZIP 条目`, stage: 'ZIP 初始化',
+        stageRatio: 0, workerCount: 1, completedTasks: 0, totalTasks: outputNames.length,
+      },
+      raw4DStats: {
+        completedFiles: 0,
+        fileCount: outputNames.length,
+        pointCount: 0,
+        sourcePreservedCount: 0,
+      },
+      logs: [{ elapsedMs: 0, message: `开始流式写入 ${handle.name}` }],
+    });
+
+    let writable: FileSystemWritableFileStream | null = null;
+    let writer: FourCgsRaw4DZipWriter | null = null;
+    try {
+      writable = await handle.createWritable();
+      const output = writable;
+      writer = new FourCgsRaw4DZipWriter(async (chunk) => {
+        await output.write(chunk.slice().buffer as ArrayBuffer);
+      });
+      const result = await runtime.exportCompactedRaw4DSegments(outputNames, {
+        signal: controller.signal,
+        onProgress: (progress) => {
+          setExportProgress(progress.ratio);
+          setExportMonitor((current) => {
+            if (!current || current.kind !== 'fourcgs-raw4d-zip' || current.phase !== 'running') return current;
+            const message = progress.stage === 'encoding'
+              ? `正在压实 ${progress.segmentIndex + 1}/${progress.segmentCount} · ${progress.filename}`
+              : progress.stage === 'writing'
+                ? `正在写入 ZIP · ${progress.filename}`
+                : `ZIP 条目完成 · ${progress.filename}`;
+            const elapsedMs = performance.now() - exportStartedAtRef.current;
+            return {
+              ...current,
+              progress: {
+                ratio: progress.ratio,
+                message,
+                stage: progress.stage === 'encoding' ? 'RAW4D 压实' : 'ZIP 流式写入',
+                stageRatio: progress.segmentRatio,
+                workerCount: 1,
+                completedTasks: progress.completedSegments,
+                totalTasks: progress.segmentCount,
+              },
+              raw4DStats: {
+                completedFiles: progress.completedSegments,
+                fileCount: progress.segmentCount,
+                pointCount: current.raw4DStats?.pointCount ?? 0,
+                sourcePreservedCount: current.raw4DStats?.sourcePreservedCount ?? 0,
+              },
+              logs: current.logs.at(-1)?.message === message
+                ? current.logs
+                : [...current.logs, { elapsedMs, message }].slice(-12),
+            };
+          });
+        },
+        writeSegment: async (file) => {
+          if (!writer) throw new Error('4CGS ZIP writer is unavailable.');
+          await writer.addRaw4D(file.filename, file.blob, controller.signal);
+        },
+      });
+      const archive = await writer.close();
+      await writable.close();
+      writable = null;
+      setExportProgress(1);
+      setExportElapsedMs(performance.now() - exportStartedAtRef.current);
+      setExportMonitor((current) => current ? {
+        ...current,
+        phase: 'success',
+        outputBytes: archive.outputBytes,
+        progress: {
+          ratio: 1, message: `已保存 ${handle.name}`, stage: '完成', stageRatio: 1,
+          workerCount: 1, completedTasks: archive.fileCount, totalTasks: archive.fileCount,
+        },
+        raw4DStats: {
+          completedFiles: archive.fileCount,
+          fileCount: archive.fileCount,
+          pointCount: result.pointCount,
+          sourcePreservedCount: result.sourcePreservedCount,
+        },
+        logs: [...current.logs, {
+          elapsedMs: performance.now() - exportStartedAtRef.current,
+          message: `完成 · ${archive.fileCount} 个 RAW4D · ${(archive.outputBytes / 1_000_000).toFixed(3)}M`,
+        }].slice(-12),
+      } : current);
+    } catch (error) {
+      writer?.terminate();
+      if (writable) {
+        try {
+          await writable.abort(error);
+        } catch {
+          // 原始导出错误优先；浏览器可能已经关闭失败的写入流。
+        }
+      }
+      const cancelled = error instanceof DOMException && error.name === 'AbortError';
+      const message = cancelled ? '4CGS RAW4D ZIP 保存已取消。' : error instanceof Error ? error.message : String(error);
+      setExportElapsedMs(performance.now() - exportStartedAtRef.current);
+      setExportMonitor((current) => current ? {
+        ...current,
+        phase: cancelled ? 'cancelled' : 'error',
+        error: message,
+        progress: { ...current.progress, message, stage: cancelled ? '已取消' : '失败' },
+        logs: [...current.logs, { elapsedMs: performance.now() - exportStartedAtRef.current, message }].slice(-12),
+      } : current);
+    } finally {
+      if (exportAbortRef.current === controller) exportAbortRef.current = null;
+      setExportProgress(null);
+    }
   };
 
   type Raw4DExportDestination =
@@ -1998,7 +2155,8 @@ export function App() {
     setExportCenterVisible(false);
     if (target === 'ply-sequence') exportPlySequence();
     else if (target === 'raw4d') void exportRaw4DSegments();
-    else void exportWorkspace();
+    else if (target === 'fourcgs-raw4d-zip') void exportFourCgsRaw4DZip();
+    else void exportWorkspace(true);
   };
 
   const cancelExport = () => exportAbortRef.current?.abort();
@@ -2646,16 +2804,24 @@ export function App() {
         <div className="export-monitor-backdrop" data-camera-input-block>
           <section aria-label={exportMonitor.kind === 'ply-sequence'
             ? (language === 'zh' ? 'PLY 序列导出监督' : 'PLY sequence export monitor')
-            : exportMonitor.kind === 'raw4d'
+            : exportMonitor.kind === 'raw4d' || exportMonitor.kind === 'fourcgs-raw4d-zip'
               ? (language === 'zh' ? 'RAW4D 多片段导出监督' : 'RAW4D segment export monitor')
               : (language === 'zh' ? '4CGS 保存监督' : '4CGS export monitor')} aria-modal="true" className="export-monitor-dialog" role="dialog">
             <header>
               <div>
-                <span>{exportMonitor.kind === 'ply-sequence' ? 'RAW4D · PLY 序列' : exportMonitor.kind === 'raw4d' ? 'RAW4D · SEGMENTS' : '4CGS · V2.6'}</span>
+                <span>{exportMonitor.kind === 'ply-sequence'
+                  ? 'RAW4D · PLY 序列'
+                  : exportMonitor.kind === 'raw4d'
+                    ? 'RAW4D · SEGMENTS'
+                    : exportMonitor.kind === 'fourcgs-raw4d-zip'
+                      ? '4CGS · RAW4D ZIP'
+                      : '4CGS · V2.6'}</span>
                 <strong>{exportMonitor.kind === 'ply-sequence'
                   ? (language === 'zh' ? 'PLY 序列导出监督' : 'PLY sequence export monitor')
                   : exportMonitor.kind === 'raw4d'
                     ? (language === 'zh' ? 'RAW4D 分段保存监督' : 'RAW4D segment export monitor')
+                    : exportMonitor.kind === 'fourcgs-raw4d-zip'
+                      ? (language === 'zh' ? '4CGS ZIP 流式保存监督' : '4CGS ZIP streaming export monitor')
                     : (language === 'zh' ? '压缩保存监督' : 'Compression export monitor')}</strong>
               </div>
               <b className={`export-monitor-state ${exportMonitor.phase}`}>
@@ -2681,22 +2847,22 @@ export function App() {
             </div>
 
             <dl className="export-monitor-stats">
-              <div><dt>{exportMonitor.kind === 'raw4d' ? (language === 'zh' ? '模式' : 'Mode') : (language === 'zh' ? 'Worker' : 'Workers')}</dt><dd>{exportMonitor.kind === 'raw4d' ? (language === 'zh' ? '逐段' : 'Sequential') : exportMonitor.progress.workerCount ?? 1}</dd></div>
+              <div><dt>{exportMonitor.kind === 'raw4d' || exportMonitor.kind === 'fourcgs-raw4d-zip' ? (language === 'zh' ? '模式' : 'Mode') : (language === 'zh' ? 'Worker' : 'Workers')}</dt><dd>{exportMonitor.kind === 'raw4d' || exportMonitor.kind === 'fourcgs-raw4d-zip' ? (language === 'zh' ? '逐段' : 'Sequential') : exportMonitor.progress.workerCount ?? 1}</dd></div>
               <div><dt>{language === 'zh' ? '任务' : 'Tasks'}</dt><dd>{exportMonitor.progress.completedTasks ?? 0}/{exportMonitor.progress.totalTasks ?? 8}</dd></div>
               <div><dt>{language === 'zh' ? '耗时' : 'Elapsed'}</dt><dd>{(exportElapsedMs / 1000).toFixed(1)} s</dd></div>
               <div><dt>{language === 'zh' ? '输入' : 'Input'}</dt><dd>{exportMonitor.kind === 'ply-sequence'
                 ? (exportMonitor.plyStats ? `${exportMonitor.plyStats.segmentCount} 段` : '--')
-                : exportMonitor.kind === 'raw4d'
+                : exportMonitor.kind === 'raw4d' || exportMonitor.kind === 'fourcgs-raw4d-zip'
                   ? `${exportMonitor.raw4DStats?.fileCount ?? status.raw4dSequence?.segmentCount ?? 1} ${language === 'zh' ? '段' : 'segments'}`
                   : `${(exportMonitor.inputBytes / 1_000_000).toFixed(3)}M`}</dd></div>
               <div><dt>{language === 'zh' ? '输出' : 'Output'}</dt><dd>{exportMonitor.outputBytes === undefined ? '--' : `${(exportMonitor.outputBytes / 1_000_000).toFixed(3)}M`}</dd></div>
               <div><dt>{exportMonitor.kind === 'ply-sequence'
                 ? (language === 'zh' ? '帧文件' : 'Frames')
-                : exportMonitor.kind === 'raw4d'
+                : exportMonitor.kind === 'raw4d' || exportMonitor.kind === 'fourcgs-raw4d-zip'
                   ? (language === 'zh' ? '分段文件' : 'Files')
                   : (language === 'zh' ? '压缩比' : 'Ratio')}</dt><dd>{exportMonitor.kind === 'ply-sequence'
                 ? (exportMonitor.plyStats ? `${exportMonitor.plyStats.frameCount}` : `${exportMonitor.progress.completedTasks ?? 0}`)
-                : exportMonitor.kind === 'raw4d'
+                : exportMonitor.kind === 'raw4d' || exportMonitor.kind === 'fourcgs-raw4d-zip'
                   ? `${exportMonitor.raw4DStats?.completedFiles ?? 0}/${exportMonitor.raw4DStats?.fileCount ?? exportMonitor.progress.totalTasks ?? 1}`
                   : (exportMonitor.result ? `${exportMonitor.result.compressionRatio.toFixed(2)}×` : '--')}</dd></div>
             </dl>
@@ -2720,6 +2886,8 @@ export function App() {
                 ? (language === 'zh' ? '每帧 PLY 在浏览器 Worker 中直接写入所选目录；取消不修改场景，目录中可能保留已写入的部分帧。' : 'Each PLY frame is written to the chosen directory by a browser worker; cancelling leaves already-written frames in place.')
                 : exportMonitor.kind === 'raw4d'
                   ? (language === 'zh' ? '每个 RAW4D 片段在浏览器中独立压实并写入；取消不修改场景，已完成文件会保留。' : 'Each RAW4D segment is compacted and written independently in the browser; cancelling keeps completed files and does not modify the scene.')
+                  : exportMonitor.kind === 'fourcgs-raw4d-zip'
+                    ? (language === 'zh' ? '每个 RAW4D 片段会逐块流入同一个 ZIP；取消不会修改当前场景。' : 'Each RAW4D segment streams into one ZIP; cancelling does not modify the current scene.')
                   : (language === 'zh' ? '压缩完全在浏览器 Worker 中执行；取消不会修改当前场景。' : 'Compression runs entirely in browser workers; cancelling does not modify the scene.')}</small>
               {exportMonitor.phase === 'running'
                 ? <button className="quiet-button export-monitor-cancel" onClick={cancelExport} type="button">{language === 'zh' ? '取消保存' : 'Cancel'}</button>
@@ -2859,7 +3027,11 @@ export function App() {
           )}
           {status.phase === 'loading' && (
             <div className="viewport-loading" role="status">
-              <span className="loading-kicker">{status.format === '4CGS' ? '4CGS V2.4' : copy.raw4dStream}</span>
+              <span className="loading-kicker">{status.format === '4CGS'
+                ? status.fourCgsContainer === 'raw4d-zip'
+                  ? '4CGS RAW4D ZIP'
+                  : status.fourCgsContainer === 'raw4d-bundle' ? '4CGS RAW4D BUNDLE' : '4CGS V2.4'
+                : copy.raw4dStream}</span>
               <strong>{localizedStatusMessage}</strong>
               <div className="loading-progress"><i style={{ width: `${(status.progress ?? 0) * 100}%` }} /></div>
               <small>{Math.round((status.progress ?? 0) * 100)}%</small>
@@ -3200,7 +3372,9 @@ export function App() {
                     type="button"
                   >{forceSortSync ? '●' : '○'}</button>
                 </div>
-                {forceSortSync && <p className="memory-auto-note">{copy.forceSortSyncActiveNote}</p>}
+                <p className="memory-auto-note">
+                  {forceSortSync ? copy.forceSortSyncActiveNote : copy.forceSortSyncInactiveNote}
+                </p>
                 <label className="memory-mode-field">
                   <span>{copy.budgetMode}</span>
                   <select

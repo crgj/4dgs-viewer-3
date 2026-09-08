@@ -38,18 +38,25 @@ export class Raw4DResource extends GSplatResourceBase {
   readonly gpuByteSize: number;
   private displayShBands: number;
 
-  constructor(device: GraphicsDevice, private readonly asset: Raw4DAsset) {
+  constructor(
+    device: GraphicsDevice,
+    private readonly asset: Raw4DAsset,
+    maxShBands = asset.shBands,
+    private readonly releaseCpuUploadSources = false,
+  ) {
+    const residentShBands = Math.max(0, Math.min(asset.shBands, Math.round(maxShBands)));
     const metadata: Raw4DResourceMetadata = {
       numSplats: asset.splatCount,
-      shBands: asset.shBands,
+      shBands: residentShBands,
       calcAabb: (result) => {
         result.setMinMax(new Vec3(...asset.bounds.min), new Vec3(...asset.bounds.max));
         return true;
       },
     };
     super(device, metadata as never, { prepareCenters: false });
-    this.shBands = asset.shBands;
-    this.displayShBands = asset.shBands;
+    // #WDD-gpt 2026-09-07 - 显存驻留级别可低于 Canonical SH 级别，CPU 仍保留全系数供导出和后续编辑。
+    this.shBands = residentShBands;
+    this.displayShBands = residentShBands;
     const streams: Array<{ name: string; format: number }> = [
       { name: 'splatColor', format: PIXELFORMAT_RGBA16F },
       { name: 'transformA', format: PIXELFORMAT_RGBA32U },
@@ -74,6 +81,7 @@ export class Raw4DResource extends GSplatResourceBase {
     // #WDD-gpt 2026-08-16 - 直接从位保持 Canonical 数组生成 PlayCanvas 纹理，避免为一次性上传常驻解码 59 个 Float32Array。
     this.uploadColorAndTransform();
     if (this.shBands > 0) this.uploadSH();
+    this.releaseUploadedCpuSources();
 
     const texels = this.streams.textureDimensions.x * this.streams.textureDimensions.y;
     const shBytes = this.shBands === 0 ? 0 : this.shBands === 1 ? 16 : this.shBands === 2 ? 36 : 64;
@@ -92,7 +100,13 @@ export class Raw4DResource extends GSplatResourceBase {
   refreshSourceData(): void {
     this.uploadColorAndTransform();
     if (this.shBands > 0) this.uploadSH();
+    this.releaseUploadedCpuSources();
     this.aabb.setMinMax(new Vec3(...this.asset.bounds.min), new Vec3(...this.asset.bounds.max));
+  }
+
+  private releaseUploadedCpuSources(): void {
+    if (!this.releaseCpuUploadSources) return;
+    for (const texture of this.streams.getTexturesInOrder()) texture._clearLevels();
   }
 
   private uploadColorAndTransform(): void {
@@ -157,6 +171,7 @@ export class Raw4DResource extends GSplatResourceBase {
     sh8to11?.fill(0);
     sh12to15?.fill(0);
     const coefficientCount = ({ 1: 3, 2: 8, 3: 15 } as const)[this.shBands as 1 | 2 | 3];
+    const sourceCoefficientCount = ({ 1: 3, 2: 8, 3: 15 } as const)[this.asset.shBands as 1 | 2 | 3];
     const values = new Array<number>(coefficientCount * 3).fill(0);
     const floatBits = new Float32Array(1);
     const uintBits = new Uint32Array(floatBits.buffer);
@@ -169,10 +184,10 @@ export class Raw4DResource extends GSplatResourceBase {
           this.asset.shRest[coefficient], index, this.asset.sourceEncoding,
         );
         values[coefficient * 3 + 1] = readRaw4DScalar(
-          this.asset.shRest[coefficient + coefficientCount], index, this.asset.sourceEncoding,
+          this.asset.shRest[coefficient + sourceCoefficientCount], index, this.asset.sourceEncoding,
         );
         values[coefficient * 3 + 2] = readRaw4DScalar(
-          this.asset.shRest[coefficient + coefficientCount * 2], index, this.asset.sourceEncoding,
+          this.asset.shRest[coefficient + sourceCoefficientCount * 2], index, this.asset.sourceEncoding,
         );
       }
       const maximum = raw4DShPackingMaximum(values);

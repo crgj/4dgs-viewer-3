@@ -9,7 +9,7 @@ import type {
   FourCgsSegment,
   FourCgsStreamEntry,
 } from './FourCgsTypes';
-import { RAW4D_BUNDLE_CODEC_NAME, paddedEvenLength, raw4DBundleStreamName } from './FourCgsRaw4DBundle';
+import { paddedEvenLength, raw4DBundleStorage, raw4DBundleStreamName } from './FourCgsRaw4DBundle';
 
 export const FOUR_CGS_MAGIC = '4CGSPRS2';
 export const FOUR_CGS_HEADER_BYTES = 12;
@@ -167,6 +167,8 @@ function validateRaw4DBundle(manifest: Partial<FourCgsManifest>, segments: reado
     throw new Error('4CGS RAW4D Bundle 段目录长度不一致。');
   }
   let expectedStreamCount = 0;
+  const storage = raw4DBundleStorage(manifest as Pick<FourCgsManifest, 'codecName'>);
+  if (!storage) throw new Error('4CGS RAW4D Bundle 编码名称无效。');
   for (let index = 0; index < count; index += 1) {
     const sourceBytes = bundle.sourceByteLengths[index];
     const chunkCount = bundle.segmentChunkCounts[index];
@@ -180,7 +182,9 @@ function validateRaw4DBundle(manifest: Partial<FourCgsManifest>, segments: reado
     for (let chunkIndex = 0; chunkIndex < chunkCount; chunkIndex += 1) {
       const chunkSourceBytes = Math.min(bundle.chunkBytes, sourceBytes - chunkIndex * bundle.chunkBytes);
       const stream = streams.find((entry) => entry.name === raw4DBundleStreamName(index, chunkIndex));
-      if (!stream || stream.compression !== 'deflate-shuffle16' || stream.rawBytes !== paddedEvenLength(chunkSourceBytes)) {
+      const expectedRawBytes = storage === 'raw' ? chunkSourceBytes : paddedEvenLength(chunkSourceBytes);
+      if (!stream || stream.compression !== storage || stream.rawBytes !== expectedRawBytes
+        || (storage === 'raw' && stream.storedBytes !== chunkSourceBytes)) {
         throw new Error(`4CGS RAW4D Bundle 第 ${index + 1} 段第 ${chunkIndex + 1} 块目录无效。`);
       }
     }
@@ -277,7 +281,7 @@ export function validateFourCgsManifest(value: unknown, fileBytes?: number): Fou
     if (streamNames.has(stream.name)) throw new Error(`4CGS 流名称重复：${stream.name}。`);
     streamNames.add(stream.name);
   }
-  if (manifest.codecName === RAW4D_BUNDLE_CODEC_NAME) {
+  if (raw4DBundleStorage(manifest as Pick<FourCgsManifest, 'codecName'>)) {
     // #WDD-gpt 2026-08-16 - 动态 RAW4D Bundle 直接保存本次拖入段，不得拿 V2.4 属性流目录误判或偷偷回退到固定成品。
     validateRaw4DBundle({ ...manifest, metadata }, segments, streams);
   } else {
