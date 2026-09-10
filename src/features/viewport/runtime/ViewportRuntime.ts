@@ -560,6 +560,8 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost, Semanti
   private sortedFrameCapturePending = false;
   private sortedFramePostRenderPending = false;
   private sortedFrameReleaseAfterReady = false;
+  private sortedFramePlaybackActive = false;
+  private sortedFrameReleaseTimer: number | null = null;
   private sortedFrameGeneration = 0;
   // #WDD-gpt 2026-09-08 - 严格排序仍完整调用 Git 基线 setFrame；切换期间用上一完整帧覆盖底层中间态。
   private readonly strictSortGate = new StrictSortFrameGate({
@@ -920,7 +922,6 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost, Semanti
     const hold = document.createElement('canvas');
     hold.className = 'sorted-frame-hold';
     hold.setAttribute('aria-hidden', 'true');
-    hold.hidden = true;
     const context = hold.getContext('2d', { alpha: false });
     if (!context) return;
     parent.append(hold);
@@ -937,7 +938,7 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost, Semanti
     if (hold.width !== width) hold.width = width;
     if (hold.height !== height) hold.height = height;
     try {
-      context.clearRect(0, 0, width, height);
+      // #WDD-gpt 2026-09-09 - drawImage 已完整覆盖画布；禁止先 clearRect，Windows/ANGLE 会把全尺寸清空提交成黑色中间帧。
       context.drawImage(this.canvas, 0, 0, width, height);
       return true;
     } catch {
@@ -946,9 +947,30 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost, Semanti
   }
 
   private releaseSortedFrameHold(): void {
+    if (this.sortedFrameReleaseTimer !== null) {
+      window.clearTimeout(this.sortedFrameReleaseTimer);
+      this.sortedFrameReleaseTimer = null;
+    }
     this.sortedFrameHoldActive = false;
     this.sortedFrameReleaseAfterReady = false;
-    if (this.sortedFrameHoldCanvas) this.sortedFrameHoldCanvas.hidden = true;
+    this.sortedFrameHoldCanvas?.classList.remove('is-active');
+  }
+
+  private cancelSortedFrameHoldRelease(): void {
+    if (this.sortedFrameReleaseTimer === null) return;
+    window.clearTimeout(this.sortedFrameReleaseTimer);
+    this.sortedFrameReleaseTimer = null;
+  }
+
+  // #WDD-gpt 2026-09-09 - 拖动事件之间给覆盖层一个短保留窗口；严格播放则整段常驻，避免 Windows 每帧重建合成层。
+  private scheduleSortedFrameHoldRelease(): void {
+    if (this.sortedFramePlaybackActive || this.sortedFrameReleaseTimer !== null) return;
+    this.sortedFrameReleaseTimer = window.setTimeout(() => {
+      this.sortedFrameReleaseTimer = null;
+      if (this.sortedFramePlaybackActive || this.strictSortGate.heldFrame !== null
+        || this.sortedFrameCapturePending || this.sortedFramePostRenderPending) return;
+      this.releaseSortedFrameHold();
+    }, 80);
   }
 
   private resetSortedFrameState(): void {
@@ -963,6 +985,7 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost, Semanti
     const raw4D = this.activeRaw4D;
     const app = this.app;
     if (!raw4D) return;
+    this.cancelSortedFrameHoldRelease();
     this.sortedFrameReleaseAfterReady = false;
     if (this.sortedFrameHoldActive || !app || !this.sortedFrameHoldCanvas) {
       raw4D.setFrame(frame);
@@ -975,7 +998,7 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost, Semanti
       this.sortedFrameCapturePending = false;
       if (this.copyViewportToSortedFrameHold() && this.sortedFrameHoldCanvas) {
         this.sortedFrameHoldActive = true;
-        this.sortedFrameHoldCanvas.hidden = false;
+        this.sortedFrameHoldCanvas.classList.add('is-active');
       }
       raw4D.setFrame(frame);
     });
@@ -997,11 +1020,11 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost, Semanti
       this.sortedFramePostRenderPending = false;
       if (this.sortedFrameHoldActive) this.copyViewportToSortedFrameHold();
       if (this.sortedFrameReleaseAfterReady) {
-        this.releaseSortedFrameHold();
+        this.scheduleSortedFrameHoldRelease();
         return;
       }
       this.strictSortGate.onSorted();
-      if (this.strictSortGate.heldFrame === null) this.releaseSortedFrameHold();
+      if (this.strictSortGate.heldFrame === null) this.scheduleSortedFrameHoldRelease();
     });
     app.renderNextFrame = true;
   }
@@ -1014,11 +1037,21 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost, Semanti
 
   setForceSortSync(enabled: boolean): void {
     this.strictSortGate.setEnabled(enabled);
-    if (!enabled) this.resetSortedFrameState();
+    if (!enabled) {
+      this.sortedFramePlaybackActive = false;
+      this.resetSortedFrameState();
+    }
+  }
+
+  // #WDD-gpt 2026-09-09 - 严格播放整段复用同一覆盖层，避免每帧 opacity/合成层切换造成 Windows 全屏闪烁。
+  beginFramePacing(): void {
+    this.sortedFramePlaybackActive = true;
+    this.cancelSortedFrameHoldRelease();
   }
 
   // #WDD-gpt 2026-09-08 - 暂停丢弃旧播放回调，但已提交目标继续在覆盖层后完成，ready 后再安全揭示。
   cancelFramePacing(): void {
+    this.sortedFramePlaybackActive = false;
     const hadSubmittedFrame = this.strictSortGate.heldFrame !== null;
     this.strictSortGate.reset();
     if (hadSubmittedFrame && (this.sortedFrameCapturePending
