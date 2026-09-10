@@ -1066,8 +1066,6 @@ export function App() {
     }
     const frameCount = timelineEndFrame + 1;
     if (effectiveForceSortSync) {
-      // #WDD-gpt 2026-09-09 - 告知运行时这是连续严格播放会话，使 Windows 全程复用同一个稳定覆盖层。
-      viewportRuntime?.beginFramePacing();
       // #WDD-gpt 2026-08-21 - 强制排序播放：等引擎确认当前帧排序提交后再推进下一帧；
       // 排序吞吐不足时播放自动降速，而不是带过期顺序渲染，循环回绕也天然被同一门槛约束。
       let stopped = false;

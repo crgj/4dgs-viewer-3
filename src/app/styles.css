@@ -2000,23 +2000,6 @@ input:focus-visible {
   touch-action: none;
 }
 
-/* #WDD-gpt 2026-09-08 - 严格切帧时覆盖底层排序中间态，只向用户呈现最近一次完整 postrender。 */
-.sorted-frame-hold {
-  position: absolute;
-  z-index: 1;
-  inset: 0;
-  display: block;
-  width: 100%;
-  height: 100%;
-  opacity: 0;
-  pointer-events: none;
-  will-change: opacity;
-}
-
-.sorted-frame-hold.is-active {
-  opacity: 1;
-}
-
 /* #WDD-gpt  2026-08-16 - 高斯框选使用独立覆盖层反馈选区，不改变 PlayCanvas 渲染画布和深度关系。 */
 .viewport-canvas.gaussian-selection-active {
   cursor: crosshair;

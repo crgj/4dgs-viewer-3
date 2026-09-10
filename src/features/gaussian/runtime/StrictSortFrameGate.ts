@@ -1,8 +1,10 @@
-// #WDD-gpt 2026-09-08 - 正确性优先播放只控制提交节拍：每帧仍完整调用 Git 基线的 setFrame，
-// 禁止拆分 uniform、动态中心与 WorkBuffer；调用方在目标 frame:ready 且已 postrender 后才放行下一帧。
+// #WDD-gpt 2026-09-09 - 正确性优先播放先准备目标排序中心；目标 uniform、WorkBuffer 与 orderData
+// 在 PlayCanvas onSorted 的同一次 WebGL update 内原子提交，postrender 后才放行下一帧。
 export interface StrictSortFrameGateHost {
-  /** 使用 Git 基线未经拆分的 setFrame 路径提交完整帧。 */
+  /** 非严格路径立即提交完整帧。 */
   applyFrameDirect(frame: number): void;
+  /** 严格路径只准备目标数据和排序中心，返回钳制后的实际帧。 */
+  prepareFrame(frame: number): number;
 }
 
 interface StrictSortFrameRequest {
@@ -32,7 +34,7 @@ export class StrictSortFrameGate {
     if (!enabled) this.flush();
   }
 
-  // #WDD-gpt 2026-09-08 - 首个请求完整提交；排序在途时只保留最新目标，避免播放时多个 WorkBuffer 版本相互覆盖。
+  // #WDD-gpt 2026-09-09 - 首个请求只准备排序；排序在途时保留唯一最新目标。
   request(frame: number, onDisplayed?: () => void): void {
     if (!this.enabled) {
       this.host.applyFrameDirect(frame);
@@ -44,8 +46,7 @@ export class StrictSortFrameGate {
       this.queuedRequest = request;
       return;
     }
-    this.submittedRequest = request;
-    this.host.applyFrameDirect(frame);
+    this.submittedRequest = { ...request, frame: this.host.prepareFrame(frame) };
   }
 
   /** 调用方确认当前完整帧已排序且真正绘制后回调，并在需要时提交唯一最新目标。 */
@@ -56,8 +57,7 @@ export class StrictSortFrameGate {
     if (this.queuedRequest !== null && this.queuedRequest.frame !== submitted.frame) {
       const next = this.queuedRequest;
       this.queuedRequest = null;
-      this.submittedRequest = next;
-      this.host.applyFrameDirect(next.frame);
+      this.submittedRequest = { ...next, frame: this.host.prepareFrame(next.frame) };
     } else {
       this.queuedRequest = null;
       submitted.onDisplayed?.();
@@ -65,14 +65,14 @@ export class StrictSortFrameGate {
     return true;
   }
 
-  /** 关闭节拍门槛时只补交尚未提交的最新排队帧；不得重复提交当前在途帧。 */
+  /** 关闭节拍门槛时立即落地最新目标；prepared 帧尚未可见，必须走直接提交路径。 */
   flush(): void {
     const queued = this.queuedRequest;
     const target = queued ?? this.submittedRequest;
     this.submittedRequest = null;
     this.queuedRequest = null;
     if (target !== null) {
-      if (queued !== null) this.host.applyFrameDirect(target.frame);
+      this.host.applyFrameDirect(target.frame);
       target.onDisplayed?.();
     }
   }

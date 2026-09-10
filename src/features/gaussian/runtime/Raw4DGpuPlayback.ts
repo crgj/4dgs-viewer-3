@@ -17,6 +17,10 @@ import type { Raw4DAsset, Raw4DTrack } from '../formats/raw4d/Raw4DTypes';
 import { readRaw4DScalar, readRaw4DTrack, raw4DScalarBits } from '../formats/raw4d/Raw4DValues';
 import type { GpuBufferAllocation, GpuBufferPool } from '../memory/GpuBufferPool';
 import { KeyframeSlotCache, keyframeRequirements } from './KeyframeSlotCache';
+import {
+  cancelPlayCanvasAtomicWorkBufferCommit,
+  registerPlayCanvasAtomicWorkBufferCommit,
+} from './PlayCanvasSortResultGuard';
 import type { Raw4DSortCenterSampler } from './Raw4DFrameSampler';
 import { createRaw4DGpuMemoryPlan } from './Raw4DGpuMemoryPlan';
 
@@ -1359,20 +1363,29 @@ export class Raw4DGpuPlayback {
     this.selectionTexture.unlock();
   }
 
-  // #WDD-gpt 2026-08-21 - 强制排序模式把“准备帧”与“显示帧”拆开：prepare 上传关键帧并刷新排序中心
-  // （centersVersion 变化即触发引擎新版本排序），reveal 只切换 dongRaw4dFrame，等排序提交后再显示。
+  // #WDD-gpt 2026-09-09 - 强制排序先上传目标关键帧并刷新 CPU 中心，但不改当前可见 WorkBuffer；
+  // 排序结果进入 manager.onSorted 时才在同一次 WebGL update 内切换 uniform 并强制重建目标 WorkBuffer。
   prepareFrame(requestedFrame: number): number {
     const frame = Math.min(this.asset.totalFrames - 1, Math.max(0, requestedFrame));
     if (this.disposed) return frame;
     this.ensureStorageFrame(frame);
     this.ensureStreamingTextureFrame(frame);
-    this.refreshSortCenters(frame);
-    const component = this.entity.gsplat;
-    if (component) component.workBufferUpdate = WORKBUFFER_UPDATE_ONCE;
+    const needsCpuSort = Boolean(
+      this.resource.centers
+      && this.sampler
+      && raw4DSortCentersNeedRefresh(frame, this.lastCenterFrame),
+    );
+    if (needsCpuSort) {
+      registerPlayCanvasAtomicWorkBufferCommit(this.resource, () => this.revealFrame(frame));
+      this.refreshSortCenters(frame);
+    } else {
+      cancelPlayCanvasAtomicWorkBufferCommit(this.resource);
+      this.revealFrame(frame);
+    }
     return frame;
   }
 
-  revealFrame(frame: number): void {
+  private revealFrame(frame: number): void {
     if (this.disposed) return;
     const component = this.entity.gsplat;
     if (!component) return;
@@ -1382,8 +1395,16 @@ export class Raw4DGpuPlayback {
 
   setFrame(requestedFrame: number): void {
     if (this.disposed) return;
-    const frame = this.prepareFrame(requestedFrame);
+    const frame = Math.min(this.asset.totalFrames - 1, Math.max(0, requestedFrame));
+    cancelPlayCanvasAtomicWorkBufferCommit(this.resource);
+    this.ensureStorageFrame(frame);
+    this.ensureStreamingTextureFrame(frame);
+    this.refreshSortCenters(frame);
     this.revealFrame(frame);
+  }
+
+  cancelPreparedFrame(): void {
+    cancelPlayCanvasAtomicWorkBufferCommit(this.resource);
   }
 
   private refreshSortCenters(frame: number): void {
@@ -1406,6 +1427,7 @@ export class Raw4DGpuPlayback {
   destroy(): void {
     if (this.disposed) return;
     this.disposed = true;
+    cancelPlayCanvasAtomicWorkBufferCommit(this.resource);
     this.stopListeningForEdits();
     this.entity.gsplat?.setWorkBufferModifier(null);
     for (const texture of this.textures) texture.destroy();

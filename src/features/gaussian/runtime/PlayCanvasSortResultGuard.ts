@@ -39,6 +39,10 @@ interface GuardedSorterPrototype {
 interface GuardedManager {
   readonly world: {
     readonly lastWorldStateVersion: number;
+    getState(version: number): {
+      readonly splats: readonly { readonly resource: object }[];
+    } | undefined;
+    invalidate(options: { readonly workBuffer?: boolean }): void;
   };
 }
 
@@ -48,6 +52,7 @@ interface GuardedManagerPrototype {
 
 const latestVersionBySorter = new WeakMap<GuardedSorter, number>();
 const queuedSortBySorter = new WeakMap<GuardedSorter, QueuedSortParameters>();
+const atomicWorkBufferCommitByResource = new WeakMap<object, () => void>();
 let installed = false;
 
 export function isStalePlayCanvasSortResult(version: number, latestVersion: number): boolean {
@@ -60,6 +65,22 @@ export function canApplyPlayCanvasSortResult(jobsInFlight: number): boolean {
 
 export function shouldQueuePlayCanvasSort(jobsInFlight: number): boolean {
   return jobsInFlight > 0;
+}
+
+// #WDD-gpt 2026-09-09 - RAW4D 严格帧在 CPU 排序完成后、同一次 WebGL update 内切换 uniform 与 WorkBuffer，
+// 避免 Windows/ANGLE 依赖跨 Canvas 截图；同一资源的新请求覆盖旧请求。
+export function registerPlayCanvasAtomicWorkBufferCommit(resource: object, commit: () => void): void {
+  atomicWorkBufferCommitByResource.set(resource, commit);
+}
+
+export function cancelPlayCanvasAtomicWorkBufferCommit(resource: object): void {
+  atomicWorkBufferCommitByResource.delete(resource);
+}
+
+export function consumePlayCanvasAtomicWorkBufferCommit(resource: object): (() => void) | null {
+  const commit = atomicWorkBufferCommitByResource.get(resource) ?? null;
+  if (commit) atomicWorkBufferCommitByResource.delete(resource);
+  return commit;
 }
 
 export function installPlayCanvasSortResultGuard(): void {
@@ -124,6 +145,17 @@ export function installPlayCanvasSortResultGuard(): void {
     if (isStalePlayCanvasSortResult(version, this.world.lastWorldStateVersion)) {
       return;
     }
+    const worldState = this.world.getState(version);
+    let requiresAtomicWorkBufferRebuild = false;
+    for (const splat of worldState?.splats ?? []) {
+      const commit = consumePlayCanvasAtomicWorkBufferCommit(splat.resource);
+      if (!commit) continue;
+      commit();
+      requiresAtomicWorkBufferRebuild = true;
+    }
+    // #WDD-gpt 2026-09-09 - onSorted 之后的 world.bake 仍在同一次 manager.update、同一次可见绘制之前；
+    // 强制全量重建使新帧几何与本次 orderData 原子进入唯一 WebGL 画布。
+    if (requiresAtomicWorkBufferRebuild) this.world.invalidate({ workBuffer: true });
     originalManagerOnSorted.call(this, count, version, orderData);
   };
 }

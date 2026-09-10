@@ -76,8 +76,8 @@ export interface Raw4DGaussian {
   refreshSourceData(): Promise<void>;
   /** 强制排序路径：只上传数据并刷新排序中心，不切换显示帧。返回钳制后的帧号。 */
   prepareFrame(frame: number): number;
-  /** 强制排序路径：排序提交后切换显示帧 uniform。 */
-  revealFrame(frame: number): void;
+  /** 丢弃尚未进入 WebGL WorkBuffer 的严格帧。 */
+  cancelPreparedFrame(): void;
   setFrame(frame: number): void;
   dispose(): void;
 }
@@ -163,13 +163,11 @@ export async function createRaw4DGaussian(
       gpuPlayback.setFrame(frame);
     },
     prepareFrame: (frame: number) => {
-      currentFrame = frame;
-      return gpuPlayback.prepareFrame(frame);
+      const preparedFrame = gpuPlayback.prepareFrame(frame);
+      currentFrame = preparedFrame;
+      return preparedFrame;
     },
-    revealFrame: (frame: number) => {
-      currentFrame = frame;
-      gpuPlayback.revealFrame(frame);
-    },
+    cancelPreparedFrame: () => gpuPlayback.cancelPreparedFrame(),
     refreshSourceData: async () => {
       if (disposed) return;
       resource.refreshSourceData();
