@@ -4,7 +4,7 @@ import type { CacheSnapshot } from './AlbumDiskCache';
 import { AlbumCacheWorkerClient } from './AlbumCacheWorkerClient';
 import { loadCacheDirectory, saveCacheDirectory, cacheDirectoryPermission } from './CacheDirectoryPreference';
 import { InkLandscape } from './InkLandscape';
-import { playableSeekTarget } from './BufferedPlayback';
+import { pacedCacheSegments, playableSeekTarget } from './BufferedPlayback';
 import { BufferedShowPlayer, type BufferedPlayerHandle, type PlayerReport } from './BufferedShowPlayer';
 import type { ViewportRuntime, ViewportStatus, ViewportCameraView } from '../features/viewport/runtime/ViewportRuntime';
 import { loadShowGallery, type ShowVideo } from './ShowGallery';
@@ -72,9 +72,16 @@ export function ShowDance() {
     setStatus({ phase: 'initializing', renderer: '', splatCount: 0 });
     await cache.current.stop();
     if (token !== generation.current) return;
-    cache.current.resume(video.segments);
+    // #WDD-gpt 2026-09-20 - 首次只下载首段；后续段等待前一段完成解码和首帧绘制后再进入队列。
+    cache.current.resume(pacedCacheSegments(video, []));
     setLoadedGeneration(token); setPlayerVideo(video);
   }, []);
+
+  // #WDD-gpt 2026-09-20 - 播放就绪进度驱动下一个磁盘任务，禁止下载跑到解码缓冲前方并争用资源。
+  useEffect(() => {
+    if (!selected || cacheState.paused) return;
+    cache.current.start(pacedCacheSegments(selected, playableParts));
+  }, [selected, playableParts, cacheState.paused]);
 
   useEffect(() => {
     let active = true;
@@ -194,7 +201,7 @@ export function ShowDance() {
     {cacheState.quota !== undefined && <p>本站已用 {bytes(cacheState.usage || 0)} / 配额 {bytes(cacheState.quota)}（包含本站其他数据）</p>}
     <div className="dance-cache-actions">
       {pendingDirectory && <button disabled={cacheBusy} onClick={() => void authorizeDirectory()}>授权并使用默认硬盘目录</button>}
-      <button disabled={cacheBusy || firstCacheSetup || Boolean(pendingDirectory)} onClick={() => { if (selected) cache.current.resume(selected.segments); else if (items[0]) void select(items[0]); setCacheNotice('已恢复当前视频的顺序缓存，失败片段将重新尝试。'); }}>恢复缓存 / 重试</button>
+      <button disabled={cacheBusy || firstCacheSetup || Boolean(pendingDirectory)} onClick={() => { if (selected) cache.current.resume(pacedCacheSegments(selected, playableParts)); else if (items[0]) void select(items[0]); setCacheNotice('已恢复下载与播放缓冲的逐段接力，失败片段将重新尝试。'); }}>恢复缓存 / 重试</button>
       <button disabled={cacheBusy} onClick={() => { setCacheBusy(true); void cache.current.stop().finally(() => setCacheBusy(false)); }}>暂停缓存</button>
       <button disabled={cacheBusy} onClick={() => void chooseDirectory()}>选择硬盘目录并设为默认</button>
       <button disabled={cacheBusy} onClick={() => void useOpfs()}>使用浏览器磁盘缓存</button>
@@ -265,7 +272,7 @@ export function ShowDance() {
       <div className="dance-camera" data-camera-input-block><nav aria-label="预设视角">{views.map(([id, name]) => <button disabled={!ready} aria-pressed={view === id} key={id} onClick={() => changeView(id)}>{name}</button>)}<button className="dance-camera-reset" aria-label="重置视角" title="重置视角" disabled={!ready} onClick={() => { changeView('front'); fitScene(); }}>↻</button></nav></div>
       <div className="dance-work-log" role="status" title={error || workLog}>
         {error || (galleryLoading ? '正在读取相册' : [downloadLog, workLog].filter(Boolean).join(' · '))}
-        {selected && (workLog.includes('失败') || Object.values(cacheState.entries).some((entry) => entry.phase === 'error')) && <button onClick={() => { cache.current.resume(selected.segments); player.current?.retry(); }}>重试</button>}
+        {selected && (workLog.includes('失败') || Object.values(cacheState.entries).some((entry) => entry.phase === 'error')) && <button onClick={() => { cache.current.resume(pacedCacheSegments(selected, playableParts)); player.current?.retry(); }}>重试</button>}
       </div>
       {selected && !firstFrameShown && !error && status.phase !== 'error' && !workLog.includes('失败') && cacheState.entries[selected.segments[0].id]?.phase !== 'error' && <div className="dance-first-loading" role="status" aria-label="正在读取第一段">
         <span className="dance-loading-ring" aria-hidden="true"/>
@@ -291,7 +298,7 @@ export function ShowDance() {
       <button className="dance-icon" aria-label="全屏播放" onClick={() => void fullscreen()}><FullscreenIcon/></button>
     </section>
     <button className="dance-album-edge" aria-label="从右侧展开相册" aria-controls="dance-album" aria-expanded={albumVisible} onPointerEnter={(event) => { if (event.pointerType === 'mouse') setAlbumVisible(true); }} onClick={() => setAlbumVisible(true)}><span>相册</span></button>
-    <aside id="dance-album" className={`dance-album${albumVisible ? ' is-open' : ''}`} aria-label="模型相册" inert={!albumVisible} onPointerLeave={(event) => { if (event.pointerType === 'mouse' && !event.currentTarget.contains(document.activeElement)) setAlbumVisible(false); }} onBlur={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) setAlbumVisible(false); }}><button className="dance-drawer-close" aria-label="收起右侧相册" onClick={() => setAlbumVisible(false)}>›</button><h2>相册<small>{String(items.length).padStart(2, '0')} 个作品</small></h2><div className="dance-filmstrip">{cards(false)}</div><button className="dance-all" onClick={() => { setPlaying(false); setExpanded(true); }}>查看全部 <span>›</span></button><div className="dance-cache-strip"><span>播放第 {selected ? partIndex + 1 : 0}/{selected?.segments.length || 0} 段 · 可播放 {playableParts.length} 段 · 已下载 {cachedCount} 段 · {bytes(loadedBytes)} / {bytes(totalBytes)}{cacheState.paused ? ' · 已暂停' : ''}</span><progress aria-label="相册缓存进度" value={loadedBytes} max={Math.max(1, totalBytes)}/><button onClick={() => { setPlaying(false); setExpanded(true); }}>缓存管理</button></div></aside>
+    <aside id="dance-album" className={`dance-album${albumVisible ? ' is-open' : ''}`} aria-label="模型相册" inert={!albumVisible} onPointerLeave={(event) => { if (event.pointerType === 'mouse' && !event.currentTarget.contains(document.activeElement)) setAlbumVisible(false); }} onBlur={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) setAlbumVisible(false); }}><button className="dance-drawer-close" aria-label="收起右侧相册" onClick={() => setAlbumVisible(false)}>›</button><h2>相册<small>{String(items.length).padStart(2, '0')} 个作品</small></h2><div className="dance-filmstrip">{cards(false)}</div><button className="dance-all" onClick={() => { setPlaying(false); setExpanded(true); }}>查看全部 <span>›</span></button><div className="dance-cache-strip"><span>播放第 {selected ? partIndex + 1 : 0}/{selected?.segments.length || 0} 段 · 播放就绪 {playableParts.length} 段 · 磁盘缓存 {cachedCount} 段 · {bytes(loadedBytes)} / {bytes(totalBytes)}{cacheState.paused ? ' · 已暂停' : ''}</span><progress aria-label="相册缓存进度" value={loadedBytes} max={Math.max(1, totalBytes)}/><button onClick={() => { setPlaying(false); setExpanded(true); }}>缓存管理</button></div></aside>
     <dialog className="dance-dialog" ref={dialog} onCancel={(event) => { if (firstCacheSetup) event.preventDefault(); else setExpanded(false); }} onClose={() => setExpanded(false)}><header><div><small>SPATIAL COLLECTION</small><h2>{firstCacheSetup ? '设置磁盘缓存' : '空间影像相册'}</h2></div>{!firstCacheSetup && <button autoFocus aria-label="关闭相册" onClick={() => setExpanded(false)}>×</button>}</header>{firstCacheSetup ? <div className="dance-cache-panel">
       <strong>首次使用，请选择缓存位置</strong>
       <p>授权一个硬盘文件夹，当前播放视频的片段将依次缓存到该目录。之后进入页面会自动复用，无需重复选择。</p>
