@@ -47,3 +47,23 @@ describe('TransferScheduler', () => {
     expect(scheduler.getStats()).toMatchObject({ cancelled: 1, completed: 1 });
   });
 });
+
+// #WDD-gpt 2026-09-20 - 动态提高并发只启动预算允许的任务，恢复单路时等待在途任务结束，不额外启动第四路。
+it('bounds preload concurrency and drains safely after returning to one lane', async () => {
+  const scheduler = new TransferScheduler();
+  const release: Array<() => void> = [];
+  const tasks = Array.from({ length: 4 }, (_, i) => scheduler.schedule({
+    key: String(i), priority: 'background', run: () => new Promise<void>(resolve => release.push(resolve)),
+  }));
+  expect(scheduler.getStats()).toMatchObject({ active: 1, queued: 3 });
+  scheduler.setConcurrency(99);
+  expect(scheduler.getStats()).toMatchObject({ active: 3, queued: 1 });
+  scheduler.setConcurrency(1);
+  release[0](); release[1]();
+  await Promise.all(tasks.slice(0, 2));
+  await Promise.resolve();
+  expect(release).toHaveLength(3);
+  release[2](); await tasks[2]; await Promise.resolve();
+  expect(release).toHaveLength(4);
+  release[3](); await tasks[3];
+});

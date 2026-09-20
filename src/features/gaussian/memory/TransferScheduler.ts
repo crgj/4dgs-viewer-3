@@ -32,7 +32,10 @@ export class TransferScheduler {
   private cancelled = 0;
   private destroyed = false;
 
-  constructor(private readonly concurrency = 1) {}
+  constructor(private concurrency = 1) {}
+
+  // #WDD-gpt 2026-09-20 - 全量显存预算通过后允许有界并行准备，常规预取仍默认单任务。
+  setConcurrency(count: number): void { this.concurrency = Math.max(1, Math.min(3, Math.floor(count))); this.drain(); }
 
   schedule<T>(input: {
     readonly key: string;

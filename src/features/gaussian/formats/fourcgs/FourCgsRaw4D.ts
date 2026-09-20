@@ -19,6 +19,11 @@ const COMPONENTS = {
   opacity: [''],
 } as const;
 
+// #WDD-gpt 2026-09-20 - V2.6 新文件按导出选择只保存 SH1/SH2/SH3 的真实非 DC 维数；旧清单缺字段时继续按 SH3 解码。
+export function fourCgsShDimensions(segment: Pick<FourCgsSegment, 'shBands'>): number {
+  return segment.shBands === 1 ? 9 : segment.shBands === 2 ? 24 : 45;
+}
+
 function bankProperties(prefix: string, count: number, components: readonly string[]): string[] {
   const names: string[] = [];
   for (let bank = 0; bank < count; bank += 1) {
@@ -35,7 +40,7 @@ export function fourCgsDecodedPropertyNames(segment: FourCgsSegment): string[] {
     ...bankProperties('scale_bank', segment.bankCounts.scale, COMPONENTS.scale),
     ...bankProperties('opacity_bank', segment.bankCounts.opacity, COMPONENTS.opacity),
     'lifetime_mu', 'lifetime_w',
-    ...Array.from({ length: 45 }, (_, coefficient) => `f_rest_${coefficient}`),
+    ...Array.from({ length: fourCgsShDimensions(segment) }, (_, coefficient) => `f_rest_${coefficient}`),
   ];
 }
 
@@ -43,7 +48,7 @@ export function fourCgsCanonicalRaw4DPropertyNames(segment: FourCgsSegment): str
   return [
     'x', 'y', 'z', 'nx', 'ny', 'nz',
     'f_dc_0', 'f_dc_1', 'f_dc_2',
-    ...Array.from({ length: 45 }, (_, coefficient) => `f_rest_${coefficient}`),
+    ...Array.from({ length: fourCgsShDimensions(segment) }, (_, coefficient) => `f_rest_${coefficient}`),
     'opacity', 'scale_0', 'scale_1', 'scale_2',
     'lifetime_mu', 'lifetime_w',
     ...bankProperties('xyz_bank', segment.bankCounts.position, COMPONENTS.position),
@@ -85,20 +90,29 @@ function sourceNameForCanonical(name: string): string | null {
   return name;
 }
 
-export function expandFourCgsCanonicalRaw4DRows(
+// #WDD-gpt 2026-09-20 - CPU 与可选 WebGPU Canonical 展开共用同一列映射，避免两条解码后端产生不同 RAW4D 布局。
+export function fourCgsCanonicalRaw4DMapping(
   segment: FourCgsSegment,
   decodedNames: readonly string[],
-  decodedRows: Uint16Array,
-): { readonly names: readonly string[]; readonly rows: Uint16Array } {
+): { readonly names: readonly string[]; readonly mapping: Int32Array } {
   const sourceIndices = new Map(decodedNames.map((name, index) => [name, index]));
   const names = fourCgsCanonicalRaw4DPropertyNames(segment);
-  const mapping = names.map((name) => {
+  const mapping = Int32Array.from(names.map((name) => {
     const sourceName = sourceNameForCanonical(name);
     if (sourceName === null) return -1;
     const source = sourceIndices.get(sourceName);
     if (source === undefined) throw new Error(`4CGS cannot reconstruct canonical RAW4D property ${name} from ${sourceName}.`);
     return source;
-  });
+  }));
+  return { names, mapping };
+}
+
+export function expandFourCgsCanonicalRaw4DRows(
+  segment: FourCgsSegment,
+  decodedNames: readonly string[],
+  decodedRows: Uint16Array,
+): { readonly names: readonly string[]; readonly rows: Uint16Array } {
+  const { names, mapping } = fourCgsCanonicalRaw4DMapping(segment, decodedNames);
   if (decodedRows.length !== segment.gaussianCount * decodedNames.length) {
     throw new Error(`4CGS decoded row length mismatch for ${segment.name}.`);
   }

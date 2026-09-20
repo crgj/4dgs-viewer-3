@@ -76,7 +76,7 @@ function createTrack(
   return { encoding: header.scalarEncoding, components: definition.components.length, keyframes, values };
 }
 
-function calculateBounds(position: Raw4DTrack): Raw4DAsset['bounds'] {
+export function calculateRaw4DBounds(position: Raw4DTrack): Raw4DAsset['bounds'] {
   let minX = Infinity;
   let minY = Infinity;
   let minZ = Infinity;
@@ -148,7 +148,7 @@ interface Raw4DCanonicalValidationPlan {
 
 type Raw4DValidationHeader = Pick<Raw4DHeader, 'propertyNames' | 'scalarEncoding'>;
 
-function canonicalValidationPlan(header: Raw4DValidationHeader): Raw4DCanonicalValidationPlan {
+function canonicalValidationPlan(header: Raw4DValidationHeader, generatedZeroNormals = false): Raw4DCanonicalValidationPlan {
   const indices = new Map(header.propertyNames.map((name, index) => [name, index]));
   const requireIndex = (name: string): number => {
     const value = indices.get(name);
@@ -165,7 +165,7 @@ function canonicalValidationPlan(header: Raw4DValidationHeader): Raw4DCanonicalV
   const opacity = RAW4D_TRACK_DEFINITIONS.opacity;
   const opacityBankCount = raw4DBankCount(header.propertyNames, opacity);
   return {
-    normals: ['nx', 'ny', 'nz'].map(requireIndex),
+    normals: generatedZeroNormals ? [] : ['nx', 'ny', 'nz'].map(requireIndex),
     rotations,
     opacity: opacityBankCount > 0
       ? Array.from({ length: opacityBankCount }, (_, bank) => requireIndex(raw4DTrackPropertyName(opacity, bank, '')))
@@ -219,6 +219,13 @@ function validateCanonicalChunk(
       throw new Error(`RAW4D lifetime must be finite at row ${firstRow + row}.`);
     }
   }
+}
+
+// #WDD-gpt 2026-09-20 - 内部 4CGS 行复用导入数值校验；其法线占位由导出器恒定生成零，无需构造冗余列。
+export function validateDecodedRaw4DRows(rows: Uint16Array, names: readonly string[]): void {
+  const header = { scalarEncoding: 'float16' as const, propertyNames: names };
+  if (!names.length || rows.length % names.length) throw new Error('4CGS decoded row layout mismatch.');
+  validateCanonicalChunk(rows, header, 0, rows.length / names.length, canonicalValidationPlan(header, true));
 }
 
 async function yieldToHost(): Promise<void> {
@@ -561,7 +568,7 @@ export async function parseRaw4D(source: Raw4DSource, options: Raw4DParseOptions
     shRest,
     lifetimeMu: storages.get('lifetime_mu')!,
     lifetimeW: storages.get('lifetime_w')!,
-    bounds: calculateBounds(position),
+    bounds: calculateRaw4DBounds(position),
     positionTiming: header.comments.get('position_timing') === 'per-point-lifetime-endpoints'
       ? 'per-point-lifetime-endpoints' : undefined,
     opacityTiming: header.comments.get('opacity_timing') === 'baked' ? 'baked' : undefined,

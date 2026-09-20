@@ -375,6 +375,7 @@ interface ResidentRaw4DEntry {
   readonly handle: ViewportResidentRaw4DSegment;
   readonly loaded: ImportedGaussianAsset;
   readonly lease: GaussianCpuPageLease<Raw4DAsset>;
+  readonly sourcePreserved: boolean;
 }
 
 interface ResidentRaw4DGpuEntry {
@@ -484,6 +485,10 @@ interface PerformanceWithMemory extends Performance {
 
 interface ViewportRuntimeOptions {
   backgroundColor?: string;
+  // #WDD-gpt 2026-09-19 - 独立展示页允许透明画布叠加本地 CSS 渐变背景。
+  transparentBackground?: boolean;
+  // #WDD-gpt 2026-09-20 - 展示页后台准备限制 CPU 并发，并在线程中打包渲染纹理。
+  backgroundPreparation?: boolean;
   showGuides?: boolean;
   preserveDrawingBuffer?: boolean;
   memoryPolicy?: Gaussian4DMemoryPolicy;
@@ -556,11 +561,10 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost, Semanti
   private gsplatFrameReadyHandle: { off(): void } | null = null;
   private sortedFramePostRenderPending = false;
   private sortedFrameGeneration = 0;
-  // #WDD-gpt 2026-09-09 - 严格排序在唯一 WebGL 画布内原子提交目标帧与排序结果，
-  // 不再通过 Windows/ANGLE 可能复制空帧的 2D Canvas 覆盖层隐藏中间态。
+  // #WDD-gpt 2026-09-09 - v3.0.122 撤销不可移植的 onSorted/WorkBuffer 原子钩子；
+  // 严格模式仅串行完整帧，且不再使用跨 Canvas 覆盖层。
   private readonly strictSortGate = new StrictSortFrameGate({
     applyFrameDirect: (frame) => this.activeRaw4D?.setFrame(frame),
-    prepareFrame: (frame) => this.activeRaw4D?.prepareFrame(frame) ?? frame,
   });
   private smartAlignmentCaptureRunning = false;
   private gs2MeshCaptureRunning = false;
@@ -620,6 +624,7 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost, Semanti
     // #WDD-gpt 2026-08-19 - 手机兼容档显式使用 WebGL2，避开移动 WebGPU 驱动差异；桌面仍优先 WebGPU 并保留 WebGL2 回退。
     const graphicsDeviceOptions = {
       antialias: false,
+      alpha: this.options.transparentBackground ?? false,
       // #WDD-gpt 2026-08-15 - 仅独立压缩渲染器开启帧缓冲保留，正式页面维持默认性能路径。
       preserveDrawingBuffer: this.options.preserveDrawingBuffer ?? false,
       powerPreference: 'high-performance' as const,
@@ -657,7 +662,7 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost, Semanti
     const [backgroundRed, backgroundGreen, backgroundBlue] = viewportBackgroundColorRgb(this.options.backgroundColor);
     camera.addComponent('camera', {
       // #WDD-gpt 2026-09-02 - 编辑器允许自定义相机清屏色；未传入时仍严格回退纯黑，保持质量参考和独立渲染器语义。
-      clearColor: new Color(backgroundRed, backgroundGreen, backgroundBlue, 1),
+      clearColor: new Color(backgroundRed, backgroundGreen, backgroundBlue, this.options.transparentBackground ? 0 : 1),
       fov: 48,
       nearClip: 0.01,
       farClip: 200,
@@ -837,6 +842,56 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost, Semanti
     return true;
   }
 
+  // #WDD-gpt 2026-09-19 - 按真实透视视锥拟合人物，代替对角线距离，避免宽屏人物过小或窄屏裁切。
+  frameSceneToViewport(occupancy = 0.92): boolean {
+    if (!this.orbit || !this.activeRaw4D || !this.camera?.camera) return false;
+    const camera = this.camera;
+    let points = this.getSmartAlignmentWorldBounds().corners;
+    // #WDD-gpt 2026-09-19 - 使用当前帧可见人物而非整段轨迹包围盒，剔除极少量漂浮点对构图的影响。
+    if (this.activeRaw4DAsset) {
+      const sampler = new Raw4DSelectionFrameSampler(this.activeRaw4DAsset);
+      sampler.sample(this.pendingFrame);
+      const frame = sampler.properties;
+      const matrix = this.activeRaw4D.entity.getWorldTransform();
+      const visible: Vec3[] = [];
+      const stride = Math.max(1, Math.ceil(this.activeRaw4DAsset.splatCount / 30000));
+      for (let i = 0; i < this.activeRaw4DAsset.splatCount; i += stride) {
+        if (frame.opacity[i] < 0.04 || this.activeRaw4D.edits.isDeleted(i)) continue;
+        const point = matrix.transformPoint(new Vec3(frame.x[i], frame.y[i], frame.z[i]));
+        if ([point.x, point.y, point.z].every(Number.isFinite)) visible.push(point);
+      }
+      if (visible.length > 100) {
+        const ranges = [camera.right, camera.up, camera.forward].map((axis) => {
+          const values = visible.map((point) => point.dot(axis)).sort((a, b) => a - b);
+          return { axis, low: values[Math.floor(values.length * 0.002)], high: values[Math.floor((values.length - 1) * 0.998)] };
+        });
+        const trimmed = visible.filter((point) => ranges.every(({ axis, low, high }) => point.dot(axis) >= low && point.dot(axis) <= high));
+        if (trimmed.length > 100) points = trimmed;
+      }
+    }
+    const center = new Vec3();
+    for (const axis of [camera.right, camera.up, camera.forward]) {
+      let low = Infinity, high = -Infinity;
+      for (const point of points) { const value = point.dot(axis); low = Math.min(low, value); high = Math.max(high, value); }
+      center.add(axis.clone().mulScalar((low + high) / 2));
+    }
+    const aspect = this.canvas.clientWidth / Math.max(1, this.canvas.clientHeight);
+    const tangent = Math.tan(camera.camera!.fov * Math.PI / 360);
+    const horizontal = camera.camera!.horizontalFov ? tangent : tangent * aspect;
+    const vertical = camera.camera!.horizontalFov ? tangent / aspect : tangent;
+    const fill = Math.max(0.1, Math.min(0.98, occupancy));
+    let distance = 0.1;
+    for (const corner of points) {
+      const offset = corner.clone().sub(center);
+      const depth = offset.dot(camera.forward);
+      distance = Math.max(distance,
+        Math.abs(offset.dot(camera.right)) / (horizontal * fill) - depth,
+        Math.abs(offset.dot(camera.up)) / (vertical * fill) - depth);
+    }
+    this.orbit.setState({ ...this.orbit.getState(), distance, target: [center.x, center.y, center.z] });
+    return true;
+  }
+
   // #WDD-gpt 2026-08-19 - F 聚焦遵循可见/全局选择范围；全局模式按需读取全部片段，避免非活动片段已有选择却误报为空。
   async frameSelectedGaussians(): Promise<boolean> {
     const orbit = this.orbit;
@@ -899,12 +954,10 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost, Semanti
     return this.activeRaw4D?.setShBands(this.shLevel) ?? this.shLevel;
   }
 
-  // #WDD-gpt 2026-09-09 - 数据集重建/替换时同步撤销资源上的原子提交回调，
-  // 防止旧排序结果在新实体接管后切回已经失效的目标帧。
+  // #WDD-gpt 2026-09-09 - 数据集重建/替换时使已排队帧与 postrender 回调整体失效。
   private resetStrictSortState(): void {
     this.sortedFrameGeneration += 1;
     this.sortedFramePostRenderPending = false;
-    this.activeRaw4D?.cancelPreparedFrame();
     this.strictSortGate.reset();
   }
 
@@ -927,15 +980,21 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost, Semanti
 
   setFrame(frame: number, onDisplayed?: () => void): void {
     this.pendingFrame = frame;
-    // #WDD-gpt 2026-09-09 - 正确性优先模式在引擎排序回调中原子切换目标帧，完成绘制后再回报时间轴。
+    // #WDD-gpt 2026-09-09 - 正确性优先模式串行完整 setFrame，完成绘制后再回报时间轴。
     this.strictSortGate.request(frame, onDisplayed);
+  }
+
+  // #WDD-gpt 2026-09-20 - 相机继承后重新确认当前局部帧的排序和绘制，不能复用隐藏画布的陈旧 ready 标记。
+  redrawCurrentFrame(onDisplayed: () => void): void {
+    this.setContinuousRendering(true);
+    this.setFrame(this.pendingFrame, onDisplayed);
   }
 
   setForceSortSync(enabled: boolean): void {
     this.strictSortGate.setEnabled(enabled);
   }
 
-  // #WDD-gpt 2026-09-09 - 暂停只停止时间轴继续排帧；已经排序中的目标仍原子完成，保证画面追上当前滑块。
+  // #WDD-gpt 2026-09-09 - 暂停只停止时间轴继续排帧；已经排序中的目标仍完整提交，保证画面追上当前滑块。
   cancelFramePacing(): void {
     // 时间轴 Promise 由 App 清理；此处刻意保留 in-flight 排序及其目标帧提交。
   }
@@ -984,7 +1043,7 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost, Semanti
     const camera = this.camera?.camera;
     if (!camera) return;
     const [red, green, blue] = viewportBackgroundColorRgb(value);
-    camera.clearColor = new Color(red, green, blue, 1);
+    camera.clearColor = new Color(red, green, blue, this.options.transparentBackground ? 0 : 1);
   }
 
   setAxesVisible(visible: boolean): void {
@@ -1112,7 +1171,7 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost, Semanti
         return {
           asset: resident.loaded.asset,
           deletionWords: sequence.edits.segment(segmentIndex).edits.deletionWords,
-          source: resident.handle.file,
+          source: resident.sourcePreserved ? resident.handle.file : undefined,
         };
       })
       : this.activeRaw4D && this.activeRaw4DAsset
@@ -3018,19 +3077,47 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost, Semanti
     files: readonly File[],
     onProgress?: (progress: ViewportRaw4DResidencyProgress) => void,
   ): Promise<readonly ViewportResidentRaw4DSegment[]> {
-    if (!this.memoryCoordinator || !this.gaussianImporter) throw new Error('三维视口尚未初始化完成。');
     if (files.length === 0 || files.some((file) => !/\.(?:raw4d|ply4)$/i.test(file.name))) {
       throw new Error('系统内存片段驻留只接受一个或更多 RAW4D / PLY4 文件。');
     }
+    return await this.preloadRaw4DSequenceSource(
+      files.length,
+      async (segmentIndex) => files[segmentIndex],
+      true,
+      onProgress,
+    );
+  }
+
+  // #WDD-gpt 2026-09-20 - 压缩 4CGS 按 Loader 并发度边提取、边解析、边驻留，且驻留后丢弃临时 Canonical File 载荷，避免先堆齐整条序列。
+  async preloadDecodedRaw4DSequence(
+    segmentCount: number,
+    loadSegment: (segmentIndex: number, cpuBudgetBytes: number) => Promise<File | { file: File; loaded: ImportedGaussianAsset }>,
+    onProgress?: (progress: ViewportRaw4DResidencyProgress) => void,
+    lowConcurrency = false,
+  ): Promise<readonly ViewportResidentRaw4DSegment[]> {
+    if (!Number.isInteger(segmentCount) || segmentCount <= 0) {
+      throw new Error(`解码片段数量无效：${segmentCount}。`);
+    }
+    return await this.preloadRaw4DSequenceSource(segmentCount, loadSegment, false, onProgress, lowConcurrency);
+  }
+
+  private async preloadRaw4DSequenceSource(
+    segmentCount: number,
+    loadSegment: (segmentIndex: number, cpuBudgetBytes: number) => Promise<File | { file: File; loaded: ImportedGaussianAsset }>,
+    preserveSourceFiles: boolean,
+    onProgress?: (progress: ViewportRaw4DResidencyProgress) => void,
+    lowConcurrency = false,
+  ): Promise<readonly ViewportResidentRaw4DSegment[]> {
+    if (!this.memoryCoordinator || !this.gaussianImporter) throw new Error('三维视口尚未初始化完成。');
     this.cancelImport();
     const controller = new AbortController();
     this.importController = controller;
     const importer = this.gaussianImporter;
     const memoryCoordinator = this.memoryCoordinator;
-    const workerCount = Math.min(files.length, importer.raw4DWorkerCount);
+    const workerCount = Math.min(segmentCount, lowConcurrency ? 1 : importer.raw4DWorkerCount);
     const created: ResidentRaw4DEntry[] = [];
-    const entries = new Array<ResidentRaw4DEntry | undefined>(files.length);
-    const ratios = new Float32Array(files.length);
+    const entries = new Array<ResidentRaw4DEntry | undefined>(segmentCount);
+    const ratios = new Float32Array(segmentCount);
     let nextSegmentIndex = 0;
     let completedCount = 0;
     let firstError: unknown = null;
@@ -3041,26 +3128,30 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost, Semanti
         for (const ratio of ratios) totalRatio += ratio;
         onProgress?.({
           segmentIndex,
-          segmentCount: files.length,
-          ratio: totalRatio / files.length,
-          message: `${workerCount} 个 Loader Worker · ${completedCount}/${files.length} 段完成 · ${file.name} · ${message}`,
+          segmentCount,
+          ratio: totalRatio / segmentCount,
+          message: `${workerCount} 条提取/Loader 流水线 · ${completedCount}/${segmentCount} 段完成 · ${file.name} · ${message}`,
         });
       };
       const loadLane = async (): Promise<void> => {
         while (!firstError && !controller.signal.aborted) {
           const segmentIndex = nextSegmentIndex;
           nextSegmentIndex += 1;
-          if (segmentIndex >= files.length) return;
-          const file = files[segmentIndex];
+          if (segmentIndex >= segmentCount) return;
           try {
-            const loaded = await importer.load(file, {
+            const decoded = await loadSegment(segmentIndex, memoryCoordinator.availableCpuBytes);
+            const file = decoded instanceof File ? decoded : decoded.file;
+            if (!/\.(?:raw4d|ply4)$/i.test(file.name)) {
+              throw new Error(`第 ${segmentIndex + 1} 个解码片段不是 RAW4D / PLY4：${file.name}。`);
+            }
+            const loaded = decoded instanceof File ? await importer.load(file, {
               cpuBudgetBytes: memoryCoordinator.availableCpuBytes,
               signal: controller.signal,
               onProgress: ({ message, ratio }) => {
                 ratios[segmentIndex] = Math.max(ratios[segmentIndex], ratio);
                 report(segmentIndex, file, message);
               },
-            });
+            }) : decoded.loaded;
             if (controller.signal.aborted || this.destroyRequested || !this.memoryCoordinator) {
               loaded.releaseBacking();
               throw new DOMException('RAW4D 多段驻留已取消。', 'AbortError');
@@ -3080,13 +3171,16 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost, Semanti
               loaded.releaseBacking();
               throw error;
             }
+            const retainedFile = preserveSourceFiles
+              ? file
+              : new File([], file.name, { type: file.type, lastModified: file.lastModified });
             const handle: ViewportResidentRaw4DSegment = {
               residentId: loaded.bufferId,
-              file,
+              file: retainedFile,
               bufferId: loaded.bufferId,
               cpuResidentBytes: loaded.cpuResidentBytes,
             };
-            const entry = { handle, loaded, lease } satisfies ResidentRaw4DEntry;
+            const entry = { handle, loaded, lease, sourcePreserved: preserveSourceFiles } satisfies ResidentRaw4DEntry;
             this.residentRaw4DSegments.set(handle.residentId, entry);
             created.push(entry);
             entries[segmentIndex] = entry;
@@ -3210,6 +3304,13 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost, Semanti
     };
   }
 
+  // #WDD-gpt 2026-09-20 - 已驻留隐藏场景暂停持续绘制；需要切换目标帧时由展示层恢复。
+  setContinuousRendering(enabled: boolean): void {
+    if (!this.app) return;
+    this.app.autoRender = enabled;
+    this.app.renderNextFrame = enabled;
+  }
+
   configureRaw4DSequenceGpuCache(
     handles: readonly ViewportResidentRaw4DSegment[],
     options: {
@@ -3298,7 +3399,7 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost, Semanti
     );
   }
 
-  // #WDD-gpt 2026-09-07 - 在首帧显示前串行建立全部隐藏 GPU 实体，播放期间只做实体切换而不再上传。
+  // #WDD-gpt 2026-09-07 - 在首帧显示前建立全部隐藏 GPU 实体，播放期间只做实体切换而不再上传。
   async preloadRaw4DSequenceGpu(
     handles: readonly ViewportResidentRaw4DSegment[],
     onProgress?: (progress: ViewportRaw4DGpuPreloadProgress) => void,
@@ -3311,25 +3412,34 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost, Semanti
       throw new Error('RAW4D 全量显存预读必须在配置同一序列后执行。');
     }
     const generation = ++this.raw4DPrefetchGeneration;
-    for (let index = 0; index < handles.length; index += 1) {
-      if (signal?.aborted || generation !== this.raw4DPrefetchGeneration || this.destroyRequested) {
-        throw new DOMException('RAW4D 全量显存预读已取消。', 'AbortError');
-      }
-      const handle = handles[index];
-      const resident = this.residentRaw4DSegments.get(handle.residentId);
-      if (!resident || resident.handle !== handle) throw new Error(`${handle.file.name} 已不在系统内存驻留池。`);
-      await this.getOrCreateResidentRaw4DGpu(resident, index, true, signal);
-      const completedSegments = index + 1;
-      onProgress?.({
-        completedSegments,
-        segmentCount: handles.length,
-        ratio: completedSegments / Math.max(1, handles.length),
-        requiredBytes: plan.requiredBytes,
-        budgetBytes: plan.budgetBytes,
-        message: `正在预读全部 GPU 片段 ${completedSegments}/${handles.length}`,
-      });
-      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
-    }
+    // #WDD-gpt 2026-09-20 - 预算覆盖全部片段后最多三路 GPU 资源准备，单段内部仍有界；失败等待在途任务收束。
+    const lanes = this.options.backgroundPreparation ? Math.min(3, handles.length) : 1;
+    const coordinator = this.memoryCoordinator!;
+    coordinator.setGpuTransferConcurrency(lanes);
+    let next = 0, completedSegments = 0;
+    let firstError: unknown = null;
+    try {
+      await Promise.all(Array.from({ length: lanes }, async () => {
+        while (next < handles.length && firstError === null) {
+          const index = next++;
+          try {
+            if (signal?.aborted || generation !== this.raw4DPrefetchGeneration || this.destroyRequested) {
+              throw new DOMException('RAW4D 全量显存预读已取消。', 'AbortError');
+            }
+            const handle = handles[index];
+            const resident = this.residentRaw4DSegments.get(handle.residentId);
+            if (!resident || resident.handle !== handle) throw new Error(`${handle.file.name} 已不在系统内存驻留池。`);
+            await this.getOrCreateResidentRaw4DGpu(resident, index, true, signal);
+            completedSegments++;
+            onProgress?.({ completedSegments, segmentCount: handles.length,
+              ratio: completedSegments / Math.max(1, handles.length), requiredBytes: plan.requiredBytes, budgetBytes: plan.budgetBytes,
+              message: `正在预读全部 GPU 片段 ${completedSegments}/${handles.length} · ${lanes} 条准备流水线`,
+            });
+          } catch (error) { firstError ??= error; }
+        }
+      }));
+      if (firstError !== null) throw firstError;
+    } finally { coordinator.setGpuTransferConcurrency(1); }
     return plan;
   }
 
@@ -3477,6 +3587,8 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost, Semanti
       this.memoryCoordinator.gpuPool,
       {
         enabled: false,
+        backgroundPreparation: this.options.backgroundPreparation,
+        signal,
         edits: sequenceEdits,
         maxShBands: this.raw4DSequenceMaxShBands,
         releaseTextureUploadSources: this.raw4DSequenceReleaseTextureUploadSources,

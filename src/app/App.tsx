@@ -20,6 +20,7 @@ import { writeFourCgsFile } from '../features/gaussian/formats/fourcgs/FourCgsCo
 import {
   encodeRaw4DMemoryAsFourCgs,
   type FourCgsEncodeResult,
+  type FourCgsExportOptions,
 } from '../features/gaussian/formats/fourcgs/FourCgsEncoderClient';
 import type { FourCgsProgress } from '../features/gaussian/formats/fourcgs/FourCgsTypes';
 import { FourCgsRaw4DZipWriter } from '../features/gaussian/formats/fourcgs/FourCgsRaw4DZip';
@@ -143,6 +144,7 @@ import {
   isFilePickerAbort,
   writeBlobToFileHandle,
 } from './fourCgsFileSave';
+import { fourCgsPartFilename, partitionConsecutiveSegments } from './fourCgsExportPartitions';
 import {
   createRaw4DSavePickerOptions,
   RAW4D_SEGMENTS_DIRECTORY_PICKER_OPTIONS,
@@ -1435,7 +1437,12 @@ export function App() {
   };
 
   // #WDD-gpt  2026-08-16 - RAW4D 保存时根据软删除位集输出压实文件；编辑中的源数据保持稳定 ID。
-  const exportWorkspace = async (forceFourCgsReencode = false) => {
+  const exportWorkspace = async (
+    forceFourCgsReencode = false,
+    fourCgsOptions: FourCgsExportOptions & { readonly partCount: number } = {
+      shLevel: 3, maximumEffectiveAlpha: 0.1, partCount: 1,
+    },
+  ) => {
     setOpenMenu(null);
     // #WDD-gpt 2026-08-17 - 所有场景文件导出在读取当前帧数据前先暂停，避免编码期间时间轴继续变化。
     setIsPlaying(false);
@@ -1453,6 +1460,7 @@ export function App() {
     const canonicalDataDirty = viewportRuntime?.hasCanonicalGaussianDataChanges() ?? false;
     const exportsFourCgs = supportsFourCgsSceneExport(status.format ?? '');
     let fourCgsFileHandle: FileSystemFileHandle | null = null;
+    let fourCgsDirectoryHandle: FileSystemDirectoryHandle | null = null;
     if (exportsFourCgs) {
       if (status.format === '4CGS' && !forceFourCgsReencode && !canonicalDataDirty && !sourceFile) {
         showAppNotice(
@@ -1471,7 +1479,21 @@ export function App() {
         );
         return;
       }
-      if (typeof window.showSaveFilePicker !== 'function') {
+      if (fourCgsOptions.partCount > 1 && fourCgsOptions.partCount > (status.raw4dSequence?.segmentCount ?? 1)) {
+        showAppNotice(
+          language === 'zh' ? `分段数 ${fourCgsOptions.partCount} 超过当前原始片段数 ${status.raw4dSequence?.segmentCount ?? 1}。` : `Output parts ${fourCgsOptions.partCount} exceed the current source segment count ${status.raw4dSequence?.segmentCount ?? 1}.`,
+          language === 'zh' ? '分段数无效' : 'Invalid output parts', 'warning',
+        );
+        return;
+      }
+      if (fourCgsOptions.partCount > 1 && typeof window.showDirectoryPicker !== 'function') {
+        showAppNotice(
+          language === 'zh' ? '当前浏览器不支持多部分 4CGS 目录授权，请使用最新版 Chrome 或 Edge。' : 'This browser cannot authorize a folder for multipart 4CGS export. Use a recent Chrome or Edge release.',
+          language === 'zh' ? '浏览器不支持选择目录' : 'Folder picker unavailable', 'warning',
+        );
+        return;
+      }
+      if (fourCgsOptions.partCount === 1 && typeof window.showSaveFilePicker !== 'function') {
         showAppNotice(
           language === 'zh'
             ? '当前浏览器不支持 4CGS“另存为”文件授权，请使用最新版 Chrome 或 Edge。'
@@ -1483,11 +1505,15 @@ export function App() {
       }
       const stem = (sceneName ?? status.objectName ?? 'dong-editor-3').replace(/\.(?:4cgs|4gs|raw4d|ply4)$/i, '');
       try {
-        // #WDD-gpt 2026-08-17 - 4CGS 是单文件，使用另存为窗口选择目录和文件名，而非申请整个目录权限。
-        fourCgsFileHandle = await window.showSaveFilePicker(createFourCgsSavePickerOptions(`${stem}.4cgs`));
+        // #WDD-gpt 2026-09-20 - 单部分保持精确文件授权；多部分只申请一个目录并顺序写入。
+        if (fourCgsOptions.partCount > 1) {
+          fourCgsDirectoryHandle = await window.showDirectoryPicker!({ id: 'dong-editor-3-fourcgs-parts-v1', mode: 'readwrite', startIn: 'downloads' });
+        } else {
+          fourCgsFileHandle = await window.showSaveFilePicker!(createFourCgsSavePickerOptions(`${stem}.4cgs`));
+        }
       } catch (error) {
-        if (isFilePickerAbort(error)) return;
-        showAppError(error, '4cgs-save-permission', () => { void exportWorkspace(forceFourCgsReencode); });
+        if (isFilePickerAbort(error) || isDirectoryPickerAbort(error)) return;
+        showAppError(error, '4cgs-save-permission', () => { void exportWorkspace(forceFourCgsReencode, fourCgsOptions); });
         return;
       }
     }
@@ -1516,18 +1542,46 @@ export function App() {
         const memorySnapshots = status.format === '4CGS' || status.format === '4GS'
           ? viewportRuntime.snapshotResidentSequenceExportMemory()
           : viewportRuntime.snapshotRaw4DExportMemory(sourceFiles);
-        const result = await encodeRaw4DMemoryAsFourCgs(memorySnapshots, (progress) => {
-          setExportProgress(progress.ratio);
-          setExportMonitor((current) => {
-            if (!current || current.phase !== 'running') return current;
-            const elapsedMs = performance.now() - exportStartedAtRef.current;
-            const previousMessage = current.logs.at(-1)?.message;
-            const logs = previousMessage === progress.message
-              ? current.logs
-              : [...current.logs, { elapsedMs, message: progress.message }].slice(-12);
-            return { ...current, progress, logs };
-          });
-        }, controller.signal);
+        const parts = partitionConsecutiveSegments(memorySnapshots, fourCgsOptions.partCount);
+        const stem = (sceneName ?? status.objectName ?? 'dong-editor-3').replace(/\.(?:4cgs|4gs|raw4d|ply4)$/i, '');
+        const results: FourCgsEncodeResult[] = [];
+        let totalOutputBytes = 0;
+        // #WDD-gpt 2026-09-20 - 多部分按原片段连续分组后串行编码/写入，避免同时驻留多份大 Blob。
+        for (let partIndex = 0; partIndex < parts.length; partIndex += 1) {
+          const result = await encodeRaw4DMemoryAsFourCgs(parts[partIndex], (progress) => {
+            const overallRatio = (partIndex + progress.ratio) / parts.length * 0.96;
+            setExportProgress(overallRatio);
+            setExportMonitor((current) => {
+              if (!current || current.phase !== 'running') return current;
+              const elapsedMs = performance.now() - exportStartedAtRef.current;
+              const partMessage = parts.length > 1 ? `第 ${partIndex + 1}/${parts.length} 部分 · ${progress.message}` : progress.message;
+              const previousMessage = current.logs.at(-1)?.message;
+              const logs = previousMessage === partMessage
+                ? current.logs
+                : [...current.logs, { elapsedMs, message: partMessage }].slice(-12);
+              return { ...current, progress: { ...progress, ratio: overallRatio, message: partMessage }, logs };
+            });
+          }, controller.signal, fourCgsOptions);
+          const blob = await writeFourCgsFile(result.blob, sceneTransform, cameraBookmarks);
+          if (controller.signal.aborted) throw new DOMException('4CGS 保存已取消。', 'AbortError');
+          const filename = fourCgsPartFilename(stem, partIndex, parts.length);
+          if (fourCgsDirectoryHandle) await writeRaw4DBlobToDirectory(fourCgsDirectoryHandle, filename, blob);
+          else await commitExportBlob(blob, filename, fourCgsFileHandle);
+          results.push(result);
+          totalOutputBytes += blob.size;
+        }
+        const lastResult = results.at(-1)!;
+        const sourceBytes = results.reduce((sum, result) => sum + result.sourceBytes, 0);
+        const result: FourCgsEncodeResult = {
+          ...lastResult,
+          sourceBytes,
+          outputBytes: totalOutputBytes,
+          compressionRatio: sourceBytes / totalOutputBytes,
+          sourceSha256: results.flatMap((item) => item.sourceSha256),
+          originalPointCount: results.reduce((sum, item) => sum + item.originalPointCount, 0),
+          encodedPointCount: results.reduce((sum, item) => sum + item.encodedPointCount, 0),
+          deletedPointCount: results.reduce((sum, item) => sum + item.deletedPointCount, 0),
+        };
         setExportProgress(0.98);
         setExportMonitor((current) => current ? {
           ...current,
@@ -1541,15 +1595,12 @@ export function App() {
             message: '压缩载荷完成，正在写入场景元数据',
           }].slice(-12),
         } : current);
-        const blob = await writeFourCgsFile(result.blob, sceneTransform, cameraBookmarks);
-        if (controller.signal.aborted) throw new DOMException('4CGS 保存已取消。', 'AbortError');
         setExportProgress(1);
-        const outputFilename = fourCgsFileHandle?.name ?? result.filename;
-        await commitExportBlob(blob, result.filename, fourCgsFileHandle);
+        const outputFilename = parts.length > 1 ? `${parts.length} 个连续 4CGS 部分` : (fourCgsFileHandle?.name ?? fourCgsPartFilename(stem, 0, 1));
         setExportElapsedMs(performance.now() - exportStartedAtRef.current);
         setExportMonitor((current) => current ? {
           ...current,
-          phase: 'success', result, outputBytes: blob.size,
+          phase: 'success', result, outputBytes: totalOutputBytes,
           progress: {
             ratio: 1, message: `已生成并保存 ${outputFilename}`, stage: '完成', stageRatio: 1,
             workerCount: result.encodeTimings?.workerCount ?? current.progress.workerCount,
@@ -1557,7 +1608,7 @@ export function App() {
           },
           logs: [...current.logs, {
             elapsedMs: performance.now() - exportStartedAtRef.current,
-            message: `完成 · ${(blob.size / 1_000_000).toFixed(3)}M · ${result.compressionRatio.toFixed(2)}×`,
+            message: `完成 · ${(totalOutputBytes / 1_000_000).toFixed(3)}M · ${result.compressionRatio.toFixed(2)}×`,
           }].slice(-12),
         } : current);
       } catch (error) {
@@ -2153,12 +2204,12 @@ export function App() {
     gs2MeshPluginRef.current?.exportLastResult();
   };
 
-  const runExportTarget = (target: ExportTarget) => {
+  const runExportTarget = (target: ExportTarget, options: FourCgsExportOptions & { readonly partCount: number }) => {
     setExportCenterVisible(false);
     if (target === 'ply-sequence') exportPlySequence();
     else if (target === 'raw4d') void exportRaw4DSegments();
     else if (target === 'fourcgs-raw4d-zip') void exportFourCgsRaw4DZip();
-    else void exportWorkspace(true);
+    else void exportWorkspace(true, options);
   };
 
   const cancelExport = () => exportAbortRef.current?.abort();

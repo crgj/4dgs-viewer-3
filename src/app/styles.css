@@ -4629,6 +4629,12 @@ button.outliner-row:hover,
 .export-preflight dt { color: #737d89; }
 .export-preflight dd { min-width: 0; margin: 0; overflow-wrap: anywhere; color: #c7cdd4; text-align: right; }
 .export-preflight p { margin: 11px 0 0; color: #7f8995; font-size: 8px; line-height: 1.6; }
+/* #WDD-gpt 2026-09-20 - 将 SH、Alpha 与多部分数作为 4CGS 导出前的明示可调参数。 */
+.export-fourcgs-options { display: grid; gap: 7px; margin: 10px 0 0; padding: 9px; border: 1px solid rgba(82, 218, 178, 0.13); border-radius: 8px; background: rgba(82, 218, 178, 0.035); }
+.export-fourcgs-options label { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: #89949f; font-size: 8px; }
+.export-fourcgs-options select,
+.export-fourcgs-options input { width: 104px; min-height: 26px; padding: 4px 7px; border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 6px; color: #d8dee5; background: #101318; font: 8px/1.2 "SFMono-Regular", Consolas, monospace; }
+.export-fourcgs-options small { color: #6f7c87; font-size: 7px; line-height: 1.55; }
 /* #WDD-gpt 2026-09-07 - RAW4D 多段导出在确认前预览真实输出文件名和每段帧范围。 */
 .export-segment-preview { display: grid; max-height: 112px; gap: 4px; margin: 10px 0 0; padding: 0; overflow-y: auto; list-style: none; }
 .export-segment-preview li { display: flex; min-width: 0; justify-content: space-between; gap: 10px; padding: 5px 7px; border-radius: 6px; background: rgba(67, 218, 173, 0.055); font: 7px/1.35 "SFMono-Regular", Consolas, monospace; }

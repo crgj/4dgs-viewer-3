@@ -1,3 +1,4 @@
+import { createFourCgsCanonicalAsset } from './FourCgsCanonicalAsset';
 /// <reference lib="webworker" />
 
 import { Buffer } from 'buffer';
@@ -7,23 +8,33 @@ import { bytesToHex } from '@noble/hashes/utils.js';
 import { FOUR_CGS_HEADER_BYTES, readFourCgsManifest } from './FourCgsContainer';
 import type { FourCgsDescriptor, FourCgsManifest, FourCgsSegment } from './FourCgsTypes';
 import { createFourCgsCanonicalRaw4D, fourCgsDecodedPropertyNames } from './FourCgsRaw4D';
-import { raw4DBundleMetadata, raw4DBundleStreamName } from './FourCgsRaw4DBundle';
+import { createFourCgsCanonicalRaw4DGpu } from './FourCgsCanonicalGpu';
+import { raw4DBundleMetadata, raw4DBundleStreamName, unshuffle16 } from './FourCgsRaw4DBundle';
 
 interface OpenRequest {
   readonly type: 'open';
   readonly requestId: number;
   readonly file: File;
+  readonly background?: boolean;
 }
 
 interface SegmentRequest {
-  readonly type: 'segment';
+  readonly type: 'segment' | 'asset';
+  readonly cpuBudgetBytes?: number;
   readonly requestId: number;
   readonly segmentIndex: number;
+  readonly consume?: boolean;
+  readonly preferGpu?: boolean;
 }
 
-type WorkerRequest = OpenRequest | SegmentRequest;
+type WorkerRequest = OpenRequest | SegmentRequest | { type: 'reset' };
 type RowBuffer = ArrayBuffer | SharedArrayBuffer;
 
+// #WDD-gpt 2026-09-20 - 跨展示片段复用各属性专用 Worker，保留已编译模块而不保留场景数组。
+const attributeWorkers = new Map<string, Worker>();
+const auxiliaryWorkers = new Map<string, Worker>();
+const streamWorkers: Worker[] = [];
+let backgroundDecode = false;
 let activeManifest: FourCgsManifest | null = null;
 let activeSourceName = '';
 let decodedRows: Uint16Array[] = [];
@@ -70,12 +81,12 @@ async function readStreams(file: File, manifest: FourCgsManifest, manifestBytes:
   if (offset !== file.size) throw new Error(`4CGS 末尾存在 ${file.size - offset} 个未登记字节。`);
   const hardwareConcurrency = navigator.hardwareConcurrency || 4;
   // #WDD-gpt 2026-08-16 - 流读取、SHA 与 Brotli 必须在独立 Worker 真并行；总控 Worker 内 Promise.all 仍会串行执行同步 WASM。
-  const concurrency = raw4DBundleMetadata(manifest)
+  const concurrency = backgroundDecode ? Math.min(2, ranges.length) : raw4DBundleMetadata(manifest)
     ? Math.min(2, ranges.length)
     : Math.min(ranges.length, Math.max(2, Math.min(4, Math.floor(hardwareConcurrency / 4))));
   lastStreamWorkerCount = Math.max(1, concurrency);
   const workers = Array.from({ length: concurrency }, () => (
-    new Worker(new URL('./fourcgs-stream.worker.ts', import.meta.url), { type: 'module' })
+    streamWorkers.pop() ?? new Worker(new URL('./fourcgs-stream.worker.ts', import.meta.url), { type: 'module' })
   ));
   const decoded = new Array<readonly [string, Buffer]>(ranges.length);
   let completed = 0;
@@ -121,11 +132,11 @@ async function readStreams(file: File, manifest: FourCgsManifest, manifestBytes:
     }
   };
   progress(0.04, `正在启动 ${concurrency} 个 Stream Worker 并行读取、校验和解压`);
-  try {
-    await Promise.all(workers.map(runLane));
-  } finally {
-    workers.forEach((worker) => worker.terminate());
-  }
+  let succeeded = false;
+  try { await Promise.all(workers.map(runLane)); succeeded = true; }
+  finally { for (const worker of workers) {
+    if (succeeded && streamWorkers.length < 4) streamWorkers.push(worker); else worker.terminate();
+  } }
   return new Map(decoded);
 }
 
@@ -240,7 +251,7 @@ function decodeSharedSh(
   floatToHalf: (value: number) => number,
 ): void {
   const magic = raw.subarray(0, 8).toString('ascii');
-  if (magic !== 'C5T1SH01' && magic !== 'C5T2SH01') throw new Error('不支持的共享 SH 流。');
+  if (magic !== 'C5T1SH01' && magic !== 'C5T2SH01' && magic !== 'C5T3SH01') throw new Error('不支持的共享 SH 流。');
   const slotCount = raw.readUInt32LE(8);
   const instanceCount = raw.readUInt32LE(12);
   const segmentCount = raw.readUInt16LE(16);
@@ -249,19 +260,20 @@ function decodeSharedSh(
   const baseBytes = raw.readUInt32LE(20);
   const maskBytes = raw.readUInt32LE(24);
   const labelBytes = raw.readUInt32LE(28);
-  const headerBytes = magic === 'C5T2SH01' ? 40 : 32;
-  const exceptionMaskBytes = magic === 'C5T2SH01' ? raw.readUInt32LE(32) : 0;
-  const exceptionValueBytes = magic === 'C5T2SH01' ? raw.readUInt32LE(36) : 0;
-  if (slotCount !== manifest.slotCount || segmentCount !== manifest.segments.length || dimensions !== 45
+  const hasExceptions = magic !== 'C5T1SH01';
+  const headerBytes = hasExceptions ? 40 : 32;
+  const exceptionMaskBytes = hasExceptions ? raw.readUInt32LE(32) : 0;
+  const exceptionValueBytes = hasExceptions ? raw.readUInt32LE(36) : 0;
+  if (slotCount !== manifest.slotCount || segmentCount !== manifest.segments.length || ![9, 24, 45].includes(dimensions)
     || levels < 1 || levels > 32 || (magic === 'C5T1SH01' && levels !== 5)
-    || baseBytes !== 45 * 2 + levels * 256 * 45 * 2) {
+    || baseBytes !== dimensions * 2 + levels * 256 * dimensions * 2) {
     throw new Error('4CGS 共享 SH 元数据不一致。');
   }
   const baseOffset = headerBytes;
-  const mean = new Float32Array(45);
-  for (let dimension = 0; dimension < 45; dimension += 1) mean[dimension] = halfToFloat(raw.readUInt16LE(baseOffset + dimension * 2));
-  const codebookOffset = baseOffset + 45 * 2;
-  const codebooks = new Float32Array(levels * 256 * 45);
+  const mean = new Float32Array(dimensions);
+  for (let dimension = 0; dimension < dimensions; dimension += 1) mean[dimension] = halfToFloat(raw.readUInt16LE(baseOffset + dimension * 2));
+  const codebookOffset = baseOffset + dimensions * 2;
+  const codebooks = new Float32Array(levels * 256 * dimensions);
   for (let index = 0; index < codebooks.length; index += 1) codebooks[index] = halfToFloat(raw.readUInt16LE(codebookOffset + index * 2));
   const maskOffset = baseOffset + baseBytes;
   const labelOffset = maskOffset + maskBytes;
@@ -269,28 +281,31 @@ function decodeSharedSh(
   const exceptionValueOffset = exceptionMaskOffset + exceptionMaskBytes;
   const updateMask = unzlibSync(raw.subarray(maskOffset, labelOffset));
   const updates = unzlibSync(raw.subarray(labelOffset, exceptionMaskOffset));
-  const exceptionMask = magic === 'C5T2SH01'
+  const exceptionMask = hasExceptions
     ? unzlibSync(raw.subarray(exceptionMaskOffset, exceptionValueOffset))
     : new Uint8Array(Math.ceil(instanceCount / 8));
-  const exceptionValues = magic === 'C5T2SH01'
+  const storedExceptionValues = hasExceptions
     ? unzlibSync(raw.subarray(exceptionValueOffset, exceptionValueOffset + exceptionValueBytes))
     : new Uint8Array(0);
+  const exceptionValues = magic === 'C5T3SH01' ? unshuffle16(storedExceptionValues) : storedExceptionValues;
   if (updateMask.byteLength !== Math.ceil(instanceCount / 8) || updates.byteLength % levels !== 0
-    || exceptionMask.byteLength !== Math.ceil(instanceCount / 8) || exceptionValues.byteLength % (45 * 2) !== 0
+    || exceptionMask.byteLength !== Math.ceil(instanceCount / 8) || exceptionValues.byteLength % (dimensions * 2) !== 0
     || exceptionValueOffset + exceptionValueBytes !== raw.byteLength) {
     throw new Error('4CGS 共享 SH 压缩载荷长度不一致。');
   }
   const state = new Uint8Array(slotCount * levels);
   const initialized = new Uint8Array(slotCount);
-  const decodedSh = new Uint16Array(slotCount * 45);
+  const decodedSh = new Uint16Array(slotCount * dimensions);
   const restOffsets = indices.map((properties, segmentIndex) => {
     const first = properties.get('f_rest_0');
     if (first === undefined) throw new Error(`4CGS 第 ${segmentIndex + 1} 段缺少 SH 属性。`);
-    for (let dimension = 1; dimension < 45; dimension += 1) {
+    for (let dimension = 1; dimension < dimensions; dimension += 1) {
       if (properties.get(`f_rest_${dimension}`) !== first + dimension) throw new Error(`4CGS 第 ${segmentIndex + 1} 段 SH 属性不连续。`);
     }
     return first;
   });
+  // #WDD-gpt 2026-09-20 - 每次模板更新只计算一次各级码本地址，保持浮点累加顺序。
+  const bookOffsets = new Int32Array(levels);
   let instance = 0;
   let updateOffset = 0;
   let exceptionOffset = 0;
@@ -302,7 +317,7 @@ function decodeSharedSh(
     for (let row = 0; row < activeSlots[segmentIndex].length; row += 1) {
       const slot = activeSlots[segmentIndex][row];
       const stateOffset = slot * levels;
-      const shOffset = slot * 45;
+      const shOffset = slot * dimensions;
       const rowOffset = row * stride + restOffset;
       const updated = (updateMask[instance >>> 3] & (1 << (instance & 7))) !== 0;
       if (updated) {
@@ -312,22 +327,23 @@ function decodeSharedSh(
       }
       if (!initialized[slot]) throw new Error(`4CGS Track ${slot} 缺少 SH 初始化。`);
       if (updated) {
-        for (let dimension = 0; dimension < 45; dimension += 1) {
+        for (let level = 0; level < levels; level++) bookOffsets[level] = (level * 256 + state[stateOffset + level]) * dimensions;
+        for (let dimension = 0; dimension < dimensions; dimension += 1) {
           let value = mean[dimension];
           for (let level = 0; level < levels; level += 1) {
-            value += codebooks[(level * 256 + state[stateOffset + level]) * 45 + dimension];
+            value += codebooks[bookOffsets[level] + dimension];
           }
           const bits = floatToHalf(value);
           decodedSh[shOffset + dimension] = bits;
           rowValues[rowOffset + dimension] = bits;
         }
       } else {
-        for (let dimension = 0; dimension < 45; dimension += 1) {
+        for (let dimension = 0; dimension < dimensions; dimension += 1) {
           rowValues[rowOffset + dimension] = decodedSh[shOffset + dimension];
         }
       }
       if (exceptionMask[instance >>> 3] & (1 << (instance & 7))) {
-        for (let dimension = 0; dimension < 45; dimension += 1) {
+        for (let dimension = 0; dimension < dimensions; dimension += 1) {
           rowValues[rowOffset + dimension] = exceptionValues[exceptionOffset]
             | (exceptionValues[exceptionOffset + 1] << 8);
           exceptionOffset += 2;
@@ -356,17 +372,15 @@ function runAttributeWorker(
   parallelism = 1,
 ): Promise<AttributeTaskTiming> {
   return new Promise((resolve, reject) => {
-    const worker = new Worker(new URL('./fourcgs-attribute.worker.ts', import.meta.url), { type: 'module' });
-    const finish = () => worker.terminate();
-    worker.addEventListener('message', (event: MessageEvent<{ type: string; task: string; elapsedMs?: number; workerCount?: number; message?: string }>) => {
-      finish();
+    const worker = attributeWorkers.get(task) ?? new Worker(new URL('./fourcgs-attribute.worker.ts', import.meta.url), { type: 'module' });
+    attributeWorkers.delete(task);
+    const finish = (success: boolean) => { worker.onmessage = null; worker.onerror = null; if (success) attributeWorkers.set(task, worker); else worker.terminate(); };
+    worker.onmessage = (event: MessageEvent<{ type: string; task: string; elapsedMs?: number; workerCount?: number; message?: string }>) => {
+      finish(event.data.type !== 'error');
       if (event.data.type === 'error') reject(new Error(event.data.message ?? `4CGS ${task} Worker 失败。`));
       else resolve({ task: event.data.task, elapsedMs: event.data.elapsedMs ?? 0, workerCount: event.data.workerCount ?? 1 });
-    }, { once: true });
-    worker.addEventListener('error', (event) => {
-      finish();
-      reject(new Error(event.message || `4CGS ${task} Worker 崩溃。`));
-    }, { once: true });
+    };
+    worker.onerror = (event) => { finish(false); reject(new Error(event.message || `4CGS ${task} Worker 崩溃。`)); };
     const streamBuffer = transferableCopy(stream);
     worker.postMessage({
       task,
@@ -388,17 +402,15 @@ function runAuxiliaryWorker(
   rows: readonly Uint16Array[],
 ): Promise<AttributeTaskTiming> {
   return new Promise((resolve, reject) => {
-    const worker = new Worker(new URL('./fourcgs-auxiliary.worker.ts', import.meta.url), { type: 'module' });
-    const finish = () => worker.terminate();
-    worker.addEventListener('message', (event: MessageEvent<{ type: string; task: string; elapsedMs?: number; message?: string }>) => {
-      finish();
+    const worker = auxiliaryWorkers.get(task) ?? new Worker(new URL('./fourcgs-auxiliary.worker.ts', import.meta.url), { type: 'module' });
+    auxiliaryWorkers.delete(task);
+    const finish = (success: boolean) => { worker.onmessage = null; worker.onerror = null; if (success) auxiliaryWorkers.set(task, worker); else worker.terminate(); };
+    worker.onmessage = (event: MessageEvent<{ type: string; task: string; elapsedMs?: number; workerCount?: number; message?: string }>) => {
+      finish(event.data.type !== 'error');
       if (event.data.type === 'error') reject(new Error(event.data.message ?? `4CGS ${task} Worker 失败。`));
-      else resolve({ task: event.data.task, elapsedMs: event.data.elapsedMs ?? 0, workerCount: 1 });
-    }, { once: true });
-    worker.addEventListener('error', (event) => {
-      finish();
-      reject(new Error(event.message || `4CGS ${task} Worker 崩溃。`));
-    }, { once: true });
+      else resolve({ task: event.data.task, elapsedMs: event.data.elapsedMs ?? 0, workerCount: event.data.workerCount ?? 1 });
+    };
+    worker.onerror = (event) => { finish(false); reject(new Error(event.message || `4CGS ${task} Worker 崩溃。`)); };
     const streamBuffers: Record<string, ArrayBuffer> = {};
     const transfer: ArrayBuffer[] = [];
     for (const streamName of streamNames) {
@@ -418,7 +430,8 @@ function runAuxiliaryWorker(
 
 async function decodeAttributes(manifest: FourCgsManifest, streams: Map<string, Buffer>): Promise<void> {
   (globalThis as typeof globalThis & { Buffer: typeof Buffer }).Buffer = Buffer;
-  const shared = typeof SharedArrayBuffer !== 'undefined' && globalThis.crossOriginIsolated;
+  // #WDD-gpt 2026-09-20 - 后台模式仅使用总控解码线程，避免额外十余条属性 Worker 抢占播放 CPU。
+  const shared = !backgroundDecode && typeof SharedArrayBuffer !== 'undefined' && globalThis.crossOriginIsolated;
   decodedNames = manifest.segments.map(propertyNames);
   const indices = decodedNames.map((items) => new Map(items.map((name, index) => [name, index])));
   const activeSlots = createActiveSlots(manifest, streams.get('active_masks')!, shared);
@@ -547,7 +560,8 @@ async function decodeAttributes(manifest: FourCgsManifest, streams: Map<string, 
   progress(0.92, '4CGS 属性解码完成，正在准备首段');
 }
 
-async function open(file: File): Promise<FourCgsDescriptor> {
+async function open(file: File, background = false): Promise<FourCgsDescriptor> {
+  backgroundDecode = background;
   const totalStartedAt = performance.now();
   progress(0.01, '正在读取 4CGS V2.4 清单');
   const { manifest, manifestBytes } = await readFourCgsManifest(file);
@@ -615,7 +629,13 @@ async function open(file: File): Promise<FourCgsDescriptor> {
   };
 }
 
-function segmentBytes(segmentIndex: number): { name: string; bytes: ArrayBuffer } {
+async function segmentBytes(segmentIndex: number, consume = false, preferGpu = true): Promise<{
+  name: string;
+  bytes: ArrayBuffer;
+  backend: 'webgpu' | 'cpu' | 'raw';
+  elapsedMs: number;
+}> {
+  const startedAt = performance.now();
   if (!activeManifest) throw new Error('4CGS 尚未完成解码。');
   const segment = activeManifest.segments[segmentIndex];
   const bundle = raw4DBundleMetadata(activeManifest);
@@ -625,18 +645,49 @@ function segmentBytes(segmentIndex: number): { name: string; bytes: ArrayBuffer 
     // #WDD-gpt 2026-08-16 - 每次请求复制后再 transfer，避免播放回访同一段时缓存 ArrayBuffer 已被 detached。
     const copy = new Uint8Array(source.byteLength);
     copy.set(source);
-    return { name: segment.name, bytes: copy.buffer };
+    if (consume) decodedRaw4DBundle[segmentIndex] = new Uint8Array(0);
+    return { name: segment.name, bytes: copy.buffer, backend: 'raw', elapsedMs: performance.now() - startedAt };
   }
   if (!segment || !decodedRows[segmentIndex] || !decodedNames[segmentIndex]) throw new Error('4CGS 尚未完成解码或段号无效。');
-  const output = createFourCgsCanonicalRaw4D(segment, decodedNames[segmentIndex], decodedRows[segmentIndex]);
-  return { name: segment.name, bytes: output.buffer as ArrayBuffer };
+  // #WDD-gpt 2026-09-20 - Canonical FP16 列展开优先走分段 WebGPU Compute；任何设备/限额/执行失败都保持原 CPU 字节级结果。
+  // #WDD-gpt 2026-09-20 - 展示页后台展开留在 CPU Worker，避免与实时渲染竞争 GPU Compute。
+  const gpuOutput = preferGpu ? await createFourCgsCanonicalRaw4DGpu(
+    segment, decodedNames[segmentIndex], decodedRows[segmentIndex],
+  ) : null;
+  const output = gpuOutput
+    ?? createFourCgsCanonicalRaw4D(segment, decodedNames[segmentIndex], decodedRows[segmentIndex]);
+  // #WDD-gpt 2026-09-20 - 流水线已把该段交给 RAW4D Loader 后不再回访解码行；逐段断开近 2GB 总工作集，降低后续 GC 与内存带宽压力。
+  if (consume) decodedRows[segmentIndex] = new Uint16Array(0);
+  return {
+    name: segment.name,
+    bytes: output.buffer as ArrayBuffer,
+    backend: gpuOutput ? 'webgpu' : 'cpu',
+    elapsedMs: performance.now() - startedAt,
+  };
+}
+
+// #WDD-gpt 2026-09-20 - 直达共享 Canonical RAM，只保留已交给主线程的列视图，旧行按段释放。
+function segmentAsset(index: number, consume: boolean, cpuBudgetBytes?: number) {
+  const started = performance.now();
+  const segment = activeManifest?.segments[index];
+  if (!segment || !decodedRows[index]?.length) throw new Error('4CGS decoded segment unavailable.');
+  const shared = globalThis.crossOriginIsolated && typeof SharedArrayBuffer !== 'undefined';
+  const asset = createFourCgsCanonicalAsset(segment, decodedNames[index], decodedRows[index], shared, cpuBudgetBytes);
+  if (consume) decodedRows[index] = new Uint16Array(0);
+  return { asset, elapsedMs: performance.now() - started, shared };
 }
 
 self.addEventListener('message', (event: MessageEvent<WorkerRequest>) => {
   const request = event.data;
+  if (request.type === 'reset') { activeManifest = null; activeSourceName = ''; decodedRows = []; decodedNames = []; decodedRaw4DBundle = []; return; }
   const operation: Promise<void> = request.type === 'open'
-    ? open(request.file).then((value) => self.postMessage({ type: 'result', requestId: request.requestId, value }))
-    : Promise.resolve(segmentBytes(request.segmentIndex)).then((value) => {
+    ? open(request.file, request.background).then((value) => self.postMessage({ type: 'result', requestId: request.requestId, value }))
+    : request.type === 'asset' ? Promise.resolve().then(() => {
+      const value = segmentAsset(request.segmentIndex, Boolean(request.consume), request.cpuBudgetBytes);
+      const buffer = value.asset.position.values[0].buffer;
+      self.postMessage({ type: 'result', requestId: request.requestId, value }, buffer instanceof ArrayBuffer ? [buffer] : []);
+    })
+    : segmentBytes(request.segmentIndex, request.consume, request.preferGpu).then((value) => {
       self.postMessage({ type: 'result', requestId: request.requestId, value }, [value.bytes]);
     });
   void operation.catch(

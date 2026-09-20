@@ -133,8 +133,9 @@ function validateEditorBuild(value: unknown): FourCgsEditorBuild | undefined {
     throw new Error('4CGS metadata.editorBuild 无效。');
   }
   const build = value as Partial<FourCgsEditorBuild>;
+  // #WDD-gpt 2026-09-19 - 兼容无法注入构建版本的外部 RAW4D Bundle；unknown 只作来源标记，不参与解码。
   if (build.schemaVersion !== 1 || build.product !== 'Dong Editor 3'
-    || typeof build.version !== 'string' || !/^\d+\.\d+\.\d+$/.test(build.version)) {
+    || typeof build.version !== 'string' || (build.version !== 'unknown' && !/^\d+\.\d+\.\d+$/.test(build.version))) {
     throw new Error('4CGS metadata.editorBuild 版本信息不受支持。');
   }
   return { schemaVersion: 1, product: 'Dong Editor 3', version: build.version };
@@ -242,6 +243,10 @@ function validateSegment(value: unknown, index: number): FourCgsSegment {
     && segment.opacityTiming !== 'lifetime-gated'
     && segment.opacityTiming !== 'baked') {
     throw new Error(`4CGS ${segment.name}.opacityTiming 无效。`);
+  }
+  // #WDD-gpt 2026-09-20 - 低阶 SH 4CGS 必须显式声明 1/2/3；旧文件未声明时由读取端兼容为 SH3。
+  if (segment.shBands !== undefined && segment.shBands !== 1 && segment.shBands !== 2 && segment.shBands !== 3) {
+    throw new Error(`4CGS ${segment.name}.shBands 无效。`);
   }
   if (!Number.isSafeInteger(segment.firstFrame) || !Number.isSafeInteger(segment.lastFrame) || segment.lastFrame! < segment.firstFrame!) {
     throw new Error(`4CGS ${segment.name} 帧范围无效。`);

@@ -1,19 +1,6 @@
-import { decodeRans, encodeRans, floatToHalf, halfToFloat } from './fourcgs-prs-codec.mjs';
+import { ByteWriter, decodeRans, encodeRans, floatToHalf, halfToFloat } from './fourcgs-prs-codec.mjs';
 
 const MAGIC = 'TATTR001';
-
-class ByteWriter {
-  constructor() { this.bytes = []; }
-  byte(value) { this.bytes.push(value & 0xff); }
-  uint(value) {
-    let remaining = Math.trunc(value);
-    while (remaining >= 128) { this.byte((remaining % 128) | 0x80); remaining = Math.floor(remaining / 128); }
-    this.byte(remaining);
-  }
-  sint(value) { this.uint(value >= 0 ? value * 2 : -value * 2 - 1); }
-  ushort(value) { this.byte(value); this.byte(value >>> 8); }
-  finish() { return Buffer.from(this.bytes); }
-}
 
 class ByteReader {
   constructor(bytes) { this.bytes = bytes; this.offset = 0; }
@@ -78,14 +65,16 @@ function unpackStreams(encoded) {
 
 function quantizedBanks(segment, layout, segmentIndex, options) {
   const active = layout.activeSlots[segmentIndex];
-  const inverse = layout.slotToLocal[segmentIndex];
+  const activeLocals = layout.activeLocals?.[segmentIndex];
+  const inverse = activeLocals ? null : layout.slotToLocal[segmentIndex];
   const bankCount = options.bankCounts[segmentIndex];
   const dimensions = options.components.length;
   return Array.from({ length: bankCount }, (_, bank) => {
     const properties = options.components.map((component) => segment.propertyIndex.get(propertyName(options.prefix, bank, component)));
     const values = new Int32Array(active.length * dimensions);
     for (let row = 0; row < active.length; row += 1) {
-      const source = inverse[active[row]] * segment.propertyNames.length;
+      const local = activeLocals ? activeLocals[row] : inverse[active[row]];
+      const source = local * segment.propertyNames.length;
       for (let component = 0; component < dimensions; component += 1) {
         const bits = segment.rows[source + properties[component]];
         values[row * dimensions + component] = options.exactHalf ? orderedHalf(bits) : Math.round(halfToFloat(bits) / options.step);
@@ -131,10 +120,12 @@ export function encodeTemporalAttribute(segments, layout, options) {
     }
     if (!options.exactHalf) {
       const segment = segments[segmentIndex];
-      const inverse = layout.slotToLocal[segmentIndex];
+      const activeLocals = layout.activeLocals?.[segmentIndex];
+      const inverse = activeLocals ? null : layout.slotToLocal[segmentIndex];
       for (let bank = 0; bank < banks.length; bank += 1) {
         for (let row = 0; row < active.length; row += 1) {
-          const source = inverse[active[row]] * segment.propertyNames.length;
+          const local = activeLocals ? activeLocals[row] : inverse[active[row]];
+          const source = local * segment.propertyNames.length;
           for (let component = 0; component < dimensions; component += 1) {
             const property = segment.propertyIndex.get(propertyName(options.prefix, bank, options.components[component]));
             const original = halfToFloat(segment.rows[source + property]);
@@ -150,13 +141,17 @@ export function encodeTemporalAttribute(segments, layout, options) {
   }
   const birthWriter = new ByteWriter();
   for (const value of birth) options.exactHalf ? birthWriter.ushort(value) : birthWriter.sint(value);
-  const rawStreams = [{ name: 'birth', raw: birthWriter.finish() }];
+  const rawWriters = [{ name: 'birth', writer: birthWriter }];
   for (const context of ['boundary', 'endpoint', 'internal']) {
     for (let component = 0; component < dimensions; component += 1) {
-      rawStreams.push({ name: `${context}:${component}`, raw: contexts[context][component].finish() });
+      rawWriters.push({ name: `${context}:${component}`, writer: contexts[context][component] });
     }
   }
-  const streams = rawStreams.map((stream) => ({ name: stream.name, bytes: encodeRans(stream.raw), rawBytes: stream.raw.length }));
+  // #WDD-gpt 2026-09-19 - 每条残差流完成后立即熵编码并释放分块，避免同时保留全部原始大流。
+  const streams = rawWriters.map((stream) => {
+    const raw = stream.writer.finish();
+    return { name: stream.name, bytes: encodeRans(raw), rawBytes: raw.length };
+  });
   const encoded = packStreams({
     prefix: options.prefix,
     components: options.components,

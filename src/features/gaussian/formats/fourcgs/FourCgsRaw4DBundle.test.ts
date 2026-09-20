@@ -223,7 +223,7 @@ describe('RAW4D 4CGS bundle helpers', () => {
     const policy = manifest.compressionV26 as Record<string, any>;
 
     expect(manifest.codecName).toContain('AdaptivePQ');
-    expect(magic).toBe('C5T2SH01');
+    expect(magic).toBe('C5T3SH01');
     expect(['compact-5x9d', 'balanced-10x4-5d', 'quality-15x3d']).toContain(policy.shPolicy.template);
     expect(policy.generalizationPolicy).toContain('no filename/hash/source-profile dependency');
     expect(policy.sourceProfileSha256).toBeUndefined();
@@ -251,6 +251,32 @@ describe('RAW4D 4CGS bundle helpers', () => {
     expect(raw4dExport.sourceKind).toBe('canonical-memory-or-file-snapshot');
     expect((raw4dExport.temporalLayouts as Array<{ schemaVersion: number }>)[0].schemaVersion).toBe(1);
     expect(result.sourceSha256[0]).toMatch(/^[0-9a-f]{64}$/);
+  }, 30_000);
+
+  // #WDD-gpt 2026-09-20 - 同时回归 SH1 真实 9D 载荷与全整数帧最大有效 Alpha 剪除统计。
+  it('writes true SH1 dimensions and prunes only points below the effective Alpha gate', async () => {
+    const source = compressibleFp16Raw4D('sh1_alpha_take_0_0.raw4d', 16);
+    const asset = await parseRaw4D(source, { sourceName: source.name });
+    for (const values of asset.opacity.values) (values as Uint16Array)[0] = floatToHalf(-20);
+    const result = await encodeRaw4DV26BrowserMemory([{
+      name: source.name,
+      asset,
+      deletionWords: new Uint32Array(1),
+    }], undefined, { shLevel: 1, maximumEffectiveAlpha: 0.1 });
+    const { manifest, manifestBytes } = await readFourCgsManifest(result.blob);
+    const policy = manifest.compressionV26 as Record<string, any>;
+    const shEntryIndex = manifest.streams.findIndex((stream) => stream.name === 'coresh5r_shared');
+    const shOffset = FOUR_CGS_HEADER_BYTES + manifestBytes
+      + manifest.streams.slice(0, shEntryIndex).reduce((sum, stream) => sum + stream.storedBytes, 0);
+    const header = new Uint8Array(await result.blob.slice(shOffset, shOffset + 20).arrayBuffer());
+
+    expect(new TextDecoder().decode(header.subarray(0, 8))).toBe('C5T3SH01');
+    expect(header[18]).toBe(9);
+    expect(manifest.segments[0].shBands).toBe(1);
+    expect(manifest.segments[0].gaussianCount).toBe(15);
+    expect(policy.alphaPrunedPointCount).toBe(1);
+    expect(policy.maximumEffectiveAlpha).toBe(0.1);
+    expect(policy.shPolicy).toMatchObject({ level: 1, dimensions: 9 });
   }, 30_000);
 
   it('encodes multi-frame Float32 PLY4 memory and expands static fallback tracks', async () => {
@@ -376,5 +402,125 @@ describe('RAW4D 4CGS bundle helpers', () => {
     expect(restored).toEqual(encoded.encoded);
     const restoredRaw = await structuredCodec.decodeV21StructuredStream('prs_position', storedRaw.encoded, manifest);
     expect(restoredRaw).toEqual(encoded.encoded);
+  });
+
+  // #WDD-gpt 2026-09-20 - Rotation 双 Worker 的分区局部状态和零 Map 例外游标必须与单路解码逐位一致。
+  it('decodes shared Rotation partitions byte-identically with partition-local state', async () => {
+    const [rotationCodec, structuredCodec, prsCodec] = await Promise.all([
+      import('../../../../../scripts/fourcgs-so3-temporal-codec.mjs'),
+      import('../../../../../scripts/fourcgs-v21-lossless-codec.mjs'),
+      import('../../../../../scripts/fourcgs-prs-codec.mjs'),
+    ]);
+    const names = Array.from({ length: 2 }, (_, bank) => (
+      ['w', 'x', 'y', 'z'].map((component) => `rot_bank_${bank}_${component}`)
+    )).flat();
+    const quaternion = (angle: number) => [Math.cos(angle / 2), 0, Math.sin(angle / 2), 0];
+    const segment = (path: string, angles: readonly (readonly [number, number])[]) => ({
+      path,
+      count: angles.length,
+      propertyNames: names,
+      propertyIndex: new Map(names.map((name, index) => [name, index])),
+      comments: new Map<string, string>(),
+      rows: Uint16Array.from(angles.flatMap((pair) => pair.flatMap((angle) => quaternion(angle))).map(prsCodec.floatToHalf)),
+    });
+    const segments = [
+      segment('rotation_0.raw4d', [[0, 0.03], [0.1, 0.13], [0.2, 0.23]]),
+      segment('rotation_1.raw4d', [[0.04, 0.07], [0.24, 0.27], [0.3, 0.33]]),
+    ];
+    const activeSlots = [Int32Array.from([0, 1, 2]), Int32Array.from([0, 2, 3])];
+    const layout = {
+      slotCount: 4,
+      activeSlots,
+      slotToLocal: [Int32Array.from([0, 1, 2, -1]), Int32Array.from([0, -1, 1, 2])],
+    };
+    const descriptors = segments.map((value, index) => ({
+      name: value.path,
+      firstFrame: index,
+      lastFrame: index + 1,
+      gaussianCount: value.count,
+      totalFrames: 2,
+      shBands: 3,
+      bankCounts: { position: 1, rotation: 2, colorDc: 1, scale: 1, opacity: 1 },
+      keyframeStrides: { position: 1, rotation: 1, colorDc: 1, scale: 1, opacity: 1 },
+    }));
+    const manifest = { slotCount: 4, segments: descriptors };
+    const encoded = rotationCodec.encodeSo3Rotations(segments, layout, [2, 2], {
+      bits: 12, stepDegrees: 0.05, maximumAngleDegrees: 0.1,
+    });
+    const stored = await structuredCodec.encodeV22StructuredStream(
+      'so3_rotation', encoded.encoded, { blockCompression: 'brotli', brotliQuality: 9 },
+    );
+    const direct = await structuredCodec.decodeV22StructuredParts('so3_rotation', stored.encoded);
+    const sharedActive = activeSlots.map((slots) => {
+      const output = new Int32Array(new SharedArrayBuffer(slots.byteLength));
+      output.set(slots);
+      return output;
+    });
+    const indices = descriptors.map(() => new Map(names.map((name, index) => [name, index])));
+    const singleRows = descriptors.map((descriptor) => new Uint16Array(descriptor.gaussianCount * names.length));
+    rotationCodec.decodeSo3RotationStreams(
+      direct.metadata, direct.streams, manifest, activeSlots, singleRows, indices,
+    );
+    const partitionRows = descriptors.map((descriptor) => (
+      new Uint16Array(new SharedArrayBuffer(descriptor.gaussianCount * names.length * 2))
+    ));
+    // #WDD-gpt 2026-09-20 - 直读 Rice 的分区结果必须和旧 Varint 解码路径逐位相同。
+    const fast = await structuredCodec.decodeV22RotationReaders(stored.encoded);
+    const prepared = rotationCodec.prepareSo3RotationStreams(
+      fast.metadata, fast.streams, manifest, sharedActive, true, fast.readers,
+    );
+    for (let partitionIndex = 0; partitionIndex < 2; partitionIndex += 1) {
+      rotationCodec.decodeSo3RotationPartition(
+        prepared, manifest, sharedActive, partitionRows, indices, partitionIndex, 2,
+      );
+    }
+    expect(partitionRows.map((row) => Array.from(row))).toEqual(singleRows.map((row) => Array.from(row)));
+  });
+
+  // #WDD-gpt 2026-09-19 - 大序列导出必须以活跃 slot/local 对替代 segmentCount×slotCount 稠密反表，并保持 Position 码流一致。
+  it('builds sparse Morton active pairs with the same ordering and Position bytes as the dense layout', async () => {
+    const prsCodec = await import('../../../../../scripts/fourcgs-prs-codec.mjs');
+    const names = ['xyz_bank_0_x', 'xyz_bank_0_y', 'xyz_bank_0_z'];
+    const segment = (path: string, positions: readonly (readonly [number, number, number])[]) => ({
+      path,
+      count: positions.length,
+      propertyNames: names,
+      propertyIndex: new Map(names.map((name, index) => [name, index])),
+      comments: new Map<string, string>(),
+      rows: Uint16Array.from(positions.flat().map(prsCodec.floatToHalf)),
+    });
+    const segments = [
+      segment('segment_0_0.raw4d', [[0.5, 0, 0], [-0.5, 0, 0], [0, 0.5, 0]]),
+      segment('segment_1_1.raw4d', [[-0.5, 0, 0], [0, -0.5, 0]]),
+    ];
+    const permanent = {
+      slotCount: 4,
+      maps: [Int32Array.from([0, 1, 2]), Int32Array.from([1, 3])],
+      continuedLocal: [new Uint8Array(3), Uint8Array.from([1, 0])],
+      matches: [],
+    };
+    const options = { positionsAlreadyInside: true };
+    const dense = prsCodec.buildCroppedMortonLayout(segments, permanent, [0, 0, 0], 1, options);
+    const sparse = prsCodec.buildCroppedMortonLayout(
+      segments, permanent, [0, 0, 0], 1, { ...options, sparseInverse: true, retainRemap: false },
+    );
+
+    expect(sparse.slotToLocal).toEqual([]);
+    expect(sparse.maps).toEqual([]);
+    expect(sparse.order).toEqual(new Int32Array(0));
+    expect(sparse.oldToNew).toEqual(new Int32Array(0));
+    expect(sparse.continuedLocal).toEqual([]);
+    for (let segmentIndex = 0; segmentIndex < segments.length; segmentIndex += 1) {
+      expect(Array.from(sparse.activeSlots[segmentIndex])).toEqual(Array.from(dense.activeSlots[segmentIndex]));
+      expect(Array.from(sparse.activeLocals[segmentIndex])).toEqual(Array.from(
+        dense.activeSlots[segmentIndex], (slot: number) => dense.slotToLocal[segmentIndex][slot],
+      ));
+    }
+    const encodeOptions = { center: [0, 0, 0], halfExtent: 1, step: 0.00045, maximumError: 0.0005, cellSize: 0.5 };
+    const densePosition = prsCodec.encodePositionRaw(segments, dense, [1, 1], encodeOptions);
+    const sparsePosition = prsCodec.encodePositionRaw(segments, sparse, [1, 1], encodeOptions);
+    expect(sparsePosition.mainRaw).toEqual(densePosition.mainRaw);
+    expect(sparsePosition.exceptionRaw).toEqual(densePosition.exceptionRaw);
+    expect(sparsePosition.metrics).toEqual(densePosition.metrics);
   });
 });

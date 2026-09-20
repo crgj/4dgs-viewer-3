@@ -1,19 +1,6 @@
-import { decodeRans, encodeRans, floatToHalf, halfToFloat } from './fourcgs-prs-codec.mjs';
+import { ByteWriter, decodeRans, encodeRans, floatToHalf, halfToFloat } from './fourcgs-prs-codec.mjs';
 
 const MAGIC = 'SO3TR001';
-
-class ByteWriter {
-  constructor() { this.bytes = []; }
-  byte(value) { this.bytes.push(value & 0xff); }
-  uint(value) {
-    let remaining = Math.trunc(value);
-    while (remaining >= 128) { this.byte((remaining % 128) | 0x80); remaining = Math.floor(remaining / 128); }
-    this.byte(remaining);
-  }
-  sint(value) { this.uint(value >= 0 ? value * 2 : -value * 2 - 1); }
-  ushort(value) { this.byte(value); this.byte(value >>> 8); }
-  finish() { return Buffer.from(this.bytes); }
-}
 
 class ByteReader {
   constructor(bytes) { this.bytes = bytes; this.offset = 0; }
@@ -34,13 +21,13 @@ class ByteReader {
 }
 
 class BitWriter {
-  constructor() { this.bytes = []; this.value = 0; this.bits = 0; }
+  constructor() { this.output = new ByteWriter(); this.value = 0; this.bits = 0; }
   write(value, bits) {
     this.value += value * 2 ** this.bits;
     this.bits += bits;
-    while (this.bits >= 8) { this.bytes.push(this.value & 0xff); this.value = Math.floor(this.value / 256); this.bits -= 8; }
+    while (this.bits >= 8) { this.output.byte(this.value & 0xff); this.value = Math.floor(this.value / 256); this.bits -= 8; }
   }
-  finish() { if (this.bits) this.bytes.push(this.value & 0xff); return Buffer.from(this.bytes); }
+  finish() { if (this.bits) this.output.byte(this.value & 0xff); return this.output.finish(); }
 }
 
 class BitReader {
@@ -156,7 +143,9 @@ export function encodeSo3Rotations(segments, layout, bankCounts, options = {}) {
   const context = { boundary: [new ByteWriter(), new ByteWriter(), new ByteWriter()], endpoint: [new ByteWriter(), new ByteWriter(), new ByteWriter()] };
   const state = new Float32Array(layout.slotCount * 4);
   const initialized = new Uint8Array(layout.slotCount);
-  const exceptions = [];
+  const exceptionBody = new ByteWriter();
+  let exceptionCount = 0;
+  let previousExceptionOrdinal = -1;
   let ordinal = 0;
   let squared = 0;
   let maximum = 0;
@@ -164,7 +153,13 @@ export function encodeSo3Rotations(segments, layout, bankCounts, options = {}) {
     const error = angleDegrees(source, reconstructed);
     squared += error * error;
     maximum = Math.max(maximum, error);
-    if (error > maximumAngleDegrees || !Number.isFinite(error)) { exceptions.push({ ordinal, bits: sourceBits }); return source; }
+    if (error > maximumAngleDegrees || !Number.isFinite(error)) {
+      exceptionBody.uint(ordinal - previousExceptionOrdinal - 1);
+      for (const value of sourceBits) exceptionBody.ushort(value);
+      previousExceptionOrdinal = ordinal;
+      exceptionCount += 1;
+      return source;
+    }
     return reconstructed;
   };
   for (let segmentIndex = 0; segmentIndex < segments.length; segmentIndex += 1) {
@@ -173,9 +168,11 @@ export function encodeSo3Rotations(segments, layout, bankCounts, options = {}) {
     }
     const segment = segments[segmentIndex];
     const active = layout.activeSlots[segmentIndex];
-    const inverse = layout.slotToLocal[segmentIndex];
-    for (const slot of active) {
-      const local = inverse[slot];
+    const activeLocals = layout.activeLocals?.[segmentIndex];
+    const inverse = activeLocals ? null : layout.slotToLocal[segmentIndex];
+    for (let row = 0; row < active.length; row += 1) {
+      const slot = active[row];
+      const local = activeLocals ? activeLocals[row] : inverse[slot];
       const base = local * segment.propertyNames.length;
       const bitsAt = (bank) => ['w', 'x', 'y', 'z'].map((component) => segment.rows[base + segment.propertyIndex.get(`rot_bank_${bank}_${component}`)]);
       const startSource = sourceQuaternion(segment, local, 0);
@@ -213,18 +210,20 @@ export function encodeSo3Rotations(segments, layout, bankCounts, options = {}) {
     for (let axis = 0; axis < 3; axis += 1) birth.write(birthCodes[axis][slot], bits);
   }
   const exceptionWriter = new ByteWriter();
-  exceptionWriter.uint(exceptions.length);
-  let previousOrdinal = -1;
-  for (const exception of exceptions) {
-    exceptionWriter.uint(exception.ordinal - previousOrdinal - 1); previousOrdinal = exception.ordinal;
-    for (const value of exception.bits) exceptionWriter.ushort(value);
+  exceptionWriter.uint(exceptionCount);
+  const exceptionPrefix = exceptionWriter.finish();
+  const exceptionRaw = Buffer.concat([exceptionPrefix, exceptionBody.finish()]);
+  const rawWriters = [{ name: 'birth', writer: birth }];
+  for (const name of ['boundary', 'endpoint']) {
+    for (let axis = 0; axis < 3; axis += 1) rawWriters.push({ name: `${name}:${axis}`, writer: context[name][axis] });
   }
-  const raw = [{ name: 'birth', raw: birth.finish() }];
-  for (const name of ['boundary', 'endpoint']) for (let axis = 0; axis < 3; axis += 1) raw.push({ name: `${name}:${axis}`, raw: context[name][axis].finish() });
-  raw.push({ name: 'exceptions', raw: exceptionWriter.finish() });
-  const streams = raw.map((stream) => ({ name: stream.name, bytes: encodeRans(stream.raw), rawBytes: stream.raw.length }));
+  const streams = rawWriters.map((stream) => {
+    const raw = stream.writer.finish();
+    return { name: stream.name, bytes: encodeRans(raw), rawBytes: raw.length };
+  });
+  streams.push({ name: 'exceptions', bytes: encodeRans(exceptionRaw), rawBytes: exceptionRaw.length });
   const encoded = pack({ bits, stepDegrees, maximumAngleDegrees, slotCount: layout.slotCount, bankCounts }, streams);
-  return { encoded, metrics: { encodedBytes: encoded.length, observationCount: ordinal, bits, stepDegrees, measuredAngularRmseDegrees: Math.sqrt(squared / ordinal), measuredMaximumAngleDegrees: maximum, exceptionCount: exceptions.length, streams: streams.map((stream) => ({ name: stream.name, rawBytes: stream.rawBytes, encodedBytes: stream.bytes.length })) } };
+  return { encoded, metrics: { encodedBytes: encoded.length, observationCount: ordinal, bits, stepDegrees, measuredAngularRmseDegrees: Math.sqrt(squared / ordinal), measuredMaximumAngleDegrees: maximum, exceptionCount, streams: streams.map((stream) => ({ name: stream.name, rawBytes: stream.rawBytes, encodedBytes: stream.bytes.length })) } };
 }
 
 export function decodeSo3Rotations(encoded, manifest, activeSlots, rows, indices) {
@@ -254,7 +253,7 @@ function uint8Storage(length, shared) {
 }
 
 // #WDD-gpt 2026-08-16 - Rotation 先顺序展开位流为共享整数平面，随后可按永久 Track 分区并行执行独立 SO(3) 重建。
-export function prepareSo3RotationStreams(metadata, streams, manifest, activeSlots, shared = false) {
+export function prepareSo3RotationStreams(metadata, streams, manifest, activeSlots, shared = false, directReaders = null) {
   if (metadata.slotCount !== manifest.slotCount) throw new Error('SO(3) slot mismatch.');
   const birthReader = new BitReader(streams.get('birth'));
   const birthLargest = uint8Storage(manifest.slotCount, shared);
@@ -266,7 +265,7 @@ export function prepareSo3RotationStreams(metadata, streams, manifest, activeSlo
     birthCodes[offset + 1] = birthReader.read(metadata.bits);
     birthCodes[offset + 2] = birthReader.read(metadata.bits);
   }
-  const context = Object.fromEntries(['boundary', 'endpoint'].map((name) => [name, Array.from({ length: 3 }, (_, axis) => new ByteReader(streams.get(`${name}:${axis}`)))]));
+  const context = Object.fromEntries(['boundary', 'endpoint'].map((name) => [name, Array.from({ length: 3 }, (_, axis) => directReaders?.get(`${name}:${axis}`) ?? new ByteReader(streams.get(`${name}:${axis}`)))]));
   const exceptionReader = new ByteReader(streams.get('exceptions'));
   const exceptionCount = exceptionReader.uint();
   const exceptionOrdinals = int32Storage(exceptionCount, shared);
@@ -331,21 +330,58 @@ export function prepareSo3RotationStreams(metadata, streams, manifest, activeSlo
   };
 }
 
+// #WDD-gpt 2026-09-20 - 旋转重建复用四元数暂存，保留原归一化、FP16 回环和乘法次序，消除逐点短数组分配。
+function normalizeQuaternionInPlace(q) {
+  const length = Math.hypot(q[0], q[1], q[2], q[3]);
+  if (length > 1e-12 && Number.isFinite(length)) { q[0] /= length; q[1] /= length; q[2] /= length; q[3] /= length; }
+  else { q[0] = 1; q[1] = 0; q[2] = 0; q[3] = 0; }
+  if (q[0] < 0) { q[0] = -q[0]; q[1] = -q[1]; q[2] = -q[2]; q[3] = -q[3]; }
+}
+function halfQuaternionInPlace(q) {
+  for (let axis = 0; axis < 4; axis++) q[axis] = halfToFloat(floatToHalf(q[axis]));
+  normalizeQuaternionInPlace(q);
+}
+function birthQuaternionInPlace(q, prepared, slot) {
+  const largest = prepared.birthLargest[slot], maximum = (1 << prepared.bits) - 1;
+  let source = slot * 3, square = 0;
+  for (let axis = 0; axis < 4; axis++) {
+    if (axis === largest) q[axis] = 0;
+    else { const value = prepared.birthCodes[source++] / maximum * Math.SQRT2 - Math.SQRT1_2; q[axis] = value; square += value * value; }
+  }
+  q[largest] = Math.sqrt(Math.max(0, 1 - square));
+  normalizeQuaternionInPlace(q);
+}
+function tangentQuaternionInPlace(q, vx, vy, vz) {
+  const angle = Math.hypot(vx, vy, vz);
+  if (angle < 1e-12) return;
+  const scale = Math.sin(angle / 2) / angle, bw = Math.cos(angle / 2), bx = vx * scale, by = vy * scale, bz = vz * scale;
+  const w = q[0], x = q[1], y = q[2], z = q[3];
+  q[0] = w * bw - x * bx - y * by - z * bz;
+  q[1] = w * bx + x * bw + y * bz - z * by;
+  q[2] = w * by - x * bz + y * bw + z * bx;
+  q[3] = w * bz + x * by - y * bx + z * bw;
+  normalizeQuaternionInPlace(q);
+}
+
 export function decodeSo3RotationPartition(prepared, manifest, activeSlots, rows, indices, partitionIndex = 0, partitionCount = 1) {
   if (!Number.isInteger(partitionIndex) || !Number.isInteger(partitionCount)
     || partitionCount < 1 || partitionIndex < 0 || partitionIndex >= partitionCount) {
     throw new Error('SO(3) partition is invalid.');
   }
-  const exceptions = new Map();
-  for (let index = 0; index < prepared.exceptionCount; index += 1) {
-    const offset = index * 4;
-    exceptions.set(prepared.exceptionOrdinals[index], [
-      prepared.exceptionBits[offset], prepared.exceptionBits[offset + 1],
-      prepared.exceptionBits[offset + 2], prepared.exceptionBits[offset + 3],
-    ]);
-  }
+  // #WDD-gpt 2026-09-20 - 例外序号本来已严格递增；分区遍历用游标读取共享 TypedArray，禁止每个 Worker 再建立数百万项 JS Map。
+  let exceptionCursor = 0;
+  const exceptionOffset = (ordinal) => {
+    while (exceptionCursor < prepared.exceptionCount
+      && prepared.exceptionOrdinals[exceptionCursor] < ordinal) exceptionCursor += 1;
+    return exceptionCursor < prepared.exceptionCount
+      && prepared.exceptionOrdinals[exceptionCursor] === ordinal
+      ? exceptionCursor * 4
+      : -1;
+  };
   const step = prepared.stepDegrees * Math.PI / 180;
-  const state = new Float32Array(manifest.slotCount * 4);
+  // #WDD-gpt 2026-09-20 - 每个分区只保存自己负责的 Track 四元数；多 Worker 总状态量保持约 slotCount×4，而不再按分区数倍增。
+  const partitionSlotCount = Math.max(0, Math.ceil((manifest.slotCount - partitionIndex) / partitionCount));
+  const state = new Float32Array(partitionSlotCount * 4);
   const seen = new Uint8Array(manifest.slotCount);
   const propertyOffsets = manifest.segments.map((segment, segmentIndex) => Array.from({ length: segment.bankCounts.rotation }, (_, bank) => ['w', 'x', 'y', 'z'].map((component) => {
     const property = indices[segmentIndex].get(`rot_bank_${bank}_${component}`);
@@ -357,6 +393,7 @@ export function decodeSo3RotationPartition(prepared, manifest, activeSlots, rows
   let intraIndex = 0;
   let observationOrdinal = 0;
   let processedObservations = 0;
+  const q = new Float64Array(4);
   for (let segmentIndex = 0; segmentIndex < manifest.segments.length; segmentIndex += 1) {
     const rowValues = rows[segmentIndex];
     const stride = indices[segmentIndex].size;
@@ -374,43 +411,32 @@ export function decodeSo3RotationPartition(prepared, manifest, activeSlots, rows
       const currentObservationOrdinal = observationOrdinal;
       observationOrdinal += bankCount;
       if (slot % partitionCount !== partitionIndex) continue;
+      const partitionSlot = Math.floor(slot / partitionCount);
+      const stateOffset = partitionSlot * 4;
       processedObservations += bankCount;
-      let start;
-      if (!continuing) {
-        const birthOffset = slot * 3;
-        start = halfQuaternion(decodeSmallestThree(prepared.birthLargest[slot], [
-          prepared.birthCodes[birthOffset], prepared.birthCodes[birthOffset + 1], prepared.birthCodes[birthOffset + 2],
-        ], prepared.bits));
-      }
+      if (!continuing) birthQuaternionInPlace(q, prepared, slot);
       else {
-        const previous = Array.from(state.subarray(slot * 4, slot * 4 + 4));
-        start = halfQuaternion(applyTangent(previous, [
-          prepared.boundary[0][currentBoundary] * step,
-          prepared.boundary[1][currentBoundary] * step,
-          prepared.boundary[2][currentBoundary] * step,
-        ]));
+        for (let axis = 0; axis < 4; axis++) q[axis] = state[stateOffset + axis];
+        tangentQuaternionInPlace(q, prepared.boundary[0][currentBoundary] * step,
+          prepared.boundary[1][currentBoundary] * step, prepared.boundary[2][currentBoundary] * step);
       }
-      const startOrdinal = currentObservationOrdinal;
-      const startException = exceptions.get(startOrdinal);
-      const startBits = startException ?? start.map(floatToHalf);
-      if (startException) start = normalized(startBits.map(halfToFloat));
       const rowOffset = row * stride;
-      for (let axis = 0; axis < 4; axis += 1) rowValues[rowOffset + offsets[0][axis]] = startBits[axis];
-      let previous = start;
-      for (let bank = 1; bank < bankCount; bank += 1) {
-        const endpoint = currentIntraIndex + bank - 1;
-        let reconstructed = halfQuaternion(applyTangent(previous, [
-          prepared.endpoint[0][endpoint] * step,
-          prepared.endpoint[1][endpoint] * step,
-          prepared.endpoint[2][endpoint] * step,
-        ]));
-        const exception = exceptions.get(startOrdinal + bank);
-        const bits = exception ?? reconstructed.map(floatToHalf);
-        if (exception) reconstructed = normalized(bits.map(halfToFloat));
-        for (let axis = 0; axis < 4; axis += 1) rowValues[rowOffset + offsets[bank][axis]] = bits[axis];
-        previous = reconstructed;
+      for (let bank = 0; bank < bankCount; bank++) {
+        if (bank > 0) {
+          const endpoint = currentIntraIndex + bank - 1;
+          tangentQuaternionInPlace(q, prepared.endpoint[0][endpoint] * step,
+            prepared.endpoint[1][endpoint] * step, prepared.endpoint[2][endpoint] * step);
+        }
+        halfQuaternionInPlace(q);
+        const exception = exceptionOffset(currentObservationOrdinal + bank);
+        for (let axis = 0; axis < 4; axis++) {
+          const bits = exception >= 0 ? prepared.exceptionBits[exception + axis] : floatToHalf(q[axis]);
+          rowValues[rowOffset + offsets[bank][axis]] = bits;
+          if (exception >= 0) q[axis] = halfToFloat(bits);
+        }
+        if (exception >= 0) normalizeQuaternionInPlace(q);
       }
-      state.set(previous, slot * 4);
+      state.set(q, stateOffset);
     }
   }
   if (instance !== prepared.instanceCount || boundaryIndex !== prepared.boundaryCount

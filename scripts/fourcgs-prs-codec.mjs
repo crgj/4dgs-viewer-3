@@ -58,7 +58,8 @@ export function floatToHalf(value) {
   return sign | (exponent << 10) | (rounded >>> 13);
 }
 
-class ByteWriter {
+// #WDD-gpt 2026-09-19 - 所有大码流统一使用 TypedArray 分块写入，禁止逐字节堆积为 V8 number[]。
+export class ByteWriter {
   constructor(chunkBytes = 1 << 20) {
     this.chunkBytes = chunkBytes;
     this.chunks = [];
@@ -100,7 +101,13 @@ class ByteWriter {
 
   finish() {
     this.flush();
-    return Buffer.concat(this.chunks, this.length);
+    const chunks = this.chunks;
+    const length = this.length;
+    this.chunks = [];
+    this.chunk = Buffer.alloc(0);
+    this.offset = 0;
+    this.length = 0;
+    return Buffer.concat(chunks, length);
   }
 }
 
@@ -184,18 +191,20 @@ export function encodeRans(bytes) {
     cumulative[symbol] = sum;
     sum += frequencies[symbol];
   }
-  const emitted = [];
+  // #WDD-gpt 2026-09-19 - rANS 反向输出可能达到数亿字节；分块 Buffer 避免每字节一个 JS number 导致 Worker old-space OOM。
+  const emittedWriter = new ByteWriter();
   let state = RANS_LOW;
   for (let index = bytes.length - 1; index >= 0; index -= 1) {
     const symbol = bytes[index];
     const frequency = frequencies[symbol];
     const maximum = Math.floor(RANS_LOW / RANS_TOTAL) * 256 * frequency;
     while (state >= maximum) {
-      emitted.push(state & 0xff);
+      emittedWriter.byte(state & 0xff);
       state = Math.floor(state / 256);
     }
     state = Math.floor(state / frequency) * RANS_TOTAL + state % frequency + cumulative[symbol];
   }
+  const emitted = emittedWriter.finish();
   emitted.reverse();
   const header = Buffer.alloc(20 + 256 * 2);
   header.write(RANS_MAGIC, 0, 'ascii');
@@ -203,7 +212,7 @@ export function encodeRans(bytes) {
   header.writeUInt32LE(emitted.length, 12);
   header.writeUInt32LE(state >>> 0, 16);
   for (let symbol = 0; symbol < 256; symbol += 1) header.writeUInt16LE(frequencies[symbol], 20 + symbol * 2);
-  return Buffer.concat([header, Buffer.from(emitted)]);
+  return Buffer.concat([header, emitted]);
 }
 
 export function decodeRans(encoded) {
@@ -324,6 +333,31 @@ function mortonCode(position, center, halfExtent) {
   return spreadMorton10(x) | (spreadMorton10(y) << 1) | (spreadMorton10(z) << 2);
 }
 
+// #WDD-gpt 2026-09-19 - 千万级 Track 以稳定字节基数排序替代 JS comparator sort，限制临时内存并保持 code/birth/id 原有顺序。
+function stableRadixSortOrder(order, passes) {
+  let input = order;
+  let output = new Int32Array(order.length);
+  for (const { keyAt, byteCount } of passes) {
+    for (let byte = 0; byte < byteCount; byte += 1) {
+      const shift = byte * 8;
+      const counts = new Uint32Array(256);
+      for (let index = 0; index < input.length; index += 1) counts[(keyAt(input[index]) >>> shift) & 0xff] += 1;
+      let offset = 0;
+      for (let value = 0; value < counts.length; value += 1) {
+        const count = counts[value];
+        counts[value] = offset;
+        offset += count;
+      }
+      for (let index = 0; index < input.length; index += 1) {
+        const item = input[index];
+        output[counts[(keyAt(item) >>> shift) & 0xff]++] = item;
+      }
+      [input, output] = [output, input];
+    }
+  }
+  if (input !== order) order.set(input);
+}
+
 function insideCube(position, center, halfExtent) {
   return position.every((value, axis) => Math.abs(value - center[axis]) <= halfExtent);
 }
@@ -332,7 +366,7 @@ function insideCube(position, center, halfExtent) {
 export function buildCroppedMortonLayout(segments, permanent, center, halfExtent, options = {}) {
   const kept = new Uint8Array(permanent.slotCount);
   kept.fill(1);
-  const firstPositions = Array.from({ length: permanent.slotCount });
+  const codes = new Uint32Array(permanent.slotCount);
   const birthSegments = new Int16Array(permanent.slotCount);
   birthSegments.fill(-1);
   for (let segmentIndex = 0; segmentIndex < segments.length; segmentIndex += 1) {
@@ -341,8 +375,9 @@ export function buildCroppedMortonLayout(segments, permanent, center, halfExtent
     while (segment.propertyIndex.has(`xyz_bank_${positionBanks}_x`)) positionBanks += 1;
     for (let local = 0; local < segment.count; local += 1) {
       const oldTrack = permanent.maps[segmentIndex][local];
-      if (!firstPositions[oldTrack]) {
-        firstPositions[oldTrack] = positionAt(segment, local, 0);
+      if (birthSegments[oldTrack] < 0) {
+        // #WDD-gpt 2026-09-19 - 首次出现时直接保存 Morton 码，避免为千万级 Track 保留海量 JS 三元数组。
+        codes[oldTrack] = mortonCode(positionAt(segment, local, 0), center, halfExtent);
         birthSegments[oldTrack] = segmentIndex;
       }
       if (!options.positionsAlreadyInside) {
@@ -352,16 +387,69 @@ export function buildCroppedMortonLayout(segments, permanent, center, halfExtent
       }
     }
   }
-  const order = [];
+  const keptCount = options.positionsAlreadyInside
+    ? permanent.slotCount
+    : kept.reduce((sum, value) => sum + value, 0);
+  // #WDD-gpt 2026-09-19 - 浏览器大序列使用定长 TypedArray 排序，避免 2,000 万项 JS number[] 的对象/堆开销。
+  const order = options.sparseInverse ? new Int32Array(keptCount) : [];
+  let orderLength = 0;
   for (let oldTrack = 0; oldTrack < permanent.slotCount; oldTrack += 1) {
-    if (kept[oldTrack]) order.push(oldTrack);
+    if (kept[oldTrack]) order[orderLength++] = oldTrack;
   }
-  const codes = new Uint32Array(permanent.slotCount);
-  for (const oldTrack of order) codes[oldTrack] = mortonCode(firstPositions[oldTrack], center, halfExtent);
-  order.sort((a, b) => codes[a] - codes[b] || birthSegments[a] - birthSegments[b] || a - b);
+  if (options.sparseInverse) {
+    stableRadixSortOrder(order, [
+      { keyAt: (track) => birthSegments[track], byteCount: 2 },
+      { keyAt: (track) => codes[track], byteCount: 4 },
+    ]);
+  } else {
+    order.sort((a, b) => codes[a] - codes[b] || birthSegments[a] - birthSegments[b] || a - b);
+  }
   const oldToNew = new Int32Array(permanent.slotCount);
   oldToNew.fill(-1);
   order.forEach((oldTrack, newTrack) => { oldToNew[oldTrack] = newTrack; });
+  if (options.sparseInverse) {
+    const shared = options.sharedArrays && typeof SharedArrayBuffer !== 'undefined';
+    const allocateInt32 = (length) => new Int32Array(shared
+      ? new SharedArrayBuffer(length * Int32Array.BYTES_PER_ELEMENT)
+      : new ArrayBuffer(length * Int32Array.BYTES_PER_ELEMENT));
+    const activeLocals = permanent.maps.map((map) => {
+      let activeCount = 0;
+      for (let local = 0; local < map.length; local += 1) {
+        if (oldToNew[map[local]] >= 0) activeCount += 1;
+      }
+      const locals = allocateInt32(activeCount);
+      let destination = 0;
+      for (let local = 0; local < map.length; local += 1) {
+        if (oldToNew[map[local]] >= 0) locals[destination++] = local;
+      }
+      stableRadixSortOrder(locals, [
+        { keyAt: (local) => oldToNew[map[local]], byteCount: 4 },
+      ]);
+      return locals;
+    });
+    const activeSlots = activeLocals.map((locals, segmentIndex) => {
+      const slots = allocateInt32(locals.length);
+      const map = permanent.maps[segmentIndex];
+      for (let row = 0; row < locals.length; row += 1) slots[row] = oldToNew[map[locals[row]]];
+      return slots;
+    });
+    // #WDD-gpt 2026-09-19 - 稀疏布局按 activeSlots 同序保存 local，仅占 O(总点数)，不再分配 segmentCount × slotCount 反表。
+    const retainRemap = options.retainRemap !== false;
+    return {
+      slotCount: order.length,
+      trackCount: order.length,
+      sourcePermanentTrackCount: permanent.slotCount,
+      droppedTrackCount: permanent.slotCount - order.length,
+      maps: [],
+      slotToLocal: [],
+      activeSlots,
+      activeLocals,
+      order: retainRemap ? order : new Int32Array(0),
+      oldToNew: retainRemap ? oldToNew : new Int32Array(0),
+      continuedLocal: retainRemap ? permanent.continuedLocal : [],
+      matches: permanent.matches,
+    };
+  }
   const maps = permanent.maps.map((map) => {
     const result = new Int32Array(map.length);
     result.fill(-1);
@@ -385,6 +473,7 @@ export function buildCroppedMortonLayout(segments, permanent, center, halfExtent
     maps,
     slotToLocal,
     activeSlots,
+    activeLocals: [],
     order,
     oldToNew,
     continuedLocal: permanent.continuedLocal,
@@ -414,17 +503,26 @@ function exceptionRecords(bytes) {
   return result;
 }
 
-function finishExceptions(records) {
-  const writer = new ByteWriter();
-  writer.uint(records.length);
-  let previous = 0;
-  for (const record of records) {
-    writer.uint(record.ordinal - previous);
-    writer.byte(record.bits.length);
-    for (const value of record.bits) writer.ushort(value);
-    previous = record.ordinal;
+class ExceptionWriter {
+  constructor() {
+    this.body = new ByteWriter();
+    this.count = 0;
+    this.previousOrdinal = 0;
   }
-  return writer.finish();
+
+  add(ordinal, bits) {
+    this.body.uint(ordinal - this.previousOrdinal);
+    this.body.byte(bits.length);
+    for (const value of bits) this.body.ushort(value);
+    this.previousOrdinal = ordinal;
+    this.count += 1;
+  }
+
+  finish() {
+    const header = new ByteWriter();
+    header.uint(this.count);
+    return Buffer.concat([header.finish(), this.body.finish()]);
+  }
 }
 
 function quantizedPosition(position, origin, step) {
@@ -446,7 +544,8 @@ export function encodePositionRaw(segments, layout, bankCounts, options) {
   const stateY = new Int32Array(layout.slotCount);
   const stateZ = new Int32Array(layout.slotCount);
   const initialized = new Uint8Array(layout.slotCount);
-  const exceptions = [];
+  // #WDD-gpt 2026-09-19 - Position 修正直接写分块字节流，避免高修正率时保留数百万对象与 bits 数组。
+  const exceptions = new ExceptionWriter();
   let ordinal = 0;
   let squaredError = 0;
   let maximumObservedError = 0;
@@ -455,7 +554,8 @@ export function encodePositionRaw(segments, layout, bankCounts, options) {
   for (let segmentIndex = 0; segmentIndex < segments.length; segmentIndex += 1) {
     const segment = segments[segmentIndex];
     const active = layout.activeSlots[segmentIndex];
-    const inverse = layout.slotToLocal[segmentIndex];
+    const activeLocals = layout.activeLocals?.[segmentIndex];
+    const inverse = activeLocals ? null : layout.slotToLocal[segmentIndex];
     const stride = segment.propertyNames.length;
     for (let bank = 0; bank < bankCounts[segmentIndex]; bank += 1) {
       const current = new Int32Array(active.length * 3);
@@ -466,7 +566,7 @@ export function encodePositionRaw(segments, layout, bankCounts, options) {
       const [indexX, indexY, indexZ] = indices[segmentIndex][bank];
       for (let row = 0; row < active.length; row += 1) {
         const slot = active[row];
-        const local = inverse[slot];
+        const local = activeLocals ? activeLocals[row] : inverse[slot];
         const sourceBase = local * stride;
         const sourceBitsX = segment.rows[sourceBase + indexX];
         const sourceBitsY = segment.rows[sourceBase + indexY];
@@ -494,7 +594,7 @@ export function encodePositionRaw(segments, layout, bankCounts, options) {
         squaredError += error * error;
         maximumObservedError = Math.max(maximumObservedError, error);
         if (!Number.isFinite(error) || error > maximumError) {
-          exceptions.push({ ordinal: ordinal + row, bits: [sourceBitsX, sourceBitsY, sourceBitsZ] });
+          exceptions.add(ordinal + row, [sourceBitsX, sourceBitsY, sourceBitsZ]);
         }
       }
       const globalX = globalCount ? Math.round(globalSumX / globalCount) : 0;
@@ -573,7 +673,7 @@ export function encodePositionRaw(segments, layout, bankCounts, options) {
     }
   }
   const mainRaw = main.finish();
-  const exceptionRaw = finishExceptions(exceptions);
+  const exceptionRaw = exceptions.finish();
   return {
     mainRaw,
     exceptionRaw,
@@ -584,7 +684,7 @@ export function encodePositionRaw(segments, layout, bankCounts, options) {
       hardMaximumEuclideanError: maximumError,
       measuredRmse: Math.sqrt(squaredError / ordinal),
       measuredMaximumEuclideanError: maximumObservedError,
-      exceptionCount: exceptions.length,
+      exceptionCount: exceptions.count,
       mainRawBytes: mainRaw.length,
       exceptionRawBytes: exceptionRaw.length,
       cellSize,
@@ -671,6 +771,9 @@ export function decodePositionContextStreams(contexts, manifest, activeSlots, ro
   const { center, halfExtent, step, cellSize } = manifest.prs.position;
   const origin = center.map((value) => value - halfExtent);
   const cellQuant = Math.max(1, Math.round(cellSize / step));
+  // #WDD-gpt 2026-09-20 - 常见量化坐标预建逐位相同的 FP16 查表，范围外仍走原转换，限制额外内存。
+  const lookupCount = Math.min(262144, Math.max(0, Math.ceil(halfExtent * 2 / step) + 2));
+  const halfLookup = origin.map(value => Uint16Array.from({ length: lookupCount }, (_, q) => floatToHalf(value + q * step)));
   const stateX = new Int32Array(manifest.slotCount);
   const stateY = new Int32Array(manifest.slotCount);
   const stateZ = new Int32Array(manifest.slotCount);
@@ -701,6 +804,11 @@ export function decodePositionContextStreams(contexts, manifest, activeSlots, ro
         key += metadata.uint();
         cells.set(key, readTriple(metadata));
       }
+      // 稀疏元数据转成有界稠密查表；超范围 key 仍保留 Map 路径。
+      const denseCells = key >= 0 && key < 262144 ? new Float64Array((key + 1) * 3) : null;
+      if (denseCells) for (const [cellKey, cell] of cells) {
+        if (cellKey >= 0 && cellKey <= key) { denseCells[cellKey * 3] = cell[0]; denseCells[cellKey * 3 + 1] = cell[1]; denseCells[cellKey * 3 + 2] = cell[2]; }
+      }
       let birthX = 0;
       let birthY = 0;
       let birthZ = 0;
@@ -728,10 +836,16 @@ export function decodePositionContextStreams(contexts, manifest, activeSlots, ro
           const cellKey = Math.floor(stateX[slot] / cellQuant)
             + Math.floor(stateY[slot] / cellQuant) * 32
             + Math.floor(stateZ[slot] / cellQuant) * 1024;
-          const cell = cells.get(cellKey);
-          quantizedX = stateX[slot] + globalX + (cell?.[0] ?? 0) + residualX;
-          quantizedY = stateY[slot] + globalY + (cell?.[1] ?? 0) + residualY;
-          quantizedZ = stateZ[slot] + globalZ + (cell?.[2] ?? 0) + residualZ;
+          if (denseCells && cellKey >= 0 && cellKey * 3 < denseCells.length) {
+            quantizedX = stateX[slot] + globalX + denseCells[cellKey * 3] + residualX;
+            quantizedY = stateY[slot] + globalY + denseCells[cellKey * 3 + 1] + residualY;
+            quantizedZ = stateZ[slot] + globalZ + denseCells[cellKey * 3 + 2] + residualZ;
+          } else {
+            const cell = cells.get(cellKey);
+            quantizedX = stateX[slot] + globalX + (cell?.[0] ?? 0) + residualX;
+            quantizedY = stateY[slot] + globalY + (cell?.[1] ?? 0) + residualY;
+            quantizedZ = stateZ[slot] + globalZ + (cell?.[2] ?? 0) + residualZ;
+          }
         } else {
           quantizedX = (hasBirth ? birthX : 0) + residualX;
           quantizedY = (hasBirth ? birthY : 0) + residualY;
@@ -746,9 +860,9 @@ export function decodePositionContextStreams(contexts, manifest, activeSlots, ro
         stateY[slot] = quantizedY;
         stateZ[slot] = quantizedZ;
         const output = row * stride;
-        rowValues[output + propertyX] = exception?.[0] ?? floatToHalf(origin[0] + quantizedX * step);
-        rowValues[output + propertyY] = exception?.[1] ?? floatToHalf(origin[1] + quantizedY * step);
-        rowValues[output + propertyZ] = exception?.[2] ?? floatToHalf(origin[2] + quantizedZ * step);
+        rowValues[output + propertyX] = exception?.[0] ?? (quantizedX >= 0 && quantizedX < lookupCount ? halfLookup[0][quantizedX] : floatToHalf(origin[0] + quantizedX * step));
+        rowValues[output + propertyY] = exception?.[1] ?? (quantizedY >= 0 && quantizedY < lookupCount ? halfLookup[1][quantizedY] : floatToHalf(origin[1] + quantizedY * step));
+        rowValues[output + propertyZ] = exception?.[2] ?? (quantizedZ >= 0 && quantizedZ < lookupCount ? halfLookup[2][quantizedZ] : floatToHalf(origin[2] + quantizedZ * step));
         initialized[slot] = 1;
         ordinal += 1;
       }
@@ -823,11 +937,13 @@ export function encodeRotations(segments, layout, bankCounts, options) {
   for (let segmentIndex = 0; segmentIndex < segments.length; segmentIndex += 1) {
     const segment = segments[segmentIndex];
     const active = layout.activeSlots[segmentIndex];
-    const inverse = layout.slotToLocal[segmentIndex];
+    const activeLocals = layout.activeLocals?.[segmentIndex];
+    const inverse = activeLocals ? null : layout.slotToLocal[segmentIndex];
     const stride = segment.propertyNames.length;
     for (let bank = 0; bank < bankCounts[segmentIndex]; bank += 1) {
-      for (const slot of active) {
-        const local = inverse[slot];
+      for (let row = 0; row < active.length; row += 1) {
+        const slot = active[row];
+        const local = activeLocals ? activeLocals[row] : inverse[slot];
         const base = local * stride;
         const source = indices[segmentIndex][bank].map((index) => halfToFloat(segment.rows[base + index]));
         const quantized = quantizeQuaternion(source, bits);
@@ -860,7 +976,7 @@ export function encodeRotations(segments, layout, bankCounts, options) {
   largestState = new Uint8Array(layout.slotCount);
   codeState = [new Uint16Array(layout.slotCount), new Uint16Array(layout.slotCount), new Uint16Array(layout.slotCount)];
   initialized = new Uint8Array(layout.slotCount);
-  const exceptions = [];
+  const exceptions = new ExceptionWriter();
   let ordinal = 0;
   let squaredAngle = 0;
   let maximumAngle = 0;
@@ -874,12 +990,13 @@ export function encodeRotations(segments, layout, bankCounts, options) {
   for (let segmentIndex = 0; segmentIndex < segments.length; segmentIndex += 1) {
     const segment = segments[segmentIndex];
     const active = layout.activeSlots[segmentIndex];
-    const inverse = layout.slotToLocal[segmentIndex];
+    const activeLocals = layout.activeLocals?.[segmentIndex];
+    const inverse = activeLocals ? null : layout.slotToLocal[segmentIndex];
     const stride = segment.propertyNames.length;
     for (let bank = 0; bank < bankCounts[segmentIndex]; bank += 1) {
       for (let row = 0; row < active.length; row += 1) {
         const slot = active[row];
-        const local = inverse[slot];
+        const local = activeLocals ? activeLocals[row] : inverse[slot];
         const base = local * stride;
         const source = indices[segmentIndex][bank].map((index) => halfToFloat(segment.rows[base + index]));
         const quantized = quantizeQuaternion(source, bits);
@@ -898,7 +1015,7 @@ export function encodeRotations(segments, layout, bankCounts, options) {
         squaredAngle += angle * angle;
         maximumAngle = Math.max(maximumAngle, angle);
         if (!Number.isFinite(angle) || angle > options.maximumAngleDegrees) {
-          exceptions.push({ ordinal, bits: indices[segmentIndex][bank].map((index) => segment.rows[base + index]) });
+          exceptions.add(ordinal, indices[segmentIndex][bank].map((index) => segment.rows[base + index]));
         }
         largestState[slot] = quantized.largest;
         for (let axis = 0; axis < 3; axis += 1) codeState[axis][slot] = quantized.codes[axis];
@@ -908,7 +1025,7 @@ export function encodeRotations(segments, layout, bankCounts, options) {
     }
   }
   const mainRaw = main.finish();
-  const exceptionRaw = finishExceptions(exceptions);
+  const exceptionRaw = exceptions.finish();
   const encoded = entropyPair('Q3DPR001', mainRaw, exceptionRaw);
   return {
     encoded,
@@ -918,7 +1035,7 @@ export function encodeRotations(segments, layout, bankCounts, options) {
       hardMaximumAngleDegrees: options.maximumAngleDegrees,
       measuredAngularRmseDegrees: Math.sqrt(squaredAngle / ordinal),
       measuredMaximumAngleDegrees: maximumAngle,
-      exceptionCount: exceptions.length,
+      exceptionCount: exceptions.count,
       learnedResidualDictionaryEntries: dictionary.length,
       mainRawBytes: mainRaw.length,
       exceptionRawBytes: exceptionRaw.length,
@@ -989,13 +1106,15 @@ export function encodeScales(segments, layout, bankCounts, options) {
   for (let segmentIndex = 0; segmentIndex < segments.length; segmentIndex += 1) {
     const segment = segments[segmentIndex];
     const active = layout.activeSlots[segmentIndex];
-    const inverse = layout.slotToLocal[segmentIndex];
+    const activeLocals = layout.activeLocals?.[segmentIndex];
+    const inverse = activeLocals ? null : layout.slotToLocal[segmentIndex];
     const stride = segment.propertyNames.length;
     for (let bank = 0; bank < bankCounts[segmentIndex]; bank += 1) {
       let birth = [0, 0, 0];
       let hasBirth = false;
-      for (const slot of active) {
-        const local = inverse[slot];
+      for (let row = 0; row < active.length; row += 1) {
+        const slot = active[row];
+        const local = activeLocals ? activeLocals[row] : inverse[slot];
         const base = local * stride;
         const quantized = indices[segmentIndex][bank].map((index) => Math.round(halfToFloat(segment.rows[base + index]) / options.step));
         const residual = quantized.map((value, axis) => value - (initialized[slot] ? state[axis][slot] : hasBirth ? birth[axis] : 0));
@@ -1028,7 +1147,7 @@ export function encodeScales(segments, layout, bankCounts, options) {
   const main = new ByteWriter();
   state = [new Int32Array(layout.slotCount), new Int32Array(layout.slotCount), new Int32Array(layout.slotCount)];
   initialized = new Uint8Array(layout.slotCount);
-  const exceptions = [];
+  const exceptions = new ExceptionWriter();
   let ordinal = 0;
   let squaredError = 0;
   let maximumError = 0;
@@ -1042,14 +1161,15 @@ export function encodeScales(segments, layout, bankCounts, options) {
   for (let segmentIndex = 0; segmentIndex < segments.length; segmentIndex += 1) {
     const segment = segments[segmentIndex];
     const active = layout.activeSlots[segmentIndex];
-    const inverse = layout.slotToLocal[segmentIndex];
+    const activeLocals = layout.activeLocals?.[segmentIndex];
+    const inverse = activeLocals ? null : layout.slotToLocal[segmentIndex];
     const stride = segment.propertyNames.length;
     for (let bank = 0; bank < bankCounts[segmentIndex]; bank += 1) {
       let birth = [0, 0, 0];
       let hasBirth = false;
       for (let row = 0; row < active.length; row += 1) {
         const slot = active[row];
-        const local = inverse[slot];
+        const local = activeLocals ? activeLocals[row] : inverse[slot];
         const base = local * stride;
         const source = indices[segmentIndex][bank].map((index) => halfToFloat(segment.rows[base + index]));
         const quantized = source.map((value) => Math.round(value / options.step));
@@ -1070,7 +1190,7 @@ export function encodeScales(segments, layout, bankCounts, options) {
         squaredError += decoded.reduce((sum, value, axis) => sum + (value - source[axis]) ** 2, 0);
         maximumError = Math.max(maximumError, error);
         if (!Number.isFinite(error) || error > options.maximumLogError) {
-          exceptions.push({ ordinal, bits: indices[segmentIndex][bank].map((index) => segment.rows[base + index]) });
+          exceptions.add(ordinal, indices[segmentIndex][bank].map((index) => segment.rows[base + index]));
         }
         for (let axis = 0; axis < 3; axis += 1) state[axis][slot] = quantized[axis];
         initialized[slot] = 1;
@@ -1079,7 +1199,7 @@ export function encodeScales(segments, layout, bankCounts, options) {
     }
   }
   const mainRaw = main.finish();
-  const exceptionRaw = finishExceptions(exceptions);
+  const exceptionRaw = exceptions.finish();
   const encoded = entropyPair('S3DPR001', mainRaw, exceptionRaw);
   return {
     encoded,
@@ -1090,7 +1210,7 @@ export function encodeScales(segments, layout, bankCounts, options) {
       measuredRmse: Math.sqrt(squaredError / (ordinal * 3)),
       measuredMaximumLogError: maximumError,
       measuredMaximumRelativeLinearError: Math.expm1(maximumError),
-      exceptionCount: exceptions.length,
+      exceptionCount: exceptions.count,
       learnedResidualDictionaryEntries: dictionary.length,
       mainRawBytes: mainRaw.length,
       exceptionRawBytes: exceptionRaw.length,

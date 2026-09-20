@@ -206,9 +206,9 @@ const zh = {
   modeCustom: '自定义',
   autoBudgetNote: '内存按浏览器可见上限；WebGPU 不提供总显存容量，8GB 是应用预算上限。',
   forceSortSync: '强制排序',
-  // #WDD-gpt 2026-09-09 - v3.0.121 改为单一 WebGL 画布内原子提交，不再描述已移除的跨 Canvas 覆盖层。
-  forceSortSyncTip: '默认开启：播放和拖动都会连续提交实际帧；CPU 深度排序保持单飞，目标几何与排序结果在同一次 WebGL 更新内提交。排序慢于目标帧率时会自动按真实吞吐降速。',
-  forceSortSyncActiveNote: '已开启正确性优先：拖动中画面按排序吞吐持续变化，每次只显示几何与深度顺序匹配的完整帧。',
+  // #WDD-gpt 2026-09-09 - v3.0.122 改为完整帧串行提交，不再声称依赖私有引擎时序的原子提交。
+  forceSortSyncTip: '默认开启：播放和拖动都会连续提交实际帧；CPU 深度排序保持单飞，每次完整帧绘制后才提交最新排队帧。排序慢于目标帧率时会自动按真实吞吐降速。',
+  forceSortSyncActiveNote: '已开启正确性优先：拖动中画面按排序吞吐持续变化，当前帧完成排序与绘制后才推进到最新目标。',
   forceSortSyncInactiveNote: '已开启流畅播放：播放和拖动按输入连续切帧，快速运动可能短暂使用旧遮挡顺序。',
   mobileBudgetNote: '手机自动启用：单 Loader Worker、1× 像素密度、WebGL2 滑动关键帧纹理，并关闭未来片段 GPU 预取。',
   localMaximumActiveNote: '已启用全片段并行驻留：系统内存预算 32GB，显存缓存预算 12GB。',
@@ -542,9 +542,9 @@ const en: UiCopy = {
   modeCustom: 'Custom',
   autoBudgetNote: 'RAM uses the highest browser-visible limit. WebGPU cannot report total VRAM; 8GB is the app budget cap.',
   forceSortSync: 'Force sorted frames',
-  // #WDD-gpt 2026-09-09 - Keep the force-sort explanation aligned with the single-canvas atomic commit path.
-  forceSortSyncTip: 'On by default: playback and scrubbing continuously submit real frames. CPU depth sorting stays single-flight, and target geometry plus its sort result commit in one WebGL update. Playback follows actual sort throughput when sorting is slower than the target rate.',
-  forceSortSyncActiveNote: 'Correctness-first mode is on: scrubbing updates at sort throughput and only complete frames with matching geometry and depth order are shown.',
+  // #WDD-gpt 2026-09-09 - Keep the force-sort explanation aligned with complete-frame serial submission in v3.0.122.
+  forceSortSyncTip: 'On by default: playback and scrubbing continuously submit real frames. CPU depth sorting stays single-flight, and the newest queued frame submits only after the current complete frame is drawn. Playback follows actual sort throughput when sorting is slower than the target rate.',
+  forceSortSyncActiveNote: 'Correctness-first mode is on: scrubbing follows sort throughput, and the newest target advances only after the current frame finishes sorting and drawing.',
   forceSortSyncInactiveNote: 'Smooth mode is on: playback and scrubbing update continuously, but fast motion can briefly use stale occlusion order.',
   mobileBudgetNote: 'Automatically used on phones: one loader worker, 1× pixel ratio, sliding WebGL2 keyframe textures, and no future-segment GPU prefetch.',
   localMaximumActiveNote: 'All-segment parallel residency is active with a 32GB RAM budget and a 12GB VRAM cache budget.',

@@ -193,7 +193,7 @@ function decodeMixRqTrack(raw, manifest, activeSlots, prefix, components, bankKe
 
 function decodeSharedSh(raw, manifest, activeSlots, rows, indices) {
   const magic = raw.subarray(0, 8).toString('ascii');
-  if (magic !== 'C5T1SH01' && magic !== 'C5T2SH01') throw new Error('Unsupported shared SH trajectory stream.');
+  if (magic !== 'C5T1SH01' && magic !== 'C5T2SH01' && magic !== 'C5T3SH01') throw new Error('Unsupported shared SH trajectory stream.');
   const slotCount = raw.readUInt32LE(8);
   const instanceCount = raw.readUInt32LE(12);
   const segmentCount = raw.readUInt16LE(16);
@@ -202,19 +202,20 @@ function decodeSharedSh(raw, manifest, activeSlots, rows, indices) {
   const baseBytes = raw.readUInt32LE(20);
   const maskBytes = raw.readUInt32LE(24);
   const labelBytes = raw.readUInt32LE(28);
-  const headerBytes = magic === 'C5T2SH01' ? 40 : 32;
-  const exceptionMaskBytes = magic === 'C5T2SH01' ? raw.readUInt32LE(32) : 0;
-  const exceptionValueBytes = magic === 'C5T2SH01' ? raw.readUInt32LE(36) : 0;
-  if (slotCount !== manifest.slotCount || segmentCount !== manifest.segments.length || dimensions !== 45
+  const hasExceptions = magic !== 'C5T1SH01';
+  const headerBytes = hasExceptions ? 40 : 32;
+  const exceptionMaskBytes = hasExceptions ? raw.readUInt32LE(32) : 0;
+  const exceptionValueBytes = hasExceptions ? raw.readUInt32LE(36) : 0;
+  if (slotCount !== manifest.slotCount || segmentCount !== manifest.segments.length || ![9, 24, 45].includes(dimensions)
     || levels < 1 || levels > 32 || (magic === 'C5T1SH01' && levels !== 5)
-    || baseBytes !== 45 * 2 + levels * 256 * 45 * 2) {
+    || baseBytes !== dimensions * 2 + levels * 256 * dimensions * 2) {
     throw new Error('Shared CoReSH-5R metadata mismatch.');
   }
   const baseOffset = headerBytes;
-  const mean = new Float32Array(45);
-  for (let dimension = 0; dimension < 45; dimension += 1) mean[dimension] = halfToFloat(raw.readUInt16LE(baseOffset + dimension * 2));
-  const codebookOffset = baseOffset + 45 * 2;
-  const codebooks = new Float32Array(levels * 256 * 45);
+  const mean = new Float32Array(dimensions);
+  for (let dimension = 0; dimension < dimensions; dimension += 1) mean[dimension] = halfToFloat(raw.readUInt16LE(baseOffset + dimension * 2));
+  const codebookOffset = baseOffset + dimensions * 2;
+  const codebooks = new Float32Array(levels * 256 * dimensions);
   for (let index = 0; index < codebooks.length; index += 1) codebooks[index] = halfToFloat(raw.readUInt16LE(codebookOffset + index * 2));
   const maskOffset = baseOffset + baseBytes;
   const labelOffset = maskOffset + maskBytes;
@@ -222,14 +223,15 @@ function decodeSharedSh(raw, manifest, activeSlots, rows, indices) {
   const exceptionValueOffset = exceptionMaskOffset + exceptionMaskBytes;
   const updateMask = inflateSync(raw.subarray(maskOffset, labelOffset));
   const updates = inflateSync(raw.subarray(labelOffset, exceptionMaskOffset));
-  const exceptionMask = magic === 'C5T2SH01'
+  const exceptionMask = hasExceptions
     ? inflateSync(raw.subarray(exceptionMaskOffset, exceptionValueOffset))
     : new Uint8Array(Math.ceil(instanceCount / 8));
-  const exceptionValues = magic === 'C5T2SH01'
+  const storedExceptionValues = hasExceptions
     ? inflateSync(raw.subarray(exceptionValueOffset, exceptionValueOffset + exceptionValueBytes))
     : new Uint8Array(0);
+  const exceptionValues = magic === 'C5T3SH01' ? unshuffle16(storedExceptionValues) : storedExceptionValues;
   if (updateMask.length !== Math.ceil(instanceCount / 8) || updates.length % levels !== 0
-    || exceptionMask.length !== Math.ceil(instanceCount / 8) || exceptionValues.length % (45 * 2) !== 0
+    || exceptionMask.length !== Math.ceil(instanceCount / 8) || exceptionValues.length % (dimensions * 2) !== 0
     || exceptionValueOffset + exceptionValueBytes !== raw.length) {
     throw new Error('Shared SH compressed payload length mismatch.');
   }
@@ -250,13 +252,13 @@ function decodeSharedSh(raw, manifest, activeSlots, rows, indices) {
         updateOffset += levels;
       }
       if (!initialized[slot]) throw new Error(`Missing SH initialization for Track ID ${slot}.`);
-      for (let dimension = 0; dimension < 45; dimension += 1) {
+      for (let dimension = 0; dimension < dimensions; dimension += 1) {
         let value = mean[dimension];
-        for (let level = 0; level < levels; level += 1) value += codebooks[(level * 256 + state[stateOffset + level]) * 45 + dimension];
+        for (let level = 0; level < levels; level += 1) value += codebooks[(level * 256 + state[stateOffset + level]) * dimensions + dimension];
         rowValues[row * rowStride + indices[segmentIndex].get(`f_rest_${dimension}`)] = floatToHalf(value);
       }
       if (exceptionMask[instance >>> 3] & (1 << (instance & 7))) {
-        for (let dimension = 0; dimension < 45; dimension += 1) {
+        for (let dimension = 0; dimension < dimensions; dimension += 1) {
           rowValues[row * rowStride + indices[segmentIndex].get(`f_rest_${dimension}`)]
             = exceptionValues[exceptionOffset] | (exceptionValues[exceptionOffset + 1] << 8);
           exceptionOffset += 2;
@@ -268,7 +270,7 @@ function decodeSharedSh(raw, manifest, activeSlots, rows, indices) {
   if (instance !== instanceCount || updateOffset !== updates.length || exceptionOffset !== exceptionValues.length) {
     throw new Error('Shared SH trajectory decode length mismatch.');
   }
-  return { instanceCount, updateCount: updateOffset / levels, exceptionCount: exceptionOffset / (45 * 2) };
+  return { instanceCount, updateCount: updateOffset / levels, exceptionCount: exceptionOffset / (dimensions * 2) };
 }
 
 function normalizedQuaternion(values) {
@@ -296,6 +298,9 @@ function validateDecoded(sources, sourceLayout, manifest, activeSlots, rows, ind
   let colorDcSquare = 0;
   let colorDcCount = 0;
   let colorDcMaximum = 0;
+  let shSquare = 0;
+  let shCount = 0;
+  let shMaximum = 0;
   let opacitySquare = 0;
   let opacityCount = 0;
   let opacityMaximum = 0;
@@ -350,6 +355,17 @@ function validateDecoded(sources, sourceLayout, manifest, activeSlots, rows, ind
           colorDcCount += 1;
         }
       }
+      // #WDD-gpt 2026-09-20 - V2.6 CoReSH 必须与源 FP16 逐系数统计 RMSE 和最大误差，稀疏例外流可解压不代表数值一定正确。
+      const shDimensions = manifest.compressionV26?.shPolicy?.dimensions ?? 0;
+      for (let dimension = 0; dimension < shDimensions; dimension += 1) {
+        const name = `f_rest_${dimension}`;
+        const sourceValue = halfToFloat(source.rows[sourceBase + source.propertyIndex.get(name)]);
+        const decodedValue = halfToFloat(decoded[decodedBase + indices[segmentIndex].get(name)]);
+        const error = Math.abs(sourceValue - decodedValue);
+        shSquare += error * error;
+        shMaximum = Math.max(shMaximum, error);
+        shCount += 1;
+      }
       for (let bank = 0; bank < manifest.segments[segmentIndex].bankCounts.opacity; bank += 1) {
         const name = `opacity_bank_${bank}`;
         const sourceBits = source.rows[sourceBase + source.propertyIndex.get(name)];
@@ -374,7 +390,9 @@ function validateDecoded(sources, sourceLayout, manifest, activeSlots, rows, ind
       }
       for (const [name, decodedProperty] of indices[segmentIndex]) {
         if (name.startsWith('xyz_bank_') || name.startsWith('rot_bank_') || name.startsWith('scale_bank_') || name.startsWith('f_rest_')) continue;
-        if ((manifest.mintMixRq?.selected?.colorDc || manifest.mesongsTemporal?.selected?.colorDc || manifest.temporalAttributes?.selected?.colorDc) && name.startsWith('f_dc_bank_')) continue;
+        if ((manifest.mintMixRq?.selected?.colorDc || manifest.mesongsTemporal?.selected?.colorDc
+          || manifest.temporalAttributes?.selected?.colorDc || manifest.compressionV26?.dcPolicy)
+          && name.startsWith('f_dc_bank_')) continue;
         if ((manifest.mintMixRq?.selected?.opacity || manifest.mesongsTemporal?.selected?.opacity) && name.startsWith('opacity_bank_')) continue;
         const sourceProperty = source.propertyIndex.get(name);
         if (decoded[decodedBase + decodedProperty] !== source.rows[sourceBase + sourceProperty]) {
@@ -399,6 +417,15 @@ function validateDecoded(sources, sourceLayout, manifest, activeSlots, rows, ind
   if (manifest.temporalAttributes?.selected?.colorDc && colorDcMaximum > manifest.temporalAttributes.colorDc.measuredMaximumError + 1e-12) {
     throw new Error(`Color DC attribute error bound violated: ${colorDcMaximum}`);
   }
+  if (manifest.compressionV26?.dcPolicy && colorDcMaximum > manifest.compressionV26.dcPolicy.maximumCoefficientError + 1e-12) {
+    throw new Error(`V2.6 Color DC error bound violated: ${colorDcMaximum}`);
+  }
+  const shPolicy = manifest.compressionV26?.shPolicy;
+  const shRmse = shCount > 0 ? Math.sqrt(shSquare / shCount) : 0;
+  if (shPolicy && (shMaximum > shPolicy.maximumCoefficientError + 1e-12
+    || shRmse > Math.max(0.013, shPolicy.measuredRmse) + 1e-6)) {
+    throw new Error(`V2.6 SH error bound violated: rmse ${shRmse}, maximum ${shMaximum}`);
+  }
   if (manifest.mesongsTemporal?.selected?.opacity && opacityMaximum > manifest.mesongsTemporal.opacity.maximumAllowedError) {
     throw new Error(`Opacity temporal alpha error bound violated: ${opacityMaximum}`);
   }
@@ -408,6 +435,7 @@ function validateDecoded(sources, sourceLayout, manifest, activeSlots, rows, ind
     rotation: { observationCount: rotationCount, angularRmseDegrees: Math.sqrt(rotationSquare / rotationCount), maximumAngleDegrees: rotationMaximum },
     scale: { valueCount: scaleCount, rmse: Math.sqrt(scaleSquare / scaleCount), maximumLogError: scaleMaximum },
     colorDc: { valueCount: colorDcCount, rmse: Math.sqrt(colorDcSquare / colorDcCount), maximumError: colorDcMaximum },
+    sharedSh: { valueCount: shCount, rmse: shRmse, maximumCoefficientError: shMaximum },
     opacityAlpha: {
       valueCount: opacityCount,
       rmse: Math.sqrt(opacitySquare / opacityCount),

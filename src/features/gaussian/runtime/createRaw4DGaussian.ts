@@ -1,3 +1,4 @@
+import { Raw4DPreparationClient } from './Raw4DPreparationClient';
 import {
   Application,
   Entity,
@@ -24,6 +25,8 @@ const PREFETCH_GPU_WORK_BYTES_PER_SPLAT = 192;
 
 export interface Raw4DGaussianCreateOptions {
   readonly enabled?: boolean;
+  readonly backgroundPreparation?: boolean;
+  readonly signal?: AbortSignal;
   readonly edits?: GaussianEditStore;
   readonly maxShBands?: number;
   readonly releaseTextureUploadSources?: boolean;
@@ -76,8 +79,8 @@ export interface Raw4DGaussian {
   refreshSourceData(): Promise<void>;
   /** 强制排序路径：只上传数据并刷新排序中心，不切换显示帧。返回钳制后的帧号。 */
   prepareFrame(frame: number): number;
-  /** 丢弃尚未进入 WebGL WorkBuffer 的严格帧。 */
-  cancelPreparedFrame(): void;
+  /** 强制排序路径：排序提交后切换显示帧 uniform。 */
+  revealFrame(frame: number): void;
   setFrame(frame: number): void;
   dispose(): void;
 }
@@ -88,6 +91,7 @@ export async function createRaw4DGaussian(
   gpuPool: GpuBufferPool,
   options: Raw4DGaussianCreateOptions = {},
 ): Promise<Raw4DGaussian> {
+  const prepStarted = performance.now();
   const canonical = new Raw4DCanonicalDataset(asset);
   // #WDD-gpt 2026-08-16 - 多片段序列注入持久编辑位集，GPU 实体重建时继续使用原选择和删除状态。
   const edits = options.edits ?? new GaussianEditStore(asset.splatCount, canonical.pageSize);
@@ -101,7 +105,14 @@ export async function createRaw4DGaussian(
     asset,
     options.maxShBands,
     options.releaseTextureUploadSources,
+    Boolean(options.backgroundPreparation),
   );
+  const preparation = options.backgroundPreparation ? new Raw4DPreparationClient(options.signal) : undefined;
+  if (preparation) {
+    try { await resource.prepareInWorker(preparation); }
+    catch (error) { preparation.close(); resource.destroy(); throw error; }
+  }
+  const resourceReady = performance.now();
   if (sampler) resource.centers = sampler.centers;
   resource.aabb.setMinMax(new Vec3(...asset.bounds.min), new Vec3(...asset.bounds.max));
 
@@ -121,6 +132,7 @@ export async function createRaw4DGaussian(
       app.graphicsDevice,
       gpuPool,
       {
+        preparation,
         releaseTextureUploadSources: options.releaseTextureUploadSources,
         streamTextureKeyframes: options.streamTextureKeyframes,
       },
@@ -132,8 +144,10 @@ export async function createRaw4DGaussian(
       resource.destroy();
     });
     throw error;
-  }
+  } finally { preparation?.close(); }
 
+  // #WDD-gpt 2026-09-20 - 区分初始资源与时序 GPU 缓冲准备耗时，用完整读取目标审计瓶颈。
+  if (options.backgroundPreparation) console.info(`RAW4D GPU prepare ${JSON.stringify({ backend: app.graphicsDevice.isWebGPU ? 'webgpu' : 'webgl', points: asset.splatCount, resourceMs: resourceReady - prepStarted, temporalMs: performance.now() - resourceReady })}`);
   let disposed = false;
   let currentFrame = 0;
   return {
@@ -163,11 +177,13 @@ export async function createRaw4DGaussian(
       gpuPlayback.setFrame(frame);
     },
     prepareFrame: (frame: number) => {
-      const preparedFrame = gpuPlayback.prepareFrame(frame);
-      currentFrame = preparedFrame;
-      return preparedFrame;
+      currentFrame = frame;
+      return gpuPlayback.prepareFrame(frame);
     },
-    cancelPreparedFrame: () => gpuPlayback.cancelPreparedFrame(),
+    revealFrame: (frame: number) => {
+      currentFrame = frame;
+      gpuPlayback.revealFrame(frame);
+    },
     refreshSourceData: async () => {
       if (disposed) return;
       resource.refreshSourceData();
@@ -180,7 +196,8 @@ export async function createRaw4DGaussian(
       gpuPlayback = await Raw4DGpuPlayback.create(
         entity, resource, sampler, asset, edits, app.graphicsDevice, gpuPool,
         {
-          releaseTextureUploadSources: options.releaseTextureUploadSources,
+          preparation,
+        releaseTextureUploadSources: options.releaseTextureUploadSources,
           streamTextureKeyframes: options.streamTextureKeyframes,
         },
       );

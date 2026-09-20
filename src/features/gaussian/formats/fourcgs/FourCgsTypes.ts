@@ -19,6 +19,7 @@ export interface FourCgsSegment {
   readonly keyframeStrides?: FourCgsKeyframeStrides;
   readonly positionTiming?: 'shared-keyframes' | 'per-point-lifetime-endpoints';
   readonly opacityTiming?: 'lifetime-gated' | 'baked';
+  readonly shBands?: 1 | 2 | 3;
 }
 
 export interface FourCgsStreamEntry {
@@ -143,6 +144,11 @@ export interface FourCgsProgress {
   readonly completedTasks?: number;
   readonly totalTasks?: number;
   readonly elapsedMs?: number;
+}
+
+export interface FourCgsExportOptions {
+  readonly shLevel: 1 | 2 | 3;
+  readonly maximumEffectiveAlpha: number;
 }
 
 export interface FourCgsFrameLocation {

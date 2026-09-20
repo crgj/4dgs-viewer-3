@@ -1,8 +1,9 @@
+import { prepareSharedSh, decodeSharedShPartition, type PreparedSharedSh } from './FourCgsSharedSh';
 /// <reference lib="webworker" />
 
 import { Buffer } from 'buffer';
-import { unzlibSync } from 'fflate';
 import type { FourCgsManifest, FourCgsSegment } from './FourCgsTypes';
+import { fourCgsDecodedPropertyNames } from './FourCgsRaw4D';
 
 type AuxiliaryTask = 'opacity' | 'lifetime' | 'sh';
 
@@ -15,15 +16,7 @@ interface DecodeRequest {
 }
 
 function propertyNames(segment: FourCgsSegment): string[] {
-  const names: string[] = [];
-  for (let bank = 0; bank < segment.bankCounts.position; bank += 1) for (const component of ['x', 'y', 'z']) names.push(`xyz_bank_${bank}_${component}`);
-  for (let bank = 0; bank < segment.bankCounts.rotation; bank += 1) for (const component of ['w', 'x', 'y', 'z']) names.push(`rot_bank_${bank}_${component}`);
-  for (let bank = 0; bank < segment.bankCounts.colorDc; bank += 1) for (const component of ['0', '1', '2']) names.push(`f_dc_bank_${bank}_${component}`);
-  for (let bank = 0; bank < segment.bankCounts.scale; bank += 1) for (const component of ['0', '1', '2']) names.push(`scale_bank_${bank}_${component}`);
-  for (let bank = 0; bank < segment.bankCounts.opacity; bank += 1) names.push(`opacity_bank_${bank}`);
-  names.push('lifetime_mu', 'lifetime_w');
-  for (let coefficient = 0; coefficient < 45; coefficient += 1) names.push(`f_rest_${coefficient}`);
-  return names;
+  return fourCgsDecodedPropertyNames(segment);
 }
 
 function temporalDecode(
@@ -113,118 +106,23 @@ function mixRqTrack(
   }
 }
 
-function decodeSharedSh(
-  raw: Buffer,
-  manifest: FourCgsManifest,
-  activeSlots: readonly Int32Array[],
-  rows: readonly Uint16Array[],
-  indices: readonly Map<string, number>[],
-  halfToFloat: (bits: number) => number,
-  floatToHalf: (value: number) => number,
-): void {
-  const magic = raw.subarray(0, 8).toString('ascii');
-  if (magic !== 'C5T1SH01' && magic !== 'C5T2SH01') throw new Error('不支持的共享 SH 流。');
-  const slotCount = raw.readUInt32LE(8);
-  const instanceCount = raw.readUInt32LE(12);
-  const segmentCount = raw.readUInt16LE(16);
-  const dimensions = raw.readUInt8(18);
-  const levels = raw.readUInt8(19);
-  const baseBytes = raw.readUInt32LE(20);
-  const maskBytes = raw.readUInt32LE(24);
-  const labelBytes = raw.readUInt32LE(28);
-  const headerBytes = magic === 'C5T2SH01' ? 40 : 32;
-  const exceptionMaskBytes = magic === 'C5T2SH01' ? raw.readUInt32LE(32) : 0;
-  const exceptionValueBytes = magic === 'C5T2SH01' ? raw.readUInt32LE(36) : 0;
-  if (slotCount !== manifest.slotCount || segmentCount !== manifest.segments.length || dimensions !== 45
-    || levels < 1 || levels > 32 || (magic === 'C5T1SH01' && levels !== 5)
-    || baseBytes !== 45 * 2 + levels * 256 * 45 * 2) {
-    throw new Error('4CGS 共享 SH 元数据不一致。');
-  }
-  const baseOffset = headerBytes;
-  const mean = new Float32Array(45);
-  for (let dimension = 0; dimension < 45; dimension += 1) mean[dimension] = halfToFloat(raw.readUInt16LE(baseOffset + dimension * 2));
-  const codebookOffset = baseOffset + 45 * 2;
-  const codebooks = new Float32Array(levels * 256 * 45);
-  for (let index = 0; index < codebooks.length; index += 1) codebooks[index] = halfToFloat(raw.readUInt16LE(codebookOffset + index * 2));
-  const maskOffset = baseOffset + baseBytes;
-  const labelOffset = maskOffset + maskBytes;
-  const exceptionMaskOffset = labelOffset + labelBytes;
-  const exceptionValueOffset = exceptionMaskOffset + exceptionMaskBytes;
-  const updateMask = unzlibSync(raw.subarray(maskOffset, labelOffset));
-  const updates = unzlibSync(raw.subarray(labelOffset, exceptionMaskOffset));
-  const exceptionMask = magic === 'C5T2SH01'
-    ? unzlibSync(raw.subarray(exceptionMaskOffset, exceptionValueOffset))
-    : new Uint8Array(Math.ceil(instanceCount / 8));
-  const exceptionValues = magic === 'C5T2SH01'
-    ? unzlibSync(raw.subarray(exceptionValueOffset, exceptionValueOffset + exceptionValueBytes))
-    : new Uint8Array(0);
-  if (updateMask.byteLength !== Math.ceil(instanceCount / 8) || updates.byteLength % levels !== 0
-    || exceptionMask.byteLength !== Math.ceil(instanceCount / 8) || exceptionValues.byteLength % (45 * 2) !== 0
-    || exceptionValueOffset + exceptionValueBytes !== raw.byteLength) {
-    throw new Error('4CGS 共享 SH 压缩载荷长度不一致。');
-  }
-  const state = new Uint8Array(slotCount * levels);
-  const initialized = new Uint8Array(slotCount);
-  const decodedSh = new Uint16Array(slotCount * 45);
-  const restOffsets = indices.map((properties, segmentIndex) => {
-    const first = properties.get('f_rest_0');
-    if (first === undefined) throw new Error(`4CGS 第 ${segmentIndex + 1} 段缺少 SH 属性。`);
-    for (let dimension = 1; dimension < 45; dimension += 1) {
-      if (properties.get(`f_rest_${dimension}`) !== first + dimension) throw new Error(`4CGS 第 ${segmentIndex + 1} 段 SH 属性不连续。`);
-    }
-    return first;
-  });
-  let instance = 0;
-  let updateOffset = 0;
-  let exceptionOffset = 0;
-  // #WDD-gpt 2026-08-16 - 共享 SH 解码支持输入自训练的 5/10/15 级模板及逐实例稀疏 FP16 质量修正。
-  for (let segmentIndex = 0; segmentIndex < manifest.segments.length; segmentIndex += 1) {
-    const stride = indices[segmentIndex].size;
-    const rowValues = rows[segmentIndex];
-    const restOffset = restOffsets[segmentIndex];
-    for (let row = 0; row < activeSlots[segmentIndex].length; row += 1) {
-      const slot = activeSlots[segmentIndex][row];
-      const stateOffset = slot * levels;
-      const shOffset = slot * 45;
-      const rowOffset = row * stride + restOffset;
-      const updated = (updateMask[instance >>> 3] & (1 << (instance & 7))) !== 0;
-      if (updated) {
-        state.set(updates.subarray(updateOffset, updateOffset + levels), stateOffset);
-        initialized[slot] = 1;
-        updateOffset += levels;
-      }
-      if (!initialized[slot]) throw new Error(`4CGS Track ${slot} 缺少 SH 初始化。`);
-      if (updated) {
-        for (let dimension = 0; dimension < 45; dimension += 1) {
-          let value = mean[dimension];
-          for (let level = 0; level < levels; level += 1) {
-            value += codebooks[(level * 256 + state[stateOffset + level]) * 45 + dimension];
-          }
-          const bits = floatToHalf(value);
-          decodedSh[shOffset + dimension] = bits;
-          rowValues[rowOffset + dimension] = bits;
-        }
-      } else {
-        for (let dimension = 0; dimension < 45; dimension += 1) {
-          rowValues[rowOffset + dimension] = decodedSh[shOffset + dimension];
-        }
-      }
-      if (exceptionMask[instance >>> 3] & (1 << (instance & 7))) {
-        for (let dimension = 0; dimension < 45; dimension += 1) {
-          rowValues[rowOffset + dimension] = exceptionValues[exceptionOffset]
-            | (exceptionValues[exceptionOffset + 1] << 8);
-          exceptionOffset += 2;
-        }
-      }
-      instance += 1;
-    }
-  }
-  if (instance !== instanceCount || updateOffset !== updates.length || exceptionOffset !== exceptionValues.length) {
-    throw new Error('4CGS 共享 SH 长度不一致。');
-  }
+export function decodeSharedSh(raw: Buffer, manifest: FourCgsManifest, activeSlots: readonly Int32Array[], rows: readonly Uint16Array[],
+  indices: readonly Map<string, number>[], halfToFloat: (bits: number) => number, floatToHalf: (value: number) => number): void {
+  decodeSharedShPartition(prepareSharedSh(raw, manifest, halfToFloat), manifest, activeSlots, rows, indices, floatToHalf);
+}
+const shWorkers: Worker[] = [];
+async function decodeShPartitions(prepared: PreparedSharedSh, request: DecodeRequest, count: number) {
+  await Promise.all(Array.from({ length: count }, (_, partitionIndex) => new Promise<void>((resolve, reject) => {
+    const worker = shWorkers.pop() ?? new Worker(new URL('./fourcgs-sh-partition.worker.ts', import.meta.url), { type: 'module' });
+    const finish = (success: boolean) => { worker.onmessage = null; worker.onerror = null; if (success && shWorkers.length < 3) shWorkers.push(worker); else worker.terminate(); };
+    worker.onmessage = ({ data }) => { finish(data.type === 'result'); if (data.type === 'result') resolve(); else reject(new Error(data.message)); };
+    worker.onerror = event => { finish(false); reject(new Error(event.message || 'SH partition worker failed')); };
+    worker.postMessage({ prepared, manifest: request.manifest, activeSlotBuffers: request.activeSlotBuffers,
+      rowBuffers: request.rowBuffers, partitionIndex, partitionCount: count });
+  })));
 }
 
-async function decode(request: DecodeRequest): Promise<void> {
+async function decode(request: DecodeRequest): Promise<number> {
   (globalThis as typeof globalThis & { Buffer: typeof Buffer }).Buffer = Buffer;
   const names = request.manifest.segments.map(propertyNames);
   const indices = names.map((items) => new Map(items.map((name, index) => [name, index])));
@@ -233,12 +131,16 @@ async function decode(request: DecodeRequest): Promise<void> {
   if (request.task === 'lifetime') {
     temporalDecode(new Uint8Array(request.streams.lifetime_mu), request.manifest, activeSlots, request.manifest.segments.map(() => ['lifetime_mu']), rows, indices, request.manifest.losslessEntropy?.temporalModes?.lifetime_mu ?? 'xor');
     temporalDecode(new Uint8Array(request.streams.lifetime_w), request.manifest, activeSlots, request.manifest.segments.map(() => ['lifetime_w']), rows, indices, request.manifest.losslessEntropy?.temporalModes?.lifetime_w ?? 'xor');
-    return;
+    return 1;
   }
   if (request.task === 'sh') {
     const prs = await import('../../../../../scripts/fourcgs-prs-codec.mjs');
-    decodeSharedSh(Buffer.from(request.streams.coresh5r_shared), request.manifest, activeSlots, rows, indices, prs.halfToFloat, prs.floatToHalf);
-    return;
+    const count = globalThis.crossOriginIsolated && typeof SharedArrayBuffer !== 'undefined'
+      && (navigator.hardwareConcurrency || 4) >= 16 && request.manifest.slotCount < 8_000_000 ? 3 : 1;
+    const prepared = prepareSharedSh(Buffer.from(request.streams.coresh5r_shared), request.manifest, prs.halfToFloat, count > 1);
+    if (count > 1) await decodeShPartitions(prepared, request, count);
+    else decodeSharedShPartition(prepared, request.manifest, activeSlots, rows, indices, prs.floatToHalf);
+    return count > 1 ? count + 1 : 1;
   }
   const [mix, scalarRq, temporalRq, opacityHybrid] = await Promise.all([
     import('../../../../../scripts/fourcgs-mixrq-codec.mjs'),
@@ -250,12 +152,13 @@ async function decode(request: DecodeRequest): Promise<void> {
     Buffer.from(request.streams.mixsc_opacity), request.manifest, activeSlots, rows, indices,
     mix.decodeMixRq, mix.decodeMixRqWindows, scalarRq.decodeScalarRq, temporalRq.decodeTemporalRq, opacityHybrid.decodeOpacityHybrid,
   );
+  return 1;
 }
 
 self.addEventListener('message', (event: MessageEvent<DecodeRequest>) => {
   const startedAt = performance.now();
   void decode(event.data).then(
-    () => self.postMessage({ type: 'result', task: event.data.task, elapsedMs: performance.now() - startedAt }),
+    (workerCount) => self.postMessage({ type: 'result', workerCount, task: event.data.task, elapsedMs: performance.now() - startedAt }),
     (error: unknown) => self.postMessage({
       type: 'error',
       task: event.data.task,

@@ -70,6 +70,8 @@ export default defineConfig({
     headers: isolationHeaders,
   },
   build: {
+    // #WDD-gpt 2026-09-19 - 同时发布编辑器与独立 show_dance 播放页。
+    rollupOptions: { input: { index: fileURLToPath(new URL('./index.html', import.meta.url)), show_dance: fileURLToPath(new URL('./show_dance.html', import.meta.url)) } },
     outDir: 'docs',
     emptyOutDir: true,
     sourcemap: true,

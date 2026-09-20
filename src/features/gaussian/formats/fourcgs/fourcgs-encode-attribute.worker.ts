@@ -2,6 +2,10 @@
 
 import { Buffer } from 'buffer';
 import type { FourCgsSegment } from './FourCgsTypes';
+import {
+  compressFourCgsPositionParts,
+  fourCgsPositionEnvelopeWorkerCount,
+} from './FourCgsPositionEnvelope';
 
 type EncodeTask = 'position' | 'rotation' | 'scale0' | 'scale1' | 'scale2' | 'dc';
 
@@ -28,53 +32,6 @@ function transferableBytes(bytes: Uint8Array): ArrayBuffer {
   return copy.buffer;
 }
 
-function positionEnvelopeWorkerCount(): number {
-  const hardwareConcurrency = navigator.hardwareConcurrency || 4;
-  // #WDD-gpt 2026-08-16 - 实测 13980HX 上六路 Brotli 会争抢带宽，24+ 线程仍以四个持久 WASM Worker 获得更短墙钟时间。
-  return hardwareConcurrency >= 12 ? 4 : hardwareConcurrency >= 8 ? 3 : 2;
-}
-
-async function compressPositionParts(
-  parts: readonly Uint8Array[],
-  quality: number,
-): Promise<readonly Uint8Array[]> {
-  const workerCount = Math.min(parts.length, positionEnvelopeWorkerCount());
-  const output = new Array<Uint8Array>(parts.length);
-  let nextPart = 0;
-  const runLane = async (): Promise<void> => {
-    const worker = new Worker(new URL('./fourcgs-brotli-compress.worker.ts', import.meta.url), { type: 'module' });
-    try {
-      for (;;) {
-        const partIndex = nextPart++;
-        if (partIndex >= parts.length) return;
-        const source = new Uint8Array(parts[partIndex].byteLength);
-        source.set(parts[partIndex]);
-        output[partIndex] = await new Promise<Uint8Array>((resolve, reject) => {
-          const onMessage = (event: MessageEvent<{
-            readonly type: 'result' | 'error';
-            readonly requestId: number;
-            readonly bytes?: ArrayBuffer;
-            readonly message?: string;
-          }>) => {
-            if (event.data.requestId !== partIndex) return;
-            worker.removeEventListener('message', onMessage);
-            if (event.data.type === 'error' || !event.data.bytes) reject(new Error(event.data.message ?? 'Position Brotli Worker 失败。'));
-            else resolve(new Uint8Array(event.data.bytes));
-          };
-          worker.addEventListener('message', onMessage);
-          worker.addEventListener('error', (event) => reject(new Error(event.message || 'Position Brotli Worker 崩溃。')), { once: true });
-          worker.postMessage({ requestId: partIndex, bytes: source.buffer, quality }, [source.buffer]);
-        });
-      }
-    } finally {
-      worker.terminate();
-    }
-  };
-  // #WDD-gpt 2026-08-16 - Position 六条上下文由 2~4 个持久 Worker 动态取块，避免每块重复初始化 Brotli WASM。
-  await Promise.all(Array.from({ length: workerCount }, () => runLane()));
-  return output;
-}
-
 async function encode(request: EncodeRequest, onStarted: () => void): Promise<{
   readonly encoded: ArrayBuffer;
   readonly metrics: Record<string, unknown>;
@@ -95,7 +52,13 @@ async function encode(request: EncodeRequest, onStarted: () => void): Promise<{
     const envelopeStartedAt = performance.now();
     const stored = await structuredCodec.encodeV21StructuredStream(
       'prs_position', { mainRaw: result.mainRaw, exceptionRaw: result.exceptionRaw }, { segments: request.descriptors },
-      { blockCompression: 'brotli', brotliQuality: 9, compressPositionParts },
+      {
+        blockCompression: 'brotli',
+        brotliQuality: 9,
+        compressPositionParts: (parts: readonly Uint8Array[], quality: number) => compressFourCgsPositionParts(
+          parts, quality, Number(request.options.envelopeWorkerCount ?? Number.POSITIVE_INFINITY),
+        ),
+      },
     );
     const envelopeMs = performance.now() - envelopeStartedAt;
     // #WDD-gpt 2026-08-16 - 单独记录 Position 预测编码与 Brotli 封装，监督窗口可据此判断下一步该优化算法还是压缩后端。
@@ -105,7 +68,7 @@ async function encode(request: EncodeRequest, onStarted: () => void): Promise<{
         ...result.metrics,
         codecMs,
         envelopeMs,
-        envelopeWorkerCount: positionEnvelopeWorkerCount(),
+        envelopeWorkerCount: fourCgsPositionEnvelopeWorkerCount(Number(request.options.envelopeWorkerCount ?? Number.POSITIVE_INFINITY)),
         skippedTransientRansBytes: result.mainRaw.byteLength + result.exceptionRaw.byteLength,
       },
     };
@@ -152,15 +115,14 @@ self.addEventListener('message', (event: MessageEvent<EncodeRequest>) => {
     started = true;
     self.postMessage({ type: 'started', task: event.data.task });
   };
-  void encode(event.data, reportStarted).then(
-    (result) => self.postMessage({
-      type: 'result', task: event.data.task, ...result, elapsedMs: performance.now() - startedAt,
-    }, [result.encoded]),
-    (error: unknown) => self.postMessage({
+  const reportError = (error: unknown) => self.postMessage({
       type: 'error', task: event.data.task,
       message: error instanceof Error ? error.message : String(error),
-    }),
-  );
+    });
+  // #WDD-gpt 2026-09-19 - 将超大结果 transfer 的同步异常也接回小消息错误通道，禁止父 Worker 永久等待一个已静默失败的结果。
+  void encode(event.data, reportStarted).then((result) => self.postMessage({
+    type: 'result', task: event.data.task, ...result, elapsedMs: performance.now() - startedAt,
+  }, [result.encoded])).catch(reportError);
 });
 
 export {};

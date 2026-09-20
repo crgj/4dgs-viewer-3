@@ -1,3 +1,5 @@
+import type { PreparationTrackRequest, PreparedArray } from './Raw4DPreparation';
+import type { Raw4DPreparationClient } from './Raw4DPreparationClient';
 import {
   ADDRESS_CLAMP_TO_EDGE,
   FILTER_NEAREST,
@@ -17,10 +19,6 @@ import type { Raw4DAsset, Raw4DTrack } from '../formats/raw4d/Raw4DTypes';
 import { readRaw4DScalar, readRaw4DTrack, raw4DScalarBits } from '../formats/raw4d/Raw4DValues';
 import type { GpuBufferAllocation, GpuBufferPool } from '../memory/GpuBufferPool';
 import { KeyframeSlotCache, keyframeRequirements } from './KeyframeSlotCache';
-import {
-  cancelPlayCanvasAtomicWorkBufferCommit,
-  registerPlayCanvasAtomicWorkBufferCommit,
-} from './PlayCanvasSortResultGuard';
 import type { Raw4DSortCenterSampler } from './Raw4DFrameSampler';
 import { createRaw4DGpuMemoryPlan } from './Raw4DGpuMemoryPlan';
 
@@ -686,6 +684,21 @@ function createTrackTexture(
   return texture;
 }
 
+// #WDD-gpt 2026-09-20 - 全量纹理由专用 Worker 分块准备，主线程只接收已打包数据并逐张提交。
+async function createPreparedTrackTexture(device: GraphicsDevice, track: Raw4DTrack, name: string, width: number,
+  components: readonly number[], half: boolean, client: Raw4DPreparationClient, layout: 'vector' | 'opacity' = 'vector'): Promise<Texture> {
+  const stride = layout === 'opacity' ? Math.ceil(track.keyframes.length / 4) : track.keyframes.length;
+  const texture = createTexture(device, name, track.values[0].length * stride, width, half);
+  try {
+    const destination = texture.lock() as Float32Array | Uint16Array;
+    destination.fill(layout === 'opacity' ? FloatPacking.float2Half(-20) : 0);
+    await client.track(track, components, half, layout, (first, packed) => destination.set(packed, first * stride * 4));
+    await client.yieldToRenderer();
+    texture.unlock();
+    return texture;
+  } catch (error) { texture.destroy(); throw error; }
+}
+
 function createStreamingTrackTexture(
   device: GraphicsDevice,
   name: string,
@@ -972,6 +985,7 @@ export class Raw4DGpuPlayback {
     device: GraphicsDevice,
     gpuPool: GpuBufferPool,
     options: {
+      readonly preparation?: Raw4DPreparationClient;
       readonly releaseTextureUploadSources?: boolean;
       readonly streamTextureKeyframes?: boolean;
     } = {},
@@ -981,7 +995,7 @@ export class Raw4DGpuPlayback {
     const selectionTexture = createSelectionTexture(device, edits, width);
     if (device.isWebGPU) {
       try {
-        const storageResources = await this.createStorageResources(asset, gpuPool);
+        const storageResources = await this.createStorageResources(asset, gpuPool, options.preparation);
         const playback = new Raw4DGpuPlayback(
           entity, resource, sampler, asset, edits, [deletionTexture, selectionTexture], deletionTexture, selectionTexture,
           width, gpuPool, storageResources, null,
@@ -994,7 +1008,7 @@ export class Raw4DGpuPlayback {
         return playback;
       } catch (error) {
         // #WDD-gpt 2026-08-16 - 显存预算/OOM 必须交给段落缓存淘汰后重试，禁止回退到更占显存的全量纹理路径。
-        if (error instanceof Error && /GPU memory budget exceeded|out of memory/i.test(error.message)) {
+        if (options.preparation || (error instanceof Error && /GPU memory budget exceeded|out of memory/i.test(error.message))) {
           deletionTexture.destroy();
           selectionTexture.destroy();
           throw error;
@@ -1008,7 +1022,9 @@ export class Raw4DGpuPlayback {
       if (options.streamTextureKeyframes) {
         const streaming = this.createStreamingTextureResources(device, asset, width);
         textures.push(streaming.position, streaming.rotation, streaming.color, streaming.scale, streaming.opacity);
-        const lifetimeTexture = createLifetimeTexture(device, asset, width);
+        const lifetimeTexture = options.preparation
+        ? await createPreparedTrackTexture(device, { encoding: asset.sourceEncoding, components: 2, keyframes: [0], values: [asset.lifetimeMu, asset.lifetimeW] }, 'RAW4D Lifetime', width, [0, 1], true, options.preparation)
+        : createLifetimeTexture(device, asset, width);
         textures.push(lifetimeTexture);
         const playback = new Raw4DGpuPlayback(
           entity, resource, sampler, asset, edits, textures, deletionTexture, selectionTexture,
@@ -1018,18 +1034,38 @@ export class Raw4DGpuPlayback {
         if (options.releaseTextureUploadSources) lifetimeTexture._clearLevels();
         return playback;
       }
-      const positionTexture = createTrackTexture(device, asset.position, 'RAW4D Position Banks', width, [0, 1, 2], false);
-      textures.push(positionTexture);
-      const rotationTexture = createTrackTexture(device, asset.rotation, 'RAW4D Rotation Banks', width, [1, 2, 3, 0], true);
-      textures.push(rotationTexture);
-      const colorTexture = createTrackTexture(device, asset.colorDc, 'RAW4D DC Banks', width, [0, 1, 2], true);
-      textures.push(colorTexture);
-      const scaleTexture = createTrackTexture(device, asset.scale, 'RAW4D Scale Banks', width, [0, 1, 2], true);
-      textures.push(scaleTexture);
-      const opacityTexture = createOpacityTexture(device, asset, width);
-      textures.push(opacityTexture);
-      const lifetimeTexture = createLifetimeTexture(device, asset, width);
-      textures.push(lifetimeTexture);
+      // #WDD-gpt 2026-09-20 - WebGL 六张时序纹理按同一批点打包，避免六轮串行 Worker 往返。
+      const specs: Array<{ track: Raw4DTrack; name: string; components: number[]; half: boolean; layout: 'vector' | 'opacity' }> = [
+        // #WDD-gpt 2026-09-20 - FP16 源位置使用原精度纹理，省去扩展成 FP32 后的双倍上传；FP32 源仍保留 FP32。
+        { track: asset.position, name: 'RAW4D Position Banks', components: [0, 1, 2], half: asset.position.encoding === 'float16', layout: 'vector' },
+        { track: asset.rotation, name: 'RAW4D Rotation Banks', components: [1, 2, 3, 0], half: true, layout: 'vector' },
+        { track: asset.colorDc, name: 'RAW4D DC Banks', components: [0, 1, 2], half: true, layout: 'vector' },
+        { track: asset.scale, name: 'RAW4D Scale Banks', components: [0, 1, 2], half: true, layout: 'vector' },
+        { track: asset.opacity, name: 'RAW4D Opacity Banks', components: [0], half: true, layout: 'opacity' },
+        { track: { encoding: asset.sourceEncoding, components: 2, keyframes: [0], values: [asset.lifetimeMu, asset.lifetimeW] }, name: 'RAW4D Lifetime', components: [0, 1], half: true, layout: 'vector' },
+      ];
+      let preparedTextures: Texture[];
+      if (options.preparation) {
+        const strides = specs.map(({ track, layout }) => layout === 'opacity' ? Math.ceil(track.keyframes.length / 4) : track.keyframes.length);
+        preparedTextures = specs.map((spec, index) => {
+          const texture = createTexture(device, spec.name, asset.splatCount * strides[index], width, spec.half);
+          textures.push(texture); return texture;
+        });
+        const destinations = preparedTextures.map((texture, index) => {
+          const array = texture.lock() as Float32Array | Uint16Array;
+          array.fill(specs[index].layout === 'opacity' ? FloatPacking.float2Half(-20) : 0); return array;
+        });
+        await options.preparation.tracks(specs.map(spec => ({ kind: 'track', ...spec, preserveHalf: false })),
+          (index, first, packed) => destinations[index].set(packed, first * strides[index] * 4));
+        for (const texture of preparedTextures) { await options.preparation.yieldToRenderer(); texture.unlock(); }
+      } else {
+        preparedTextures = specs.map(spec => {
+          const texture = spec.layout === 'opacity' ? createOpacityTexture(device, asset, width)
+            : createTrackTexture(device, spec.track, spec.name, width, spec.components, spec.half);
+          textures.push(texture); return texture;
+        });
+      }
+      const [positionTexture, rotationTexture, colorTexture, scaleTexture, opacityTexture, lifetimeTexture] = preparedTextures;
       const playback = new Raw4DGpuPlayback(
         entity, resource, sampler, asset, edits, textures, deletionTexture, selectionTexture, width, null, null,
         null,
@@ -1153,6 +1189,7 @@ export class Raw4DGpuPlayback {
   private static async createStorageResources(
     asset: Raw4DAsset,
     gpuPool: GpuBufferPool,
+    preparation?: Raw4DPreparationClient,
   ): Promise<StoragePlaybackResources> {
     const plan = createRaw4DGpuMemoryPlan(asset);
     const {
@@ -1179,6 +1216,28 @@ export class Raw4DGpuPlayback {
       const scaleSlots = new KeyframeSlotCache(asset.scale.keyframes.length, scaleSlotCount);
       const opacitySlots = new KeyframeSlotCache(asset.opacity.keyframes.length, opacitySlotCount);
       // #WDD-gpt 2026-08-16 - WebGPU 仅常驻左右关键帧和一个预取帧；DC 额外固定第零帧用于颜色增量。
+      if (preparation) {
+        // #WDD-gpt 2026-09-20 - 所有初始关键帧合批打包并写入互不重叠的 GPU 范围，取消逐槽位等待渲染帧。
+        const tasks: PreparationTrackRequest[] = [];
+        const writes: Array<(first: number, packed: PreparedArray) => void> = [];
+        const vector = (buffer: StorageBuffer, offset: number, track: Raw4DTrack, key: number, components: number[]) => {
+          const single = { ...track, keyframes: [track.keyframes[key]], values: track.values.slice(key * track.components, (key + 1) * track.components) };
+          tasks.push({ kind: 'track', track: single, components, half, layout: 'vector', preserveHalf: true });
+          writes.push((first, packed) => buffer.write((offset + first) * (half ? 8 : 16), packed, 0, packed.length));
+        };
+        const scalar = (offset: number, values: Raw4DAsset['lifetimeMu'], encoding: Raw4DAsset['sourceEncoding']) => {
+          tasks.push({ kind: 'track', track: { components: 1, keyframes: [0], values: [values], encoding }, components: [0], half, layout: 'scalar', preserveHalf: true });
+          writes.push((first, packed) => scalarBuffer.write((offset + first) * (half ? 2 : 4), packed, 0, packed.length));
+        };
+        positionSlots.initialize((slot, key) => vector(positionBuffer, slot * asset.splatCount, asset.position, key, [0, 1, 2]));
+        rotationSlots.initialize((slot, key) => vector(vectorBuffer, rotationOffset + slot * asset.splatCount, asset.rotation, key, [1, 2, 3, 0]));
+        colorSlots.initialize((slot, key) => vector(vectorBuffer, colorOffset + slot * asset.splatCount, asset.colorDc, key, [0, 1, 2]));
+        scaleSlots.initialize((slot, key) => vector(vectorBuffer, scaleOffset + slot * asset.splatCount, asset.scale, key, [0, 1, 2]));
+        opacitySlots.initialize((slot, key) => scalar(opacityOffset + slot * scalarStride, asset.opacity.values[key], asset.opacity.encoding));
+        scalar(lifetimeMuOffset, asset.lifetimeMu, asset.sourceEncoding);
+        scalar(lifetimeWOffset, asset.lifetimeW, asset.sourceEncoding);
+        await preparation.tracks(tasks, (index, first, packed) => writes[index](first, packed));
+      } else {
       positionSlots.initialize((slot, key) => uploadVectorSlot(
         positionBuffer, slot * asset.splatCount, asset.position, key, [0, 1, 2], half,
       ));
@@ -1196,6 +1255,7 @@ export class Raw4DGpuPlayback {
       ));
       uploadScalarArray(scalarBuffer, lifetimeMuOffset, scalarStride, asset.lifetimeMu, asset, half);
       uploadScalarArray(scalarBuffer, lifetimeWOffset, scalarStride, asset.lifetimeW, asset, half);
+      }
       return {
         position,
         vectors,
@@ -1363,29 +1423,20 @@ export class Raw4DGpuPlayback {
     this.selectionTexture.unlock();
   }
 
-  // #WDD-gpt 2026-09-09 - 强制排序先上传目标关键帧并刷新 CPU 中心，但不改当前可见 WorkBuffer；
-  // 排序结果进入 manager.onSorted 时才在同一次 WebGL update 内切换 uniform 并强制重建目标 WorkBuffer。
+  // #WDD-gpt 2026-09-09 - v3.0.122 撤销在 PlayCanvas 私有 onSorted 回调内改写 WorkBuffer 的跨平台不安全路径；
+  // 目标帧只通过资源原有的完整帧提交顺序更新关键帧、排序中心、uniform 与 WorkBuffer。
   prepareFrame(requestedFrame: number): number {
     const frame = Math.min(this.asset.totalFrames - 1, Math.max(0, requestedFrame));
     if (this.disposed) return frame;
     this.ensureStorageFrame(frame);
     this.ensureStreamingTextureFrame(frame);
-    const needsCpuSort = Boolean(
-      this.resource.centers
-      && this.sampler
-      && raw4DSortCentersNeedRefresh(frame, this.lastCenterFrame),
-    );
-    if (needsCpuSort) {
-      registerPlayCanvasAtomicWorkBufferCommit(this.resource, () => this.revealFrame(frame));
-      this.refreshSortCenters(frame);
-    } else {
-      cancelPlayCanvasAtomicWorkBufferCommit(this.resource);
-      this.revealFrame(frame);
-    }
+    this.refreshSortCenters(frame);
+    const component = this.entity.gsplat;
+    if (component) component.workBufferUpdate = WORKBUFFER_UPDATE_ONCE;
     return frame;
   }
 
-  private revealFrame(frame: number): void {
+  revealFrame(frame: number): void {
     if (this.disposed) return;
     const component = this.entity.gsplat;
     if (!component) return;
@@ -1395,16 +1446,8 @@ export class Raw4DGpuPlayback {
 
   setFrame(requestedFrame: number): void {
     if (this.disposed) return;
-    const frame = Math.min(this.asset.totalFrames - 1, Math.max(0, requestedFrame));
-    cancelPlayCanvasAtomicWorkBufferCommit(this.resource);
-    this.ensureStorageFrame(frame);
-    this.ensureStreamingTextureFrame(frame);
-    this.refreshSortCenters(frame);
+    const frame = this.prepareFrame(requestedFrame);
     this.revealFrame(frame);
-  }
-
-  cancelPreparedFrame(): void {
-    cancelPlayCanvasAtomicWorkBufferCommit(this.resource);
   }
 
   private refreshSortCenters(frame: number): void {
@@ -1427,7 +1470,6 @@ export class Raw4DGpuPlayback {
   destroy(): void {
     if (this.disposed) return;
     this.disposed = true;
-    cancelPlayCanvasAtomicWorkBufferCommit(this.resource);
     this.stopListeningForEdits();
     this.entity.gsplat?.setWorkBufferModifier(null);
     for (const texture of this.textures) texture.destroy();

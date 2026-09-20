@@ -28,6 +28,9 @@ declare module '*fourcgs-v21-lossless-codec.mjs' {
   export const decodeV21StructuredStream: (...arguments_: any[]) => Promise<any>;
   export const decodeV21PositionContexts: (...arguments_: any[]) => Promise<any>;
   export const decodeV22ScaleReaders: (...arguments_: any[]) => Promise<any>;
+  // #WDD-gpt 2026-09-20 - Rotation 直读 Rice 读取器的浏览器模块声明。
+  export const decodeV22DcReaders: (...arguments_: any[]) => Promise<any>;
+  export const decodeV22RotationReaders: (...arguments_: any[]) => Promise<any>;
   export const decodeV22StructuredParts: (...arguments_: any[]) => Promise<any>;
   export const isV21StructuredStream: (bytes: Uint8Array) => boolean;
 }

@@ -14,7 +14,11 @@ interface StreamRequest {
   readonly entry: FourCgsStreamEntry;
 }
 
-function digest(bytes: Uint8Array): string {
+// #WDD-gpt 2026-09-20 - 优先原生 SHA-256，保留同等完整校验；不支持 WebCrypto 时使用原 JS 路径。
+async function digest(bytes: Uint8Array): Promise<string> {
+  if (globalThis.crypto?.subtle && bytes.buffer instanceof ArrayBuffer) {
+    return bytesToHex(new Uint8Array(await crypto.subtle.digest('SHA-256', bytes as Uint8Array<ArrayBuffer>)));
+  }
   return bytesToHex(sha256(bytes));
 }
 
@@ -24,7 +28,7 @@ async function decodeStream(request: StreamRequest): Promise<ArrayBuffer> {
     request.offset,
     request.offset + entry.storedBytes,
   ).arrayBuffer());
-  if (stored.byteLength !== entry.storedBytes || digest(stored) !== entry.storedSha256) {
+  if (stored.byteLength !== entry.storedBytes || await digest(stored) !== entry.storedSha256) {
     throw new Error(`4CGS 存储流校验失败：${entry.name}。`);
   }
   let raw: Uint8Array;
@@ -41,10 +45,12 @@ async function decodeStream(request: StreamRequest): Promise<ArrayBuffer> {
   }
   const rawDigestMatches = raw === stored
     ? entry.rawSha256 === entry.storedSha256
-    : digest(raw) === entry.rawSha256;
+    : await digest(raw) === entry.rawSha256;
   if (raw.byteLength !== entry.rawBytes || !rawDigestMatches) {
     throw new Error(`4CGS 原始流校验失败：${entry.name}。`);
   }
+  // #WDD-gpt 2026-09-20 - File 切片独占的未压缩流直接转移所有权；WASM 解压视图仍复制以保护运行时内存。
+  if (raw === stored) return stored.buffer;
   const copy = new Uint8Array(raw.byteLength);
   copy.set(raw);
   return copy.buffer;

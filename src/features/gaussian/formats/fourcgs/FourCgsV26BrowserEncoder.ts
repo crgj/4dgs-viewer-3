@@ -1,7 +1,7 @@
 import { Buffer } from 'buffer';
 import { sha256 as nobleSha256 } from '@noble/hashes/sha2.js';
 import { bytesToHex } from '@noble/hashes/utils.js';
-import { zlibSync } from 'fflate';
+import { Zlib, zlibSync } from 'fflate';
 import { createFourCgsEditorBuild, FOUR_CGS_HEADER_BYTES, FOUR_CGS_MAGIC, readFourCgsManifest } from './FourCgsContainer';
 import {
   fourCgsCanonicalRaw4DHeader,
@@ -10,7 +10,8 @@ import {
 } from './FourCgsRaw4D';
 import { raw4DBundleOutputName, shuffle16WithPadding } from './FourCgsRaw4DBundle';
 import type { FourCgsEncodeResult } from './FourCgsEncoderClient';
-import type { FourCgsManifest, FourCgsProgress, FourCgsSegment, FourCgsStreamEntry } from './FourCgsTypes';
+import type { FourCgsExportOptions, FourCgsManifest, FourCgsProgress, FourCgsSegment, FourCgsStreamEntry } from './FourCgsTypes';
+import { fourCgsShDimensions } from './FourCgsRaw4D';
 import { readRaw4DHeader } from '../raw4d/Raw4DParser';
 import { raw4DSequenceFrameRangeFromName } from '../raw4d/Raw4DSequence';
 import {
@@ -20,8 +21,18 @@ import {
   raw4DTrackStride,
 } from '../raw4d/Raw4DSchema';
 import type { Raw4DAsset, Raw4DHeader, Raw4DMemorySnapshot, Raw4DTemporalLayout, Raw4DTrack } from '../raw4d/Raw4DTypes';
+import { readRaw4DScalar } from '../raw4d/Raw4DValues';
+import {
+  computeFourCgsEffectiveAlphaWitnessesGpu,
+  computeFourCgsExportCropGpu,
+  fourCgsUnorderedHalf,
+} from './FourCgsExportGpu';
+import {
+  compressFourCgsPositionParts,
+  fourCgsPositionEnvelopeWorkerCount,
+} from './FourCgsPositionEnvelope';
 
-const SH_DIMENSIONS = 45;
+const MAX_SH_DIMENSIONS = 45;
 const SH_CODEBOOK_SIZE = 256;
 const SH_TARGET_RMSE = 0.013;
 const SH_MAXIMUM_COEFFICIENT_ERROR = 0.05;
@@ -42,7 +53,7 @@ interface BrowserSegment {
 }
 
 interface ShTemplate {
-  readonly name: 'compact-5x9d' | 'balanced-10x4-5d' | 'quality-15x3d';
+  readonly name: string;
   readonly levels: number;
 }
 
@@ -58,6 +69,7 @@ interface ShProductLevel {
 }
 
 interface TrainedSh {
+  readonly shDimensions: number;
   readonly template: ShTemplate;
   readonly base: Buffer;
   readonly labels: readonly Uint8Array[];
@@ -73,7 +85,7 @@ interface TrainedSh {
     readonly assignmentWorkerCount: number;
     readonly assignmentElapsedMs: number;
     readonly attempts: readonly {
-      readonly template: ShTemplate['name'];
+      readonly template: string;
       readonly sampleRmse: number;
       readonly estimatedExceptionRatio: number;
       readonly estimatedBytesPerInstance: number;
@@ -117,6 +129,11 @@ interface PreparedV26Source {
   readonly sourceShBands: number;
   readonly descriptor: FourCgsSegment;
   readonly originalPointCount: number;
+  readonly alphaPrunedPointCount: number;
+  readonly alphaScanBackend?: 'webgpu-witness-cpu-verified' | 'cpu';
+  readonly alphaGpuElapsedMs?: number;
+  readonly alphaGpuVerifiedWitnessCount?: number;
+  readonly alphaCpuFullScanCount?: number;
   readonly temporalLayout?: Raw4DTemporalLayout;
   readonly compacted: {
     readonly segment: BrowserSegment;
@@ -126,16 +143,149 @@ interface PreparedV26Source {
   };
 }
 
+const LEGACY_V26_OPTIONS: FourCgsExportOptions = { shLevel: 3, maximumEffectiveAlpha: 0 };
+
+function normalizeV26Options(options: FourCgsExportOptions = LEGACY_V26_OPTIONS): FourCgsExportOptions {
+  if (options.shLevel !== 1 && options.shLevel !== 2 && options.shLevel !== 3) {
+    throw new Error(`4CGS SH 级别无效：${options.shLevel}。`);
+  }
+  if (!Number.isFinite(options.maximumEffectiveAlpha)
+    || options.maximumEffectiveAlpha < 0 || options.maximumEffectiveAlpha >= 1) {
+    throw new Error(`4CGS 最大有效 Alpha 阈值必须位于 [0, 1)：${options.maximumEffectiveAlpha}。`);
+  }
+  return options;
+}
+
+function shBasisCount(shBands: number): number {
+  return shBands === 1 ? 3 : shBands === 2 ? 8 : shBands === 3 ? 15 : 0;
+}
+
+function sourceShDimensions(header: Raw4DHeader): number {
+  let count = 0;
+  while (header.propertyNames.includes(`f_rest_${count}`)) count += 1;
+  if (![0, 9, 24, 45].includes(count)) throw new Error(`RAW4D 非 DC SH 维数无效：${count}。`);
+  return count;
+}
+
+function shBandsFromDimensions(dimensions: number): number {
+  return dimensions === 45 ? 3 : dimensions === 24 ? 2 : dimensions === 9 ? 1 : 0;
+}
+
+function sourceShIndex(destination: number, sourceDimensions: number, targetDimensions: number): number | null {
+  const sourceBasis = sourceDimensions / 3;
+  const targetBasis = targetDimensions / 3;
+  const channel = Math.floor(destination / targetBasis);
+  const basis = destination % targetBasis;
+  return basis < sourceBasis ? channel * sourceBasis + basis : null;
+}
+
+interface TrackSpan { readonly left: number; readonly right: number; readonly alpha: number }
+
+function trackSpan(track: Raw4DTrack, frame: number): TrackSpan {
+  if (track.keyframes.length === 1 || frame <= track.keyframes[0]) return { left: 0, right: 0, alpha: 0 };
+  const last = track.keyframes.length - 1;
+  if (frame >= track.keyframes[last]) return { left: last, right: last, alpha: 0 };
+  for (let right = 1; right < track.keyframes.length; right += 1) {
+    if (frame <= track.keyframes[right]) {
+      const left = right - 1;
+      return { left, right, alpha: (frame - track.keyframes[left]) / (track.keyframes[right] - track.keyframes[left]) };
+    }
+  }
+  return { left: last, right: last, alpha: 0 };
+}
+
+function stableSigmoid(value: number): number {
+  if (value >= 0) return 1 / (1 + Math.exp(-value));
+  const exponential = Math.exp(value);
+  return exponential / (1 + exponential);
+}
+
+function interpolateExtended(left: number, right: number, alpha: number): number {
+  if (alpha <= 0 || left === right) return left;
+  if (alpha >= 1) return right;
+  if (!Number.isFinite(left) || !Number.isFinite(right)) {
+    if (left === -Infinity || right === -Infinity) return -Infinity;
+  }
+  return left + (right - left) * alpha;
+}
+
+function effectiveAlphaAtFrame(asset: Raw4DAsset, stableId: number, frame: number): number {
+  const span = trackSpan(asset.opacity, frame);
+  const left = readRaw4DScalar(asset.opacity.values[span.left], stableId, asset.opacity.encoding);
+  const right = readRaw4DScalar(asset.opacity.values[span.right], stableId, asset.opacity.encoding);
+  const opacity = stableSigmoid(interpolateExtended(left, right, span.alpha));
+  if (asset.opacityTiming === 'baked') return opacity;
+  const lifetimeMu = readRaw4DScalar(asset.lifetimeMu, stableId, asset.sourceEncoding);
+  const lifetimeW = readRaw4DScalar(asset.lifetimeW, stableId, asset.sourceEncoding);
+  const gate = stableSigmoid(10 * (frame - (lifetimeMu - lifetimeW)))
+    * stableSigmoid(10 * ((lifetimeMu + lifetimeW) - frame));
+  return opacity * gate;
+}
+
+// #WDD-gpt 2026-09-20 - Alpha 剪除严格复用正式渲染的 opacity 插值与生命周期 Gate，并以片段内所有整数帧最大值判定。
+async function effectiveDeletionWords(
+  asset: Raw4DAsset,
+  sourceWords: Uint32Array,
+  threshold: number,
+): Promise<{
+  readonly words: Uint32Array;
+  readonly alphaPruned: number;
+  readonly backend: 'webgpu-witness-cpu-verified' | 'cpu';
+  readonly gpuElapsedMs: number;
+  readonly gpuVerifiedWitnessCount: number;
+  readonly cpuFullScanCount: number;
+}> {
+  const words = sourceWords.slice();
+  if (threshold <= 0) {
+    return {
+      words, alphaPruned: 0, backend: 'cpu', gpuElapsedMs: 0,
+      gpuVerifiedWitnessCount: 0, cpuFullScanCount: 0,
+    };
+  }
+  const gpuWitnesses = await computeFourCgsEffectiveAlphaWitnessesGpu(asset, threshold);
+  let alphaPruned = 0;
+  let gpuVerifiedWitnessCount = 0;
+  let cpuFullScanCount = 0;
+  for (let stableId = 0; stableId < asset.splatCount; stableId += 1) {
+    if (words[stableId >>> 5] & (1 << (stableId & 31))) continue;
+    let visible = false;
+    const witness = gpuWitnesses?.frames[stableId] ?? 0;
+    if (witness > 0 && effectiveAlphaAtFrame(asset, stableId, witness - 1) >= threshold) {
+      visible = true;
+      gpuVerifiedWitnessCount += 1;
+    } else {
+      cpuFullScanCount += 1;
+      for (let frame = 0; frame < asset.totalFrames; frame += 1) {
+        if (effectiveAlphaAtFrame(asset, stableId, frame) < threshold) continue;
+        visible = true;
+        break;
+      }
+    }
+    if (!visible) {
+      words[stableId >>> 5] |= 1 << (stableId & 31);
+      alphaPruned += 1;
+    }
+  }
+  return {
+    words,
+    alphaPruned,
+    backend: gpuWitnesses ? 'webgpu-witness-cpu-verified' : 'cpu',
+    gpuElapsedMs: gpuWitnesses?.elapsedMs ?? 0,
+    gpuVerifiedWitnessCount,
+    cpuFullScanCount,
+  };
+}
+
 interface PermanentLayout {
   readonly slotCount: number;
   readonly maps: readonly Int32Array[];
-  readonly slotToLocal: readonly Int32Array[];
   readonly continuedLocal: readonly Uint8Array[];
   readonly matches: readonly Record<string, unknown>[];
 }
 
 interface MortonLayout extends PermanentLayout {
   readonly activeSlots: readonly Int32Array[];
+  readonly activeLocals: readonly Int32Array[];
   readonly trackCount: number;
   readonly sourcePermanentTrackCount: number;
   readonly droppedTrackCount: number;
@@ -151,6 +301,11 @@ interface ParallelAttributeResult {
   readonly encoded: Uint8Array;
   readonly metrics: Record<string, any>;
   readonly elapsedMs: number;
+}
+
+interface ParallelAttributePoolResult {
+  readonly results: ReadonlyMap<ParallelAttributeResult['task'], ParallelAttributeResult>;
+  readonly workerCount: number;
 }
 
 export class FourCgsHighCompressionUnsupportedError extends Error {}
@@ -226,7 +381,11 @@ function exactBoundaryTieScore(
   const previousBase = previousLocal * previous.propertyNames.length;
   const currentBase = currentLocal * current.propertyNames.length;
   let score = 0;
-  for (let component = 0; component < SH_DIMENSIONS; component += 1) {
+  const shDimensions = Math.min(
+    Array.from(previous.propertyIndex.keys()).filter((name) => name.startsWith('f_rest_')).length,
+    Array.from(current.propertyIndex.keys()).filter((name) => name.startsWith('f_rest_')).length,
+  );
+  for (let component = 0; component < shDimensions; component += 1) {
     const name = `f_rest_${component}`;
     if (previous.rows[previousBase + previous.propertyIndex.get(name)!]
       === current.rows[currentBase + current.propertyIndex.get(name)!]) score += 4;
@@ -296,13 +455,8 @@ function buildExactBoundaryPermanentTrackMaps(segments: readonly BrowserSegment[
       method: 'exact_fp16_boundary_position_sh_dc_tie_break',
     });
   }
-  const slotToLocal = maps.map((map) => {
-    const inverse = new Int32Array(trackCount);
-    inverse.fill(-1);
-    for (let local = 0; local < map.length; local += 1) inverse[map[local]] = local;
-    return inverse;
-  });
-  return { slotCount: trackCount, maps, slotToLocal, continuedLocal, matches };
+  // #WDD-gpt 2026-09-19 - 永久匹配阶段只保留 local→Track；禁止为每段建立全局 Track 长度的稠密反表。
+  return { slotCount: trackCount, maps, continuedLocal, matches };
 }
 
 function sourceFrameRange(name: string, totalFrames: number): { readonly firstFrame: number; readonly lastFrame: number } {
@@ -329,13 +483,14 @@ function orderedHeaders(headers: readonly SourceHeader[]): readonly SourceHeader
   });
 }
 
-function segmentDescriptor(source: SourceHeader, gaussianCount: number): FourCgsSegment {
+function segmentDescriptor(source: SourceHeader, gaussianCount: number, shLevel: 1 | 2 | 3): FourCgsSegment {
   return {
     name: source.file.name.replace(/\.(?:raw4d|ply4)$/i, ''),
     firstFrame: source.range.firstFrame,
     lastFrame: source.range.lastFrame,
     gaussianCount,
     totalFrames: source.header.totalFrames,
+    shBands: shLevel,
     bankCounts: {
       position: raw4DBankCount(source.header.propertyNames, RAW4D_TRACK_DEFINITIONS.position),
       rotation: raw4DBankCount(source.header.propertyNames, RAW4D_TRACK_DEFINITIONS.rotation),
@@ -356,6 +511,7 @@ function segmentDescriptor(source: SourceHeader, gaussianCount: number): FourCgs
 async function compactSegment(
   source: SourceHeader,
   words: Uint32Array,
+  options: FourCgsExportOptions,
 ): Promise<{ readonly segment: BrowserSegment; readonly sourceSha256: string; readonly deleted: number; readonly compactedBytes: number }> {
   const deleted = countDeleted(words, source.header.vertexCount);
   if (deleted === source.header.vertexCount) throw new Error(`${source.file.name} 的高斯点已全部删除，无法导出空片段。`);
@@ -366,11 +522,17 @@ async function compactSegment(
   sourceHasher.update(payloadBytes);
   const sourceSha256 = bytesToHex(sourceHasher.digest());
   const sourceRows = new Uint16Array(payloadBytes.buffer, payloadBytes.byteOffset, payloadBytes.byteLength / 2);
-  const descriptor = segmentDescriptor(source, source.header.vertexCount - deleted);
+  const descriptor = segmentDescriptor(source, source.header.vertexCount - deleted, options.shLevel);
   const propertyNames = fourCgsDecodedPropertyNames(descriptor);
   const sourceIndices = new Map(source.header.propertyNames.map((name, index) => [name, index]));
   const indices = propertyNames.map((name) => {
-    const index = sourceIndices.get(name);
+    const shMatch = /^f_rest_(\d+)$/.exec(name);
+    const mappedShIndex = shMatch
+      ? sourceShIndex(Number(shMatch[1]), sourceShDimensions(source.header), fourCgsShDimensions(descriptor))
+      : undefined;
+    if (shMatch && mappedShIndex === null) return -1;
+    const mappedName = shMatch ? `f_rest_${mappedShIndex}` : name;
+    const index = sourceIndices.get(mappedName);
     if (index === undefined) throw new Error(`${source.file.name} 缺少 V2.6 属性 ${name}。`);
     return index;
   });
@@ -381,7 +543,7 @@ async function compactSegment(
     const sourceOffset = stableId * source.header.propertyNames.length;
     const destinationOffset = destination * propertyNames.length;
     for (let property = 0; property < indices.length; property += 1) {
-      rows[destinationOffset + property] = sourceRows[sourceOffset + indices[property]];
+      rows[destinationOffset + property] = indices[property] < 0 ? 0 : sourceRows[sourceOffset + indices[property]];
     }
     destination += 1;
   }
@@ -433,7 +595,7 @@ function memoryTrackColumns(track: Raw4DTrack, totalFrames: number): readonly Ra
     : track.values;
 }
 
-function memoryDescriptor(source: IndexedMemorySource, gaussianCount: number): FourCgsSegment {
+function memoryDescriptor(source: IndexedMemorySource, gaussianCount: number, shLevel: 1 | 2 | 3): FourCgsSegment {
   const { asset } = source;
   return {
     name: source.name.replace(/\.(?:raw4d|ply4|4gs)$/i, ''),
@@ -442,6 +604,7 @@ function memoryDescriptor(source: IndexedMemorySource, gaussianCount: number): F
     gaussianCount,
     totalFrames: asset.totalFrames,
     frameRate: asset.frameRate,
+    shBands: shLevel,
     bankCounts: {
       position: memoryTrackBankCount(asset.position, asset.totalFrames),
       rotation: memoryTrackBankCount(asset.rotation, asset.totalFrames),
@@ -483,20 +646,30 @@ function orderedMemorySources(sources: readonly Raw4DMemorySnapshot[]): readonly
 }
 
 // #WDD-gpt 2026-08-18 - Float32 PLY4 保持场景 Canonical RAM 原样，只在 Worker 的 V2.6 编码工作副本中显式量化为 FP16。
-async function compactMemorySegment(source: IndexedMemorySource): Promise<PreparedV26Source> {
-  const { asset, deletionWords } = source;
-  if (![0, 9, 24, SH_DIMENSIONS].includes(asset.shRest.length)) {
+async function compactMemorySegment(
+  source: IndexedMemorySource,
+  options: FourCgsExportOptions,
+): Promise<PreparedV26Source> {
+  const { asset } = source;
+  if (![0, 9, 24, MAX_SH_DIMENSIONS].includes(asset.shRest.length)) {
     throw new FourCgsHighCompressionUnsupportedError(`${source.name} 的非 DC SH 系数数量 ${asset.shRest.length} 不对应 SH0/SH1/SH2/SH3。`);
   }
+  const effective = await effectiveDeletionWords(asset, source.deletionWords, options.maximumEffectiveAlpha);
+  const deletionWords = effective.words;
   const deleted = countDeleted(deletionWords, asset.splatCount);
   if (deleted === asset.splatCount) throw new Error(`${source.name} 的高斯点已全部删除，无法导出空片段。`);
-  const descriptor = memoryDescriptor(source, asset.splatCount - deleted);
+  const descriptor = memoryDescriptor(source, asset.splatCount - deleted, options.shLevel);
   const propertyNames = fourCgsDecodedPropertyNames(descriptor);
-  // #WDD-gpt 2026-08-20 - 4CGS V2.6 固定使用 SH3 载荷；低阶 4GS 仅在编码副本补零，不扩大或改写场景 Canonical RAM。
+  // #WDD-gpt 2026-09-20 - 按目标阶数以 RGB channel-major 顺序截取 SH；源阶数不足时只在编码副本补零。
   const shZero = asset.sourceEncoding === 'float16'
     ? new Uint16Array(asset.splatCount)
     : new Float32Array(asset.splatCount);
-  const paddedShRest = Array.from({ length: SH_DIMENSIONS }, (_, index) => asset.shRest[index] ?? shZero);
+  const targetShDimensions = fourCgsShDimensions(descriptor);
+  const sourceDimensions = asset.shRest.length;
+  const paddedShRest = Array.from({ length: targetShDimensions }, (_, destination) => {
+    const sourceIndex = sourceShIndex(destination, sourceDimensions, targetShDimensions);
+    return sourceIndex === null ? shZero : asset.shRest[sourceIndex] ?? shZero;
+  });
   const columns = [
     ...memoryTrackColumns(asset.position, asset.totalFrames),
     ...memoryTrackColumns(asset.rotation, asset.totalFrames),
@@ -555,6 +728,11 @@ async function compactMemorySegment(source: IndexedMemorySource): Promise<Prepar
     sourceShBands: asset.shBands,
     descriptor,
     originalPointCount: asset.splatCount,
+    alphaPrunedPointCount: effective.alphaPruned,
+    alphaScanBackend: effective.backend,
+    alphaGpuElapsedMs: effective.gpuElapsedMs,
+    alphaGpuVerifiedWitnessCount: effective.gpuVerifiedWitnessCount,
+    alphaCpuFullScanCount: effective.cpuFullScanCount,
     temporalLayout: compactTemporalLayout(asset.temporalLayout, deletionWords),
     compacted: {
       segment: {
@@ -614,18 +792,50 @@ function computeInputCrop(
   return { center, halfExtent: Math.max(POSITION_STEP * 4, radius + POSITION_STEP * 2) };
 }
 
-const SH_TEMPLATES: readonly ShTemplate[] = [
-  { name: 'compact-5x9d', levels: 5 },
-  { name: 'balanced-10x4-5d', levels: 10 },
-  { name: 'quality-15x3d', levels: 15 },
-];
+// #WDD-gpt 2026-09-20 - GPU 仅归约原始 FP16 Position 次序位，中心与 halfExtent 仍由 CPU 用同一公式计算，确保码流参数不因后端改变。
+async function computeInputCropPreferred(
+  segments: readonly BrowserSegment[],
+  halfToFloat: (bits: number) => number,
+): Promise<{
+  readonly crop: { readonly center: readonly [number, number, number]; readonly halfExtent: number };
+  readonly backend: 'webgpu' | 'cpu';
+}> {
+  const gpuBounds = await computeFourCgsExportCropGpu(segments);
+  if (!gpuBounds) return { crop: computeInputCrop(segments, halfToFloat), backend: 'cpu' };
+  const minimum = gpuBounds.minimum.map((ordered) => halfToFloat(fourCgsUnorderedHalf(ordered)));
+  const maximum = gpuBounds.maximum.map((ordered) => halfToFloat(fourCgsUnorderedHalf(ordered)));
+  if (minimum.some((value) => !Number.isFinite(value)) || maximum.some((value) => !Number.isFinite(value))) {
+    throw new FourCgsHighCompressionUnsupportedError('Position 含有非有限数。');
+  }
+  const center = minimum.map((value, axis) => (value + maximum[axis]) * 0.5) as [number, number, number];
+  const radius = Math.max(...maximum.map((value, axis) => Math.max(value - center[axis], center[axis] - minimum[axis])));
+  return {
+    crop: { center, halfExtent: Math.max(POSITION_STEP * 4, radius + POSITION_STEP * 2) },
+    backend: 'webgpu',
+  };
+}
 
-function shLevelDimensions(level: number, levels: number): readonly number[] {
-  const firstBasis = Math.floor(level * 15 / levels);
-  const lastBasis = Math.floor((level + 1) * 15 / levels);
+function shTemplates(shDimensions: number): readonly ShTemplate[] {
+  if (shDimensions === 45) return [
+    { name: 'compact-5x9d', levels: 5 },
+    { name: 'balanced-10x4-5d', levels: 10 },
+    { name: 'quality-15x3d', levels: 15 },
+  ];
+  const basis = shDimensions / 3;
+  const candidates = [...new Set([Math.min(5, basis), Math.min(10, basis), basis])];
+  return candidates.map((levels, index) => ({
+    name: `${index === 0 ? 'compact' : index === candidates.length - 1 ? 'quality' : 'balanced'}-${levels}x${Math.ceil(shDimensions / levels)}d`,
+    levels,
+  }));
+}
+
+function shLevelDimensions(level: number, levels: number, shDimensions: number): readonly number[] {
+  const basisCount = shDimensions / 3;
+  const firstBasis = Math.floor(level * basisCount / levels);
+  const lastBasis = Math.floor((level + 1) * basisCount / levels);
   const dimensions: number[] = [];
   for (let channel = 0; channel < 3; channel += 1) {
-    for (let basis = firstBasis; basis < lastBasis; basis += 1) dimensions.push(channel * 15 + basis);
+    for (let basis = firstBasis; basis < lastBasis; basis += 1) dimensions.push(channel * basisCount + basis);
   }
   return dimensions;
 }
@@ -653,12 +863,13 @@ function meanOf(values: Float32Array, indices: readonly number[], dimensions: nu
 function trainShTree(
   values: Float32Array,
   dimensions: readonly number[],
+  shDimensions: number,
   floatToHalf: (value: number) => number,
   halfToFloat: (bits: number) => number,
 ): ShProductLevel {
   const vectorDimensions = dimensions.length;
   const nodes: ShTreeNode[] = new Array(SH_CODEBOOK_SIZE - 1);
-  const centers = new Float32Array(SH_CODEBOOK_SIZE * SH_DIMENSIONS);
+  const centers = new Float32Array(SH_CODEBOOK_SIZE * shDimensions);
   const all = Array.from({ length: values.length / vectorDimensions }, (_, index) => index);
 
   const build = (indices: readonly number[], node: number, depth: number, fallback?: Float32Array): void => {
@@ -666,7 +877,7 @@ function trainShTree(
     if (depth === 8) {
       const label = node - (SH_CODEBOOK_SIZE - 1);
       for (let component = 0; component < vectorDimensions; component += 1) {
-        centers[label * SH_DIMENSIONS + dimensions[component]] = halfToFloat(floatToHalf(mean[component]));
+        centers[label * shDimensions + dimensions[component]] = halfToFloat(floatToHalf(mean[component]));
       }
       return;
     }
@@ -758,6 +969,7 @@ function shValue(
 function trainShTemplate(
   segments: readonly BrowserSegment[],
   template: ShTemplate,
+  shDimensions: number,
   samples: readonly [number, number][],
   floatToHalf: (value: number) => number,
   halfToFloat: (bits: number) => number,
@@ -773,7 +985,7 @@ function trainShTemplate(
   const vectorMaximumErrors = new Float32Array(samples.length);
   const sampleLabels = new Uint8Array(samples.length * template.levels);
   for (let levelIndex = 0; levelIndex < template.levels; levelIndex += 1) {
-    const dimensions = shLevelDimensions(levelIndex, template.levels);
+    const dimensions = shLevelDimensions(levelIndex, template.levels, shDimensions);
     const values = new Float32Array(samples.length * dimensions.length);
     for (let sample = 0; sample < samples.length; sample += 1) {
       const [segmentIndex, local] = samples[sample];
@@ -781,7 +993,7 @@ function trainShTemplate(
         values[sample * dimensions.length + component] = shValue(segments[segmentIndex], local, dimensions[component], halfToFloat);
       }
     }
-    const trained = trainShTree(values, dimensions, floatToHalf, halfToFloat);
+    const trained = trainShTree(values, dimensions, shDimensions, floatToHalf, halfToFloat);
     levels.push(trained);
     const vector = new Float32Array(dimensions.length);
     for (let sample = 0; sample < samples.length; sample += 1) {
@@ -789,7 +1001,7 @@ function trainShTemplate(
       const label = assignShTree(trained, vector);
       sampleLabels[sample * template.levels + levelIndex] = label;
       for (let component = 0; component < dimensions.length; component += 1) {
-        const difference = vector[component] - trained.centers[label * SH_DIMENSIONS + dimensions[component]];
+        const difference = vector[component] - trained.centers[label * shDimensions + dimensions[component]];
         squaredError += difference * difference;
         vectorSquaredErrors[sample] += difference * difference;
         vectorMaximumErrors[sample] = Math.max(vectorMaximumErrors[sample], Math.abs(difference));
@@ -805,7 +1017,7 @@ function trainShTemplate(
     retainedSquaredError -= vectorSquaredErrors[sample];
     exceptionCount += 1;
   }
-  const targetSquaredError = SH_TARGET_RMSE * SH_TARGET_RMSE * samples.length * SH_DIMENSIONS;
+  const targetSquaredError = SH_TARGET_RMSE * SH_TARGET_RMSE * samples.length * shDimensions;
   if (retainedSquaredError > targetSquaredError) {
     const remaining = Array.from({ length: samples.length }, (_, index) => index)
       .filter((index) => !exceptions[index])
@@ -819,7 +1031,7 @@ function trainShTemplate(
   }
   const estimatedExceptionRatio = exceptionCount / samples.length;
   const sampleExceptionMask = new Uint8Array(Math.ceil(samples.length / 8));
-  const sampleExceptionValues = new Uint8Array(exceptionCount * SH_DIMENSIONS * 2);
+  const sampleExceptionValues = new Uint8Array(exceptionCount * shDimensions * 2);
   const sampleExceptionView = new DataView(sampleExceptionValues.buffer);
   let exception = 0;
   for (let sample = 0; sample < samples.length; sample += 1) {
@@ -828,9 +1040,9 @@ function trainShTemplate(
     const [segmentIndex, local] = samples[sample];
     const segment = segments[segmentIndex];
     const base = local * segment.propertyNames.length;
-    for (let dimension = 0; dimension < SH_DIMENSIONS; dimension += 1) {
+    for (let dimension = 0; dimension < shDimensions; dimension += 1) {
       sampleExceptionView.setUint16(
-        (exception * SH_DIMENSIONS + dimension) * 2,
+        (exception * shDimensions + dimension) * 2,
         segment.rows[base + segment.propertyIndex.get(`f_rest_${dimension}`)!],
         true,
       );
@@ -841,16 +1053,17 @@ function trainShTemplate(
   const estimatedStoredBytes = zlibSync(sampleLabels, { level: 9 }).byteLength
     + zlibSync(sampleExceptionMask, { level: 9 }).byteLength
     + zlibSync(sampleExceptionValues, { level: 9 }).byteLength;
-  const codebookBytesPerInstance = (SH_DIMENSIONS * 2 + template.levels * SH_CODEBOOK_SIZE * SH_DIMENSIONS * 2) / totalInstances;
+  const codebookBytesPerInstance = (shDimensions * 2 + template.levels * SH_CODEBOOK_SIZE * shDimensions * 2) / totalInstances;
   return {
     levels,
-    sampleRmse: Math.sqrt(squaredError / (samples.length * SH_DIMENSIONS)),
+    sampleRmse: Math.sqrt(squaredError / (samples.length * shDimensions)),
     estimatedExceptionRatio,
     estimatedBytesPerInstance: estimatedStoredBytes / samples.length + codebookBytesPerInstance,
   };
 }
 
 function packShTrees(levels: readonly ShProductLevel[]): PackedShTrees {
+  const shDimensions = levels[0].centers.length / SH_CODEBOOK_SIZE;
   const maximumDimensions = Math.max(...levels.map((level) => level.dimensions.length));
   const levelDimensions = new Uint32Array(levels.length * maximumDimensions);
   const dimensionCounts = new Uint32Array(levels.length);
@@ -873,7 +1086,7 @@ function packShTrees(levels: readonly ShProductLevel[]): PackedShTrees {
     for (let label = 0; label < SH_CODEBOOK_SIZE; label += 1) {
       for (let component = 0; component < level.dimensions.length; component += 1) {
         centers[(levelIndex * SH_CODEBOOK_SIZE + label) * maximumDimensions + component]
-          = level.centers[label * SH_DIMENSIONS + level.dimensions[component]];
+          = level.centers[label * shDimensions + level.dimensions[component]];
       }
     }
   }
@@ -885,6 +1098,7 @@ function assignShCpu(
   levels: readonly ShProductLevel[],
   halfToFloat: (bits: number) => number,
 ): ShAssignmentResult {
+  const shDimensions = levels[0].centers.length / SH_CODEBOOK_SIZE;
   const startedAt = performance.now();
   const labels = segments.map((segment) => new Uint8Array(segment.count * levels.length));
   const squaredErrors = segments.map((segment) => new Float64Array(segment.count));
@@ -903,7 +1117,7 @@ function assignShCpu(
         const label = assignShTree(level, vector.subarray(0, level.dimensions.length));
         labels[segmentIndex][local * levels.length + levelIndex] = label;
         for (let component = 0; component < level.dimensions.length; component += 1) {
-          const difference = vector[component] - level.centers[label * SH_DIMENSIONS + level.dimensions[component]];
+          const difference = vector[component] - level.centers[label * shDimensions + level.dimensions[component]];
           const absolute = Math.abs(difference);
           vectorSquaredError += difference * difference;
           vectorMaximumError = Math.max(vectorMaximumError, absolute);
@@ -934,8 +1148,9 @@ function runShAssignmentWorker(
   requestId: number,
   segment: BrowserSegment,
   packed: PackedShTrees,
+  shDimensions: number,
 ): Promise<ShWorkerResult> {
-  const shIndices = Uint32Array.from({ length: SH_DIMENSIONS }, (_, dimension) => {
+  const shIndices = Uint32Array.from({ length: shDimensions }, (_, dimension) => {
     const index = segment.propertyIndex.get(`f_rest_${dimension}`);
     if (index === undefined) throw new Error(`${segment.path} 缺少 f_rest_${dimension}。`);
     return index;
@@ -982,20 +1197,21 @@ function runShAssignmentWorker(
   });
 }
 
-function shWasmWorkerCount(segmentCount: number): number {
+function shWasmWorkerCount(segmentCount: number, workerLimit = Number.POSITIVE_INFINITY): number {
   const hardwareConcurrency = navigator.hardwareConcurrency || 4;
-  if (hardwareConcurrency >= 24) return Math.min(segmentCount, 6);
-  if (hardwareConcurrency >= 12) return Math.min(segmentCount, 4);
-  return Math.min(segmentCount, 2);
+  const preferred = hardwareConcurrency >= 24 ? 6 : hardwareConcurrency >= 12 ? 4 : 2;
+  return Math.max(1, Math.min(segmentCount, preferred, workerLimit));
 }
 
 async function assignShWasmWorkers(
   segments: readonly BrowserSegment[],
   levels: readonly ShProductLevel[],
+  shDimensions: number,
   onProgress?: (ratio: number, message: string, detail?: Partial<FourCgsProgress>) => void,
+  workerLimit = Number.POSITIVE_INFINITY,
 ): Promise<ShAssignmentResult> {
   const startedAt = performance.now();
-  const workerCount = shWasmWorkerCount(segments.length);
+  const workerCount = shWasmWorkerCount(segments.length, workerLimit);
   const packed = packShTrees(levels);
   const labels = new Array<Uint8Array>(segments.length);
   const squaredErrors = new Array<Float64Array>(segments.length);
@@ -1008,7 +1224,7 @@ async function assignShWasmWorkers(
       for (;;) {
         const segmentIndex = nextSegment++;
         if (segmentIndex >= segments.length) return;
-        const result = await runShAssignmentWorker(worker, segmentIndex, segments[segmentIndex], packed);
+        const result = await runShAssignmentWorker(worker, segmentIndex, segments[segmentIndex], packed, shDimensions);
         labels[segmentIndex] = result.labels;
         squaredErrors[segmentIndex] = result.squaredErrors;
         maximumErrors[segmentIndex] = result.maximumErrors;
@@ -1038,8 +1254,10 @@ async function assignShWasmWorkers(
 async function assignSh(
   segments: readonly BrowserSegment[],
   levels: readonly ShProductLevel[],
+  shDimensions: number,
   halfToFloat: (bits: number) => number,
   onProgress?: (ratio: number, message: string, detail?: Partial<FourCgsProgress>) => void,
+  workerLimit = Number.POSITIVE_INFINITY,
 ): Promise<ShAssignmentResult> {
   const wasmSupported = globalThis.crossOriginIsolated
     && typeof SharedArrayBuffer !== 'undefined'
@@ -1048,11 +1266,11 @@ async function assignSh(
     && segments.every((segment) => segment.rows.buffer instanceof SharedArrayBuffer);
   if (wasmSupported) {
     try {
-      onProgress?.(0.36, `正在以 ${shWasmWorkerCount(segments.length)} 个 WASM Worker 扫描全部 SH`, {
-        stage: 'SH WASM 并行标签', stageRatio: 0, workerCount: shWasmWorkerCount(segments.length),
+      onProgress?.(0.36, `正在以 ${shWasmWorkerCount(segments.length, workerLimit)} 个 WASM Worker 扫描全部 SH`, {
+        stage: 'SH WASM 并行标签', stageRatio: 0, workerCount: shWasmWorkerCount(segments.length, workerLimit),
         completedTasks: 0, totalTasks: segments.length,
       });
-      return await assignShWasmWorkers(segments, levels, onProgress);
+      return await assignShWasmWorkers(segments, levels, shDimensions, onProgress, workerLimit);
     } catch (error) {
       onProgress?.(0.36, `SH WASM 不可用，安全回退 JavaScript：${error instanceof Error ? error.message : String(error)}`, {
         stage: 'SH JavaScript 回退', stageRatio: 0, workerCount: 1,
@@ -1066,19 +1284,22 @@ async function assignSh(
 async function trainAdaptiveSh(
   segments: readonly BrowserSegment[],
   layout: MortonLayout,
+  shDimensions: number,
   floatToHalf: (value: number) => number,
   halfToFloat: (bits: number) => number,
   onProgress?: (ratio: number, message: string, detail?: Partial<FourCgsProgress>) => void,
+  workerLimit = Number.POSITIVE_INFINITY,
 ): Promise<TrainedSh> {
   const samples = sampleReferences(segments);
+  const templates = shTemplates(shDimensions);
   let selected: ReturnType<typeof trainShTemplate> | undefined;
-  let selectedTemplate = SH_TEMPLATES[SH_TEMPLATES.length - 1];
+  let selectedTemplate = templates[templates.length - 1];
   let selectedRate = Number.POSITIVE_INFINITY;
   const attempts: TrainedSh['metrics']['attempts'][number][] = [];
-  for (let index = 0; index < SH_TEMPLATES.length; index += 1) {
-    const template = SH_TEMPLATES[index];
+  for (let index = 0; index < templates.length; index += 1) {
+    const template = templates[index];
     onProgress?.(0.29 + index * 0.025, `正在训练通用 SH ${template.name} 档`);
-    const trained = trainShTemplate(segments, template, samples, floatToHalf, halfToFloat);
+    const trained = trainShTemplate(segments, template, shDimensions, samples, floatToHalf, halfToFloat);
     attempts.push({
       template: template.name,
       sampleRmse: trained.sampleRmse,
@@ -1092,7 +1313,7 @@ async function trainAdaptiveSh(
     }
   }
   if (!selected) throw new Error('SH 自适应训练未产生结果。');
-  const assignment = await assignSh(segments, selected.levels, halfToFloat, onProgress);
+  const assignment = await assignSh(segments, selected.levels, shDimensions, halfToFloat, onProgress, workerLimit);
   const labels = assignment.labels;
   const localSquaredErrors = assignment.squaredErrors;
   const localMaximumErrors = assignment.maximumErrors;
@@ -1104,9 +1325,9 @@ async function trainAdaptiveSh(
   let totalSquaredError = 0;
   let maximumAbsoluteError = 0;
   for (let segmentIndex = 0; segmentIndex < segments.length; segmentIndex += 1) {
-    const inverse = layout.slotToLocal[segmentIndex];
-    for (const slot of layout.activeSlots[segmentIndex]) {
-      const local = inverse[slot];
+    const activeLocals = layout.activeLocals[segmentIndex];
+    for (let row = 0; row < activeLocals.length; row += 1) {
+      const local = activeLocals[row];
       // #WDD-gpt 2026-08-16 - 标签阶段已取得同一 45D 向量和中心，复用误差结果避免对全部 SH 再扫描一次。
       const vectorSquaredError = localSquaredErrors[segmentIndex][local];
       const vectorMaximumError = localMaximumErrors[segmentIndex][local];
@@ -1132,7 +1353,7 @@ async function trainAdaptiveSh(
     maximumVectorSquaredError = Math.max(maximumVectorSquaredError, vectorSquaredErrors[index]);
     if (vectorMaximumErrors[index] > SH_MAXIMUM_COEFFICIENT_ERROR) markException(index);
   }
-  const targetSquaredError = SH_TARGET_RMSE * SH_TARGET_RMSE * instanceCount * SH_DIMENSIONS;
+  const targetSquaredError = SH_TARGET_RMSE * SH_TARGET_RMSE * instanceCount * shDimensions;
   if (retainedSquaredError > targetSquaredError && maximumVectorSquaredError > 0) {
     const histogram = new Uint32Array(4096);
     const histogramError = new Float64Array(4096);
@@ -1162,20 +1383,20 @@ async function trainAdaptiveSh(
     }
   }
 
-  const exceptionValues = new Uint8Array(exceptionCount * SH_DIMENSIONS * 2);
+  const exceptionValues = new Uint8Array(exceptionCount * shDimensions * 2);
   const exceptionView = new DataView(exceptionValues.buffer);
   instance = 0;
   let exception = 0;
   for (let segmentIndex = 0; segmentIndex < segments.length; segmentIndex += 1) {
     const segment = segments[segmentIndex];
-    const inverse = layout.slotToLocal[segmentIndex];
-    for (const slot of layout.activeSlots[segmentIndex]) {
-      const local = inverse[slot];
+    const activeLocals = layout.activeLocals[segmentIndex];
+    for (let row = 0; row < activeLocals.length; row += 1) {
+      const local = activeLocals[row];
       if (exceptionMask[instance >>> 3] & (1 << (instance & 7))) {
         const base = local * segment.propertyNames.length;
-        for (let dimension = 0; dimension < SH_DIMENSIONS; dimension += 1) {
+        for (let dimension = 0; dimension < shDimensions; dimension += 1) {
           exceptionView.setUint16(
-            (exception * SH_DIMENSIONS + dimension) * 2,
+            (exception * shDimensions + dimension) * 2,
             segment.rows[base + segment.propertyIndex.get(`f_rest_${dimension}`)!],
             true,
           );
@@ -1187,8 +1408,8 @@ async function trainAdaptiveSh(
   }
   if (exception !== exceptionCount) throw new Error('SH 稀疏修正计数不一致。');
 
-  const base = Buffer.alloc(SH_DIMENSIONS * 2 + selectedTemplate.levels * SH_CODEBOOK_SIZE * SH_DIMENSIONS * 2);
-  let baseOffset = SH_DIMENSIONS * 2;
+  const base = Buffer.alloc(shDimensions * 2 + selectedTemplate.levels * SH_CODEBOOK_SIZE * shDimensions * 2);
+  let baseOffset = shDimensions * 2;
   for (const level of selected.levels) {
     for (let index = 0; index < level.centers.length; index += 1) {
       base.writeUInt16LE(floatToHalf(level.centers[index]), baseOffset);
@@ -1196,13 +1417,14 @@ async function trainAdaptiveSh(
     }
   }
   return {
+    shDimensions,
     template: selectedTemplate,
     base,
     labels,
     exceptionMask,
     exceptionValues,
     metrics: {
-      rmse: Math.sqrt(Math.max(0, retainedSquaredError) / (instanceCount * SH_DIMENSIONS)),
+      rmse: Math.sqrt(Math.max(0, retainedSquaredError) / (instanceCount * shDimensions)),
       maximumAbsoluteError: exceptionCount > 0 ? SH_MAXIMUM_COEFFICIENT_ERROR : maximumAbsoluteError,
       exceptionCount,
       exceptionRatio: exceptionCount / instanceCount,
@@ -1238,12 +1460,14 @@ function temporalComponent(
   let destination = 0;
   for (let segmentIndex = 0; segmentIndex < segments.length; segmentIndex += 1) {
     const segment = segments[segmentIndex];
-    const inverse = layout.slotToLocal[segmentIndex];
+    const active = layout.activeSlots[segmentIndex];
+    const activeLocals = layout.activeLocals[segmentIndex];
     for (const name of namesBySegment[segmentIndex]) {
       const property = segment.propertyIndex.get(name);
       if (property === undefined) throw new Error(`${segment.path} 缺少 ${name}。`);
-      for (const slot of layout.activeSlots[segmentIndex]) {
-        const local = inverse[slot];
+      for (let row = 0; row < active.length; row += 1) {
+        const slot = active[row];
+        const local = activeLocals[row];
         const value = segment.rows[local * segment.propertyNames.length + property];
         values[destination++] = initialized[slot] ? value ^ state[slot] : value;
         state[slot] = value;
@@ -1263,10 +1487,11 @@ function opacityVectors(segments: readonly BrowserSegment[], layout: MortonLayou
   let observation = 0;
   for (let segmentIndex = 0; segmentIndex < segments.length; segmentIndex += 1) {
     const segment = segments[segmentIndex];
-    const inverse = layout.slotToLocal[segmentIndex];
+    const active = layout.activeSlots[segmentIndex];
+    const activeLocals = layout.activeLocals[segmentIndex];
     const properties = Array.from({ length: bankCounts[segmentIndex] }, (_, bank) => segment.propertyIndex.get(`opacity_bank_${bank}`)!);
-    for (const slot of layout.activeSlots[segmentIndex]) {
-      const source = inverse[slot] * segment.propertyNames.length;
+    for (let row = 0; row < active.length; row += 1) {
+      const source = activeLocals[row] * segment.propertyNames.length;
       for (let bank = 0; bank < properties.length; bank += 1) values[observation * properties.length + bank] = segment.rows[source + properties[bank]];
       observation += 1;
     }
@@ -1274,51 +1499,105 @@ function opacityVectors(segments: readonly BrowserSegment[], layout: MortonLayou
   return values;
 }
 
-function sharedShStream(trained: TrainedSh, layout: MortonLayout): Buffer {
+function concatByteChunks(chunks: readonly Uint8Array[], totalBytes: number): Uint8Array {
+  const result = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    result.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return result;
+}
+
+function zlibStreamSync(source: Uint8Array, chunkBytes = 1 << 20): Uint8Array {
+  // #WDD-gpt 2026-09-20 - 小载荷直接使用一次性 Zlib，规避流式回调在特定稀疏位图上产出不可解码码流；大载荷回调块立即复制，禁止复用内部缓冲。
+  if (source.byteLength <= chunkBytes) return zlibSync(source, { level: 9 });
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+  const encoder = new Zlib({ level: 9 }, (chunk) => {
+    const copy = chunk.slice();
+    chunks.push(copy);
+    totalBytes += copy.byteLength;
+  });
+  if (source.byteLength === 0) encoder.push(source, true);
+  else {
+    for (let offset = 0; offset < source.byteLength; offset += chunkBytes) {
+      const end = Math.min(source.byteLength, offset + chunkBytes);
+      encoder.push(source.subarray(offset, end), end === source.byteLength);
+    }
+  }
+  return concatByteChunks(chunks, totalBytes);
+}
+
+function sharedShStream(trained: TrainedSh, layout: MortonLayout): Uint8Array {
   const { labels } = trained;
   const levels = trained.template.levels;
   const instanceCount = layout.activeSlots.reduce((sum, active) => sum + active.length, 0);
   const mask = new Uint8Array(Math.ceil(instanceCount / 8));
-  const updates = new Uint8Array(instanceCount * levels);
-  const state = new Uint8Array(layout.slotCount * levels);
-  const initialized = new Uint8Array(layout.slotCount);
+  // #WDD-gpt 2026-09-19 - SH 更新标签在遍历时直接送入流式 Zlib，禁止为 2800 万观测预分配 instanceCount×levels 的整块 updates。
+  const storedUpdateChunks: Uint8Array[] = [];
+  let storedUpdateBytes = 0;
+  const updateEncoder = new Zlib({ level: 9 }, (chunk) => {
+    // #WDD-gpt 2026-09-20 - 保留每次流式回调的独立副本，避免后续 push 覆盖已登记的 SH 标签压缩块。
+    const copy = chunk.slice();
+    storedUpdateChunks.push(copy);
+    storedUpdateBytes += copy.byteLength;
+  });
+  const updateChunkBytes = 1 << 20;
+  let updateChunk = new Uint8Array(updateChunkBytes);
+  let updateChunkOffset = 0;
+  let state = new Uint8Array(layout.slotCount * levels);
+  let initialized = new Uint8Array(layout.slotCount);
   let instance = 0;
-  let updateCount = 0;
   for (let segmentIndex = 0; segmentIndex < labels.length; segmentIndex += 1) {
-    const inverse = layout.slotToLocal[segmentIndex];
-    for (const slot of layout.activeSlots[segmentIndex]) {
-      const local = inverse[slot];
+    const active = layout.activeSlots[segmentIndex];
+    const activeLocals = layout.activeLocals[segmentIndex];
+    for (let row = 0; row < active.length; row += 1) {
+      const slot = active[row];
+      const local = activeLocals[row];
       const current = labels[segmentIndex].subarray(local * levels, local * levels + levels);
       const stateOffset = slot * levels;
       let changed = !initialized[slot];
       for (let level = 0; level < levels && !changed; level += 1) changed = state[stateOffset + level] !== current[level];
       if (changed) {
         mask[instance >>> 3] |= 1 << (instance & 7);
-        updates.set(current, updateCount * levels);
+        if (updateChunkOffset + levels > updateChunk.byteLength) {
+          updateEncoder.push(updateChunk.subarray(0, updateChunkOffset), false);
+          updateChunk = new Uint8Array(updateChunkBytes);
+          updateChunkOffset = 0;
+        }
+        updateChunk.set(current, updateChunkOffset);
+        updateChunkOffset += levels;
         state.set(current, stateOffset);
         initialized[slot] = 1;
-        updateCount += 1;
       }
       instance += 1;
     }
   }
-  const storedMask = zlibSync(mask, { level: 9 });
-  const storedUpdates = zlibSync(updates.subarray(0, updateCount * levels), { level: 9 });
-  const storedExceptions = zlibSync(trained.exceptionMask, { level: 9 });
-  const storedExceptionValues = zlibSync(trained.exceptionValues, { level: 9 });
+  updateEncoder.push(updateChunk.subarray(0, updateChunkOffset), true);
+  const storedUpdates = concatByteChunks(storedUpdateChunks, storedUpdateBytes);
+  updateChunk = new Uint8Array(0);
+  // #WDD-gpt 2026-09-19 - 状态表只服务更新判定；进入其余流压缩前解除引用，避免最终码流分配与约 slotCount×levels 状态重叠。
+  state = new Uint8Array(0);
+  initialized = new Uint8Array(0);
+  const storedMask = zlibStreamSync(mask);
+  const storedExceptions = zlibStreamSync(trained.exceptionMask);
+  // #WDD-gpt 2026-09-20 - FP16 例外向量先拆分低/高字节平面，不改变系数位模式即提高 Zlib 的重复性。
+  const storedExceptionValues = zlibStreamSync(shuffle16WithPadding(trained.exceptionValues));
   const header = Buffer.alloc(40);
-  header.write('C5T2SH01', 0, 'ascii');
+  header.write('C5T3SH01', 0, 'ascii');
   header.writeUInt32LE(layout.slotCount, 8);
   header.writeUInt32LE(instanceCount, 12);
   header.writeUInt16LE(labels.length, 16);
-  header.writeUInt8(SH_DIMENSIONS, 18);
+  header.writeUInt8(trained.shDimensions, 18);
   header.writeUInt8(levels, 19);
   header.writeUInt32LE(trained.base.length, 20);
   header.writeUInt32LE(storedMask.length, 24);
   header.writeUInt32LE(storedUpdates.length, 28);
   header.writeUInt32LE(storedExceptions.length, 32);
   header.writeUInt32LE(storedExceptionValues.length, 36);
-  return Buffer.concat([header, trained.base, storedMask, storedUpdates, storedExceptions, storedExceptionValues]);
+  const parts = [header, trained.base, storedMask, storedUpdates, storedExceptions, storedExceptionValues];
+  return concatByteChunks(parts, parts.reduce((sum, part) => sum + part.byteLength, 0));
 }
 
 async function storedStream(
@@ -1333,8 +1612,14 @@ async function storedStream(
     const source = compression === 'brotli-shuffle16' ? shuffle16WithPadding(raw) : raw;
     stored = brotli.compress(source, { quality: 9 });
   }
-  const bytes = new Uint8Array(stored.byteLength);
-  bytes.set(stored);
+  // #WDD-gpt 2026-09-19 - raw 辅助流直接沿用其独占缓冲区；仅对 WASM 视图或非完整切片制作必要副本。
+  const bytes = stored === raw
+    ? new Uint8Array(transferableArrayBuffer(raw))
+    : (() => {
+        const copy = new Uint8Array(stored.byteLength);
+        copy.set(stored);
+        return copy;
+      })();
   return {
     entry: {
       name,
@@ -1348,6 +1633,74 @@ async function storedStream(
   };
 }
 
+function transferableArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+  if (bytes.buffer instanceof ArrayBuffer && bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength) {
+    return bytes.buffer;
+  }
+  return bytes.slice().buffer as ArrayBuffer;
+}
+
+async function storedBrotliStreamInWorker(
+  name: string,
+  raw: Uint8Array,
+  compression: 'brotli' | 'brotli-shuffle16',
+  onHeartbeat?: (elapsedMs: number) => void,
+): Promise<StoredStream> {
+  const rawBytes = raw.byteLength;
+  const rawSha256 = hash(raw);
+  const source = transferableArrayBuffer(raw);
+  const worker = new Worker(new URL('./fourcgs-brotli-compress.worker.ts', import.meta.url), { type: 'module' });
+  const startedAt = performance.now();
+  return new Promise<StoredStream>((resolve, reject) => {
+    let settled = false;
+    const heartbeat = globalThis.setInterval(() => onHeartbeat?.(performance.now() - startedAt), 15_000);
+    const finish = () => {
+      if (settled) return false;
+      settled = true;
+      globalThis.clearInterval(heartbeat);
+      worker.terminate();
+      return true;
+    };
+    worker.addEventListener('message', (event: MessageEvent<{
+      readonly type: 'started' | 'result' | 'error';
+      readonly requestId: number;
+      readonly bytes?: ArrayBuffer;
+      readonly message?: string;
+    }>) => {
+      if (event.data.requestId !== 0 || event.data.type === 'started') return;
+      if (!finish()) return;
+      if (event.data.type === 'error' || !event.data.bytes) {
+        reject(new Error(event.data.message ?? `${name} Brotli Worker 未返回压缩结果。`));
+        return;
+      }
+      const bytes = new Uint8Array(event.data.bytes);
+      resolve({
+        entry: {
+          name, compression, rawBytes, storedBytes: bytes.byteLength,
+          rawSha256, storedSha256: hash(bytes),
+        },
+        bytes,
+      });
+    });
+    worker.addEventListener('error', (event) => {
+      if (!finish()) return;
+      reject(new Error(event.message || `${name} Brotli Worker 崩溃。`));
+    }, { once: true });
+    worker.addEventListener('messageerror', () => {
+      if (!finish()) return;
+      reject(new Error(`${name} Brotli Worker 的结果消息无法解析。`));
+    }, { once: true });
+    try {
+      worker.postMessage({
+        requestId: 0, bytes: source, quality: 9, shuffle16: compression === 'brotli-shuffle16',
+      }, [source]);
+    } catch (error) {
+      finish();
+      reject(error);
+    }
+  });
+}
+
 function container(manifest: FourCgsManifest, streams: readonly StoredStream[]): Blob {
   const manifestBytes = new TextEncoder().encode(JSON.stringify(manifest));
   const header = new Uint8Array(FOUR_CGS_HEADER_BYTES);
@@ -1356,7 +1709,8 @@ function container(manifest: FourCgsManifest, streams: readonly StoredStream[]):
   return new Blob([
     header.buffer as ArrayBuffer,
     manifestBytes.buffer as ArrayBuffer,
-    ...streams.map((stream) => stream.bytes.slice().buffer as ArrayBuffer),
+    // #WDD-gpt 2026-09-19 - 大流已经拥有独立 ArrayBuffer 时直接交给 Blob，禁止成品组装前再复制一整份压缩结果。
+    ...streams.map((stream) => transferableArrayBuffer(stream.bytes)),
   ], { type: 'application/x-4cgs' });
 }
 
@@ -1368,16 +1722,16 @@ function sharedInt32(values: Int32Array): Int32Array {
 }
 
 function shareEncoderLayout(layout: MortonLayout): MortonLayout {
-  // #WDD-gpt 2026-08-16 - 属性编码只读取 slotCount/activeSlots/slotToLocal；禁止把近百万项 Morton order 与匹配诊断重复克隆给每个 Worker。
+  // #WDD-gpt 2026-09-19 - Worker 只共享同序 activeSlots/activeLocals 稀疏对，禁止恢复每段全局 Track 长度的稠密反表。
   return {
     slotCount: layout.slotCount,
     trackCount: layout.trackCount,
     sourcePermanentTrackCount: layout.sourcePermanentTrackCount,
     droppedTrackCount: layout.droppedTrackCount,
     maps: [],
-    slotToLocal: layout.slotToLocal.map(sharedInt32),
     continuedLocal: [],
     activeSlots: layout.activeSlots.map(sharedInt32),
+    activeLocals: layout.activeLocals.map(sharedInt32),
     matches: [],
   };
 }
@@ -1389,6 +1743,7 @@ function runEncodeAttributeWorker(
   descriptors: readonly FourCgsSegment[],
   crop: { readonly center: readonly [number, number, number]; readonly halfExtent: number },
   onStarted: () => void,
+  positionEnvelopeWorkerCount: number,
 ): Promise<ParallelAttributeResult> {
   return new Promise((resolve, reject) => {
     const worker = new Worker(new URL('./fourcgs-encode-attribute.worker.ts', import.meta.url), { type: 'module' });
@@ -1421,17 +1776,30 @@ function runEncodeAttributeWorker(
       finish();
       reject(new Error(event.message || `4CGS ${task} 编码 Worker 崩溃。`));
     }, { once: true });
-    worker.postMessage({
-      task,
-      segments,
-      layout,
-      descriptors,
-      options: task === 'position'
-        ? { center: crop.center, halfExtent: crop.halfExtent, step: POSITION_STEP, maximumError: POSITION_MAXIMUM_ERROR, cellSize: 0.5 }
-        : task === 'rotation'
-          ? { bits: 12, stepDegrees: ROTATION_STEP_DEGREES, maximumAngleDegrees: ROTATION_MAXIMUM_DEGREES }
-          : { step: task.startsWith('scale') ? SCALE_STEP : DC_STEP },
-    });
+    worker.addEventListener('messageerror', () => {
+      finish();
+      reject(new Error(`4CGS ${task} 编码 Worker 的超大结果消息无法解析。`));
+    }, { once: true });
+    try {
+      worker.postMessage({
+        task,
+        segments,
+        layout,
+        descriptors,
+        options: task === 'position'
+          ? {
+            center: crop.center, halfExtent: crop.halfExtent, step: POSITION_STEP,
+            maximumError: POSITION_MAXIMUM_ERROR, cellSize: 0.5,
+            envelopeWorkerCount: positionEnvelopeWorkerCount,
+          }
+          : task === 'rotation'
+            ? { bits: 12, stepDegrees: ROTATION_STEP_DEGREES, maximumAngleDegrees: ROTATION_MAXIMUM_DEGREES }
+            : { step: task.startsWith('scale') ? SCALE_STEP : DC_STEP },
+      });
+    } catch (error) {
+      finish();
+      reject(error);
+    }
   });
 }
 
@@ -1441,14 +1809,18 @@ function encodeAttributesInWorkerPool(
   descriptors: readonly FourCgsSegment[],
   crop: { readonly center: readonly [number, number, number]; readonly halfExtent: number },
   onProgress?: (ratio: number, message: string, detail?: Partial<FourCgsProgress>) => void,
+  workerLimit = Number.POSITIVE_INFINITY,
+  positionEnvelopeWorkerCount = 4,
 ): {
   readonly ready: Promise<void>;
-  readonly done: Promise<{ readonly results: ReadonlyMap<ParallelAttributeResult['task'], ParallelAttributeResult>; readonly workerCount: number }>;
+  readonly done: Promise<ParallelAttributePoolResult>;
 } {
   const tasks: ParallelAttributeResult['task'][] = ['position', 'rotation', 'scale0', 'scale1', 'scale2', 'dc'];
   const hardwareConcurrency = navigator.hardwareConcurrency || 4;
-  const workerCount = Math.min(tasks.length, Math.max(2, Math.floor((hardwareConcurrency - 2) / 2)));
-  const positionEnvelopeWorkers = hardwareConcurrency >= 12 ? 4 : hardwareConcurrency >= 8 ? 3 : 2;
+  const workerCount = Math.max(1, Math.min(
+    tasks.length, workerLimit, Math.max(2, Math.floor((hardwareConcurrency - 2) / 2)),
+  ));
+  const positionEnvelopeWorkers = positionEnvelopeWorkerCount;
   const peakWorkerCount = workerCount + 1 + positionEnvelopeWorkers;
   const sharedLayout = shareEncoderLayout(layout);
   let nextTask = 0;
@@ -1466,7 +1838,7 @@ function encodeAttributesInWorkerPool(
       const result = await runEncodeAttributeWorker(task, segments, sharedLayout, descriptors, crop, () => {
         started += 1;
         if (started === initialWorkerCount) resolveReady();
-      });
+      }, positionEnvelopeWorkers);
       results.set(task, result);
       completed += 1;
       const timingLabel = task === 'position'
@@ -1502,7 +1874,9 @@ export async function encodeRaw4DV26Browser(
   files: readonly File[],
   deletionWords: readonly Uint32Array[],
   onProgress?: (ratio: number, message: string, detail?: Partial<FourCgsProgress>) => void,
+  exportOptions: FourCgsExportOptions = LEGACY_V26_OPTIONS,
 ): Promise<FourCgsEncodeResult> {
+  const options = normalizeV26Options(exportOptions);
   if (files.length === 0) throw new Error('没有可编码的 RAW4D 文件。');
   if (deletionWords.length !== files.length) throw new Error(`RAW4D 删除位集数量不一致：${deletionWords.length}/${files.length}。`);
   onProgress?.(0.01, '正在读取当前 RAW4D 头');
@@ -1524,37 +1898,56 @@ export async function encodeRaw4DV26Browser(
   for (let index = 0; index < ordered.length; index += 1) {
     const source = ordered[index];
     onProgress?.(0.03 + index * 0.18 / ordered.length, `正在读取并去掉删除点 ${index + 1}/${ordered.length}：${source.file.name}`);
-    const compacted = await compactSegment(source, deletionWords[source.fileIndex]);
+    const compacted = await compactSegment(source, deletionWords[source.fileIndex], options);
     prepared.push({
       name: source.file.name,
       sourceEncoding: source.header.scalarEncoding,
-      sourceShBands: 3,
-      descriptor: segmentDescriptor(source, compacted.segment.count),
+      sourceShBands: shBandsFromDimensions(sourceShDimensions(source.header)),
+      descriptor: segmentDescriptor(source, compacted.segment.count, options.shLevel),
       originalPointCount: source.header.vertexCount,
+      alphaPrunedPointCount: 0,
       compacted,
     });
   }
-  return encodePreparedRaw4DV26(prepared, onProgress);
+  return encodePreparedRaw4DV26(prepared, options, onProgress);
 }
 
 // #WDD-gpt 2026-08-16 - 内存保存绕过 File 解析，直接从当前 SoA 位模式建立压缩工作集。
 export async function encodeRaw4DV26BrowserMemory(
   sources: readonly Raw4DMemorySnapshot[],
   onProgress?: (ratio: number, message: string, detail?: Partial<FourCgsProgress>) => void,
+  exportOptions: FourCgsExportOptions = LEGACY_V26_OPTIONS,
 ): Promise<FourCgsEncodeResult> {
+  const options = normalizeV26Options(exportOptions);
   if (sources.length === 0) throw new Error('没有可编码的 RAW4D 内存快照。');
   const ordered = orderedMemorySources(sources);
   const prepared: PreparedV26Source[] = [];
   for (let index = 0; index < ordered.length; index += 1) {
     const precision = ordered[index].asset.sourceEncoding === 'float32' ? '（Float32 → FP16 编码工作副本）' : '';
     onProgress?.(0.03 + index * 0.18 / ordered.length, `正在从 Canonical RAM 压实 ${index + 1}/${ordered.length}：${ordered[index].name}${precision}`);
-    prepared.push(await compactMemorySegment(ordered[index]));
+    const compacted = await compactMemorySegment(ordered[index], options);
+    prepared.push(compacted);
+    if (options.maximumEffectiveAlpha > 0) {
+      const alphaBackend = compacted.alphaScanBackend === 'webgpu-witness-cpu-verified'
+        ? `WebGPU 扫描 ${(compacted.alphaGpuElapsedMs! / 1000).toFixed(2)} 秒 · CPU 验证 ${compacted.alphaGpuVerifiedWitnessCount!.toLocaleString()} 点`
+        : 'CPU 完整扫描';
+      onProgress?.(0.03 + (index + 1) * 0.18 / ordered.length,
+        `Alpha ${index + 1}/${ordered.length} 完成 · ${alphaBackend} · 剪除 ${compacted.alphaPrunedPointCount.toLocaleString()} 点`, {
+          stage: compacted.alphaScanBackend === 'webgpu-witness-cpu-verified' ? 'WebGPU Alpha 扫描' : 'CPU Alpha 扫描',
+          stageRatio: (index + 1) / ordered.length,
+          workerCount: 1,
+          completedTasks: index + 1,
+          totalTasks: ordered.length,
+          elapsedMs: compacted.alphaGpuElapsedMs,
+        });
+    }
   }
-  return encodePreparedRaw4DV26(prepared, onProgress);
+  return encodePreparedRaw4DV26(prepared, options, onProgress);
 }
 
 async function encodePreparedRaw4DV26(
   prepared: readonly PreparedV26Source[],
+  options: FourCgsExportOptions,
   onProgress?: (ratio: number, message: string, detail?: Partial<FourCgsProgress>) => void,
 ): Promise<FourCgsEncodeResult> {
   const totalStartedAt = performance.now();
@@ -1563,60 +1956,179 @@ async function encodePreparedRaw4DV26(
   const compacted = prepared.map((source) => source.compacted);
   const segments = compacted.map((value) => value.segment);
   const descriptors = prepared.map((source) => source.descriptor);
+  const shDimensions = fourCgsShDimensions(descriptors[0]);
+  if (descriptors.some((descriptor) => fourCgsShDimensions(descriptor) !== shDimensions)) {
+    throw new Error('4CGS 各片段 SH 阶数必须一致。');
+  }
+  onProgress?.(0.215, '正在建立稀疏永久 Track 映射', {
+    stage: '稀疏 Track 匹配', stageRatio: 0, workerCount: 1,
+  });
   const permanent = buildExactBoundaryPermanentTrackMaps(segments);
   const prsCodec = await import('../../../../../scripts/fourcgs-prs-codec.mjs');
-  const crop = computeInputCrop(segments, prsCodec.halfToFloat);
+  const cropStartedAt = performance.now();
+  const preferredCrop = await computeInputCropPreferred(segments, prsCodec.halfToFloat);
+  const crop = preferredCrop.crop;
+  stageMs.crop = performance.now() - cropStartedAt;
+  onProgress?.(0.225, preferredCrop.backend === 'webgpu'
+    ? `WebGPU 已归约全部 Position bank 包围盒 · ${(stageMs.crop / 1000).toFixed(2)} 秒`
+    : `CPU 已归约全部 Position bank 包围盒 · ${(stageMs.crop / 1000).toFixed(2)} 秒`, {
+    stage: preferredCrop.backend === 'webgpu' ? 'WebGPU Position 归约' : 'CPU Position 归约',
+    stageRatio: 1,
+    workerCount: 1,
+    elapsedMs: stageMs.crop,
+  });
+  onProgress?.(0.23, `正在按 Morton 顺序整理 ${permanent.slotCount.toLocaleString()} 条 Track`, {
+    stage: '稀疏 Morton 布局', stageRatio: 0, workerCount: 1,
+  });
   const layout = prsCodec.buildCroppedMortonLayout(
     segments,
     permanent,
     crop.center,
     crop.halfExtent,
-    // #WDD-gpt 2026-08-16 - crop 刚由全部 Position 关键帧的有限 min/max 生成并增加余量，无需在 Morton 阶段重复扫描验证。
-    { positionsAlreadyInside: true },
+    // #WDD-gpt 2026-09-19 - crop 已覆盖全部 Position；按活跃点保存 slot/local 对并直接共享，避免 108×全局 Track 稠密反表及 Worker 复制。
+    {
+      positionsAlreadyInside: true,
+      sparseInverse: true,
+      sharedArrays: globalThis.crossOriginIsolated && typeof SharedArrayBuffer !== 'undefined',
+      // #WDD-gpt 2026-09-19 - 浏览器编码只消费稀疏 slot/local 对，布局完成后释放千万级 Morton order 与 oldToNew。
+      retainRemap: false,
+    },
   ) as MortonLayout;
   if (layout.droppedTrackCount !== 0) throw new Error(`输入自适应包围盒意外丢弃 ${layout.droppedTrackCount} 条轨迹。`);
+  const activeObservationCount = layout.activeSlots.reduce((sum, active) => sum + active.length, 0);
+  const sparseLayoutBytes = activeObservationCount * Int32Array.BYTES_PER_ELEMENT * 2;
+  const avoidedDenseInverseBytes = layout.sourcePermanentTrackCount
+    * segments.length * Int32Array.BYTES_PER_ELEMENT;
+  const releasedMortonRemapBytes = layout.trackCount * Int32Array.BYTES_PER_ELEMENT
+    + layout.sourcePermanentTrackCount * Int32Array.BYTES_PER_ELEMENT;
+  const releasedSourceMappingBytes = permanent.maps.reduce((sum, map) => sum + map.byteLength, 0)
+    + permanent.continuedLocal.reduce((sum, continued) => sum + continued.byteLength, 0);
+  // #WDD-gpt 2026-09-19 - 稀疏 slot/local 对已独立完成，立即断开原 local→Track 与 continued 引用，供 GC 回收约 5B/观测。
+  (permanent.maps as Int32Array[]).length = 0;
+  (permanent.continuedLocal as Uint8Array[]).length = 0;
   stageMs.layout = performance.now() - totalStartedAt;
-  const parallelSupported = globalThis.crossOriginIsolated
+  onProgress?.(0.26, `稀疏布局完成：${(sparseLayoutBytes / 1_000_000).toFixed(1)}M，已释放 ${((releasedMortonRemapBytes + releasedSourceMappingBytes) / 1_000_000).toFixed(1)}M 临时索引`, {
+    stage: '稀疏 Morton 布局', stageRatio: 1, workerCount: 1,
+  });
+  // #WDD-gpt 2026-09-19 - 超大序列优先稳定性，避免 6 路属性状态、SH 与辅助流同时推高浏览器 Worker 峰值。
+  const lowMemoryMode = layout.slotCount >= 8_000_000 || activeObservationCount >= 12_000_000;
+  // #WDD-gpt 2026-09-19 - 千万 Track 级属性结果可能超过 Chromium 跨 Worker 消息的可靠交付范围；大序列全部留在总控 Worker 串行编码。
+  const parallelSupported = !lowMemoryMode
+    && globalThis.crossOriginIsolated
     && typeof SharedArrayBuffer !== 'undefined'
     && segments.every((segment) => segment.rows.buffer instanceof SharedArrayBuffer)
     && (navigator.hardwareConcurrency || 4) >= 6;
+  const attributeWorkerLimit = lowMemoryMode ? 2 : 6;
   const parallelAttributeWorkerCount = parallelSupported
-    ? Math.min(6, Math.max(2, Math.floor(((navigator.hardwareConcurrency || 4) - 2) / 2)))
+    ? Math.min(attributeWorkerLimit, Math.max(2, Math.floor(((navigator.hardwareConcurrency || 4) - 2) / 2)))
     : 0;
   const parallelPositionEnvelopeWorkerCount = parallelSupported
-    ? (navigator.hardwareConcurrency || 4) >= 12 ? 4 : (navigator.hardwareConcurrency || 4) >= 8 ? 3 : 2
+    ? lowMemoryMode ? 1 : (navigator.hardwareConcurrency || 4) >= 12 ? 4 : (navigator.hardwareConcurrency || 4) >= 8 ? 3 : 2
     : 0;
+  if (lowMemoryMode) {
+    onProgress?.(0.265, `大序列可靠传输模式：${layout.slotCount.toLocaleString()} 条 Track，SH、属性、辅助流在总控 Worker 分阶段串行`, {
+      stage: '大序列可靠调度', stageRatio: 1, workerCount: 1,
+    });
+  }
   const attributePool = parallelSupported
-    ? encodeAttributesInWorkerPool(segments, layout, descriptors, crop, onProgress)
+    ? encodeAttributesInWorkerPool(
+      segments, layout, descriptors, crop, onProgress,
+      attributeWorkerLimit, parallelPositionEnvelopeWorkerCount,
+    )
     : null;
   if (attributePool) {
     // #WDD-gpt 2026-08-16 - 先让嵌套 Worker 完成模块/WASM 启动并真正进入编码，再同步训练 SH，防止启动消息被 17 秒计算段饿死。
     await attributePool.ready;
-    onProgress?.(0.27, '属性 Worker 已全部启动；现在与 SH 训练并行', {
+    onProgress?.(lowMemoryMode ? 0.275 : 0.27, lowMemoryMode
+      ? '低内存阶段 1/3 · 属性 Worker 已全部启动，完成后再训练 SH'
+      : '属性 Worker 已全部启动；现在与 SH 训练并行', {
       stage: 'Worker 启动屏障', stageRatio: 1,
       workerCount: parallelAttributeWorkerCount + 1 + parallelPositionEnvelopeWorkerCount,
       completedTasks: 0, totalTasks: 6,
     });
   }
+  let completedParallel: ParallelAttributePoolResult | undefined;
+  if (attributePool && lowMemoryMode) {
+    // #WDD-gpt 2026-09-19 - 千万 Track 级导出严格分阶段：先收齐并终止属性 Worker，再启动 SH，避免结果 transfer 与 SH/辅助流内存峰值互相饿死。
+    const attributeStartedAt = performance.now();
+    completedParallel = await attributePool.done;
+    stageMs.attributeWait = performance.now() - attributeStartedAt;
+  }
   const shStartedAt = performance.now();
+  const shProgress = lowMemoryMode && onProgress
+    ? (ratio: number, message: string, detail?: Partial<FourCgsProgress>) => {
+        const stageRatio = Math.max(0, Math.min(1, (ratio - 0.29) / 0.085));
+        onProgress(0.28 + 0.14 * stageRatio, `大序列阶段 1/3 · ${message}`, detail);
+      }
+    : onProgress;
   onProgress?.(0.28, parallelSupported
-    ? '正在训练自适应 SH；Position / Rotation / Scale / DC 已在子 Worker 并行编码'
-    : '正在训练自适应 SH', {
+    ? lowMemoryMode
+      ? '大序列阶段 1/3 · 正在训练自适应 SH'
+      : '正在训练自适应 SH；Position / Rotation / Scale / DC 已在子 Worker 并行编码'
+    : lowMemoryMode ? '大序列阶段 1/3 · 正在训练自适应 SH' : '正在训练自适应 SH', {
     stage: 'SH 质量训练', stageRatio: 0,
-    workerCount: parallelSupported ? parallelAttributeWorkerCount + 1 + parallelPositionEnvelopeWorkerCount : 1,
+    workerCount: parallelSupported
+      ? lowMemoryMode ? 1 : parallelAttributeWorkerCount + 1 + parallelPositionEnvelopeWorkerCount
+      : 1,
     completedTasks: 0, totalTasks: parallelSupported ? 6 : 1,
   });
-  const trainedSh = await trainAdaptiveSh(segments, layout, prsCodec.floatToHalf, prsCodec.halfToFloat, onProgress);
+  const trainedSh = await trainAdaptiveSh(
+    segments, layout, shDimensions, prsCodec.floatToHalf, prsCodec.halfToFloat, shProgress,
+    lowMemoryMode ? 2 : Number.POSITIVE_INFINITY,
+  );
   stageMs.shTraining = performance.now() - shStartedAt;
 
-  // #WDD-gpt 2026-08-16 - SH 完成后立刻在控制 Worker 生成辅助流，让 Opacity/Lifetime/SH 的 3~4 秒隐藏在 Position 子 Worker 等待期内。
-  const auxiliaryPromise = (async () => {
+  // #WDD-gpt 2026-09-19 - 普通输入继续并行隐藏辅助流耗时；大序列改为逐流生成并交给独立 Brotli Worker，避免 38% 阶段同时常驻全部原始流。
+  const encodeAuxiliaryStreams = async () => {
     const auxiliaryStartedAt = performance.now();
-    onProgress?.(0.38, '正在并行封装 Opacity、生命周期与共享 SH', {
+    onProgress?.(lowMemoryMode ? 0.84 : 0.38, lowMemoryMode
+      ? '大序列阶段 3/3 · 正在逐项封装 Active Mask、Opacity、生命周期与共享 SH'
+      : '正在并行封装 Opacity、生命周期与共享 SH', {
       stage: '辅助流并行封装', stageRatio: 0,
-      workerCount: parallelSupported ? parallelAttributeWorkerCount + 1 + parallelPositionEnvelopeWorkerCount : 1,
-      completedTasks: 0, totalTasks: 4,
+      workerCount: lowMemoryMode ? 2 : parallelSupported ? parallelAttributeWorkerCount + 1 + parallelPositionEnvelopeWorkerCount : 1,
+      completedTasks: 0, totalTasks: 5,
     });
+    if (lowMemoryMode) {
+      const streams: StoredStream[] = [];
+      const report = (completed: number, message: string) => onProgress?.(
+        0.84 + 0.10 * completed / 5,
+        `大序列阶段 3/3 · ${message}`,
+        {
+          stage: '辅助流逐项封装', stageRatio: completed / 5, workerCount: 2,
+          completedTasks: completed, totalTasks: 5,
+        },
+      );
+      report(0, '正在生成并压缩 Active Mask');
+      streams.push(await storedBrotliStreamInWorker(
+        'active_masks', activeMask(layout, segments.length), 'brotli',
+        (elapsedMs) => report(0, `Active Mask Brotli 正在运行 ${(elapsedMs / 1000).toFixed(0)} 秒`),
+      ));
+      report(1, 'Active Mask 完成，正在封装 Opacity');
+      {
+        const opacityCodec = await import('../../../../../scripts/fourcgs-opacity-hybrid-codec.mjs');
+        const opacityBits = opacityVectors(segments, layout);
+        const observationCount = opacityBits.length / descriptors[0].bankCounts.opacity;
+        const opacity = opacityCodec.encodeOpacityHybrid(opacityBits, observationCount, {
+          baseExact: true,
+          residualCompression: 'zlib',
+        });
+        streams.push(await storedStream('mixsc_opacity', opacity.encoded));
+      }
+      report(2, 'Opacity 完成，正在压缩生命周期中心');
+      streams.push(await storedBrotliStreamInWorker(
+        'lifetime_mu', temporalComponent(segments, layout, segments.map(() => ['lifetime_mu'])), 'brotli-shuffle16',
+        (elapsedMs) => report(2, `生命周期中心 Brotli 正在运行 ${(elapsedMs / 1000).toFixed(0)} 秒`),
+      ));
+      report(3, '生命周期中心完成，正在压缩生命周期宽度');
+      streams.push(await storedBrotliStreamInWorker(
+        'lifetime_w', temporalComponent(segments, layout, segments.map(() => ['lifetime_w'])), 'brotli-shuffle16',
+        (elapsedMs) => report(3, `生命周期宽度 Brotli 正在运行 ${(elapsedMs / 1000).toFixed(0)} 秒`),
+      ));
+      report(4, '生命周期完成，正在封装共享 SH');
+      streams.push(await storedStream('coresh5r_shared', sharedShStream(trainedSh, layout)));
+      report(5, '辅助流全部完成');
+      return { streams, elapsedMs: performance.now() - auxiliaryStartedAt };
+    }
     const opacityCodec = await import('../../../../../scripts/fourcgs-opacity-hybrid-codec.mjs');
     const opacityBits = opacityVectors(segments, layout);
     const observationCount = opacityBits.length / descriptors[0].bankCounts.opacity;
@@ -1635,7 +2147,9 @@ async function encodePreparedRaw4DV26(
       storedStream('coresh5r_shared', sh),
     ]);
     return { streams, elapsedMs: performance.now() - auxiliaryStartedAt };
-  })();
+  };
+  // #WDD-gpt 2026-09-19 - 小输入继续把辅助流与属性池重叠；大序列必须等总控 Worker 完成全部属性，避免再次叠加临时缓冲区。
+  const auxiliaryPromise = lowMemoryMode ? null : encodeAuxiliaryStreams();
 
   let position: { metrics: Record<string, any> };
   let rotation: { metrics: Record<string, any> };
@@ -1648,8 +2162,8 @@ async function encodePreparedRaw4DV26(
   let encoderWorkerCount = 1;
   if (attributePool) {
     const parallelStartedAt = performance.now();
-    const parallel = await attributePool.done;
-    stageMs.attributeWait = performance.now() - parallelStartedAt;
+    const parallel = completedParallel ?? await attributePool.done;
+    if (!completedParallel) stageMs.attributeWait = performance.now() - parallelStartedAt;
     // #WDD-gpt 2026-08-16 - 最终监督值记录 SH WASM 阶段与 Position Brotli 阶段二者中的真实峰值，而非仅报告属性池。
     encoderWorkerCount = Math.max(
       parallel.workerCount,
@@ -1688,18 +2202,68 @@ async function encodePreparedRaw4DV26(
     dcStored = { encoded: dcResult.encoded };
   } else {
     const structuredCodec = await import('../../../../../scripts/fourcgs-v21-lossless-codec.mjs');
-    onProgress?.(0.40, '正在编码 Position（兼容单 Worker）', { stage: 'Position', stageRatio: 0, workerCount: 1 });
+    onProgress?.(lowMemoryMode ? 0.44 : 0.40, lowMemoryMode
+      ? '大序列阶段 2/3 · 正在串行编码 Position'
+      : '正在编码 Position（兼容单 Worker）', { stage: 'Position', stageRatio: 0, workerCount: 1 });
     let startedAt = performance.now();
-    const encodedPosition = prsCodec.encodePositions(
+    const positionCodecStartedAt = performance.now();
+    const encodedPosition = prsCodec.encodePositionRaw(
       segments, layout, descriptors.map((segment) => segment.bankCounts.position),
       { center: crop.center, halfExtent: crop.halfExtent, step: POSITION_STEP, maximumError: POSITION_MAXIMUM_ERROR, cellSize: 0.5 },
     );
-    positionStored = await structuredCodec.encodeV21StructuredStream(
-      'prs_position', encodedPosition.encoded, { segments: descriptors }, { blockCompression: 'brotli', brotliQuality: 9 },
-    );
-    position = encodedPosition;
+    const positionCoreMs = performance.now() - positionCodecStartedAt;
+    const positionEnvelopeStartedAt = performance.now();
+    const positionEnvelopeWorkerLimit = lowMemoryMode ? 2 : 4;
+    let positionEnvelopeWorkers = 1;
+    let positionEnvelopeBackend = 'sequential-brotli';
+    try {
+      positionEnvelopeWorkers = fourCgsPositionEnvelopeWorkerCount(positionEnvelopeWorkerLimit);
+      positionStored = await structuredCodec.encodeV21StructuredStream(
+        'prs_position', { mainRaw: encodedPosition.mainRaw, exceptionRaw: encodedPosition.exceptionRaw },
+        { segments: descriptors },
+        {
+          blockCompression: 'brotli',
+          brotliQuality: 9,
+          compressPositionParts: (parts: readonly Uint8Array[], quality: number) => (
+            compressFourCgsPositionParts(parts, quality, positionEnvelopeWorkerLimit)
+          ),
+        },
+      );
+      positionEnvelopeBackend = `bounded-${positionEnvelopeWorkers}-worker-brotli`;
+    } catch (error) {
+      positionEnvelopeWorkers = 1;
+      onProgress?.(lowMemoryMode ? 0.55 : 0.48,
+        `Position Brotli Worker 不可用，安全回退单路：${error instanceof Error ? error.message : String(error)}`, {
+          stage: 'Position Brotli 回退', stageRatio: 0, workerCount: 1,
+        });
+      positionStored = await structuredCodec.encodeV21StructuredStream(
+        'prs_position', { mainRaw: encodedPosition.mainRaw, exceptionRaw: encodedPosition.exceptionRaw },
+        { segments: descriptors }, { blockCompression: 'brotli', brotliQuality: 9 },
+      );
+    }
+    const positionEnvelopeMs = performance.now() - positionEnvelopeStartedAt;
+    position = { metrics: {
+      ...encodedPosition.metrics,
+      codecMs: positionCoreMs,
+      envelopeMs: positionEnvelopeMs,
+      envelopeWorkerCount: positionEnvelopeWorkers,
+      envelopeBackend: positionEnvelopeBackend,
+      skippedTransientRansBytes: encodedPosition.mainRaw.byteLength + encodedPosition.exceptionRaw.byteLength,
+    } };
+    // #WDD-gpt 2026-09-19 - 结构化压缩完成后立刻断开 Position 原始码流，禁止它与 Rotation 原始码流叠加触发 Chromium 渲染进程内存终止。
+    (encodedPosition as { mainRaw: Uint8Array }).mainRaw = new Uint8Array(0);
+    (encodedPosition as { exceptionRaw: Uint8Array }).exceptionRaw = new Uint8Array(0);
     stageMs.position = performance.now() - startedAt;
-    onProgress?.(0.55, '正在编码 Rotation（兼容单 Worker）', { stage: 'Rotation', stageRatio: 0, workerCount: 1 });
+    stageMs.positionCore = positionCoreMs;
+    stageMs.positionEnvelope = positionEnvelopeMs;
+    onProgress?.(lowMemoryMode ? 0.60 : 0.55,
+      `Position 完成 · 核心 ${(positionCoreMs / 1000).toFixed(2)} 秒 · Brotli ${(positionEnvelopeMs / 1000).toFixed(2)} 秒/${positionEnvelopeWorkers}W`, {
+        stage: 'Position', stageRatio: 1, workerCount: positionEnvelopeWorkers,
+        elapsedMs: stageMs.position,
+      });
+    onProgress?.(lowMemoryMode ? 0.60 : 0.55, lowMemoryMode
+      ? '大序列阶段 2/3 · Position 完成，正在串行编码 Rotation'
+      : '正在编码 Rotation（兼容单 Worker）', { stage: 'Rotation', stageRatio: 0, workerCount: 1 });
     startedAt = performance.now();
     const rotationCodec = await import('../../../../../scripts/fourcgs-so3-temporal-codec.mjs');
     const encodedRotation = rotationCodec.encodeSo3Rotations(
@@ -1709,10 +2273,14 @@ async function encodePreparedRaw4DV26(
     rotationStored = await structuredCodec.encodeV22StructuredStream(
       'so3_rotation', encodedRotation.encoded, { blockCompression: 'brotli', brotliQuality: 9 },
     );
-    rotation = encodedRotation;
+    rotation = { metrics: encodedRotation.metrics };
+    // #WDD-gpt 2026-09-19 - 仅保留 Rotation 指标和最终压缩流，下一属性开始前释放多 GiB 级瞬时码流。
+    (encodedRotation as { encoded: Uint8Array }).encoded = new Uint8Array(0);
     stageMs.rotation = performance.now() - startedAt;
     const attributeCodec = await import('../../../../../scripts/fourcgs-temporal-attribute-codec.mjs');
-    onProgress?.(0.65, '正在编码 Scale（兼容单 Worker）', { stage: 'Scale', stageRatio: 0, workerCount: 1 });
+    onProgress?.(lowMemoryMode ? 0.68 : 0.65, lowMemoryMode
+      ? '大序列阶段 2/3 · Rotation 完成，正在串行编码 Scale'
+      : '正在编码 Scale（兼容单 Worker）', { stage: 'Scale', stageRatio: 0, workerCount: 1 });
     startedAt = performance.now();
     const encodedScale = attributeCodec.encodeTemporalAttribute(segments, layout, {
       prefix: 'scale_bank', components: ['0', '1', '2'],
@@ -1722,9 +2290,13 @@ async function encodePreparedRaw4DV26(
       'tattr_scale', encodedScale.encoded, { blockCompression: 'brotli', brotliQuality: 9 },
     );
     scaleStoredStreams = [{ name: 'tattr_scale', encoded: scaleStored.encoded }];
-    scale = encodedScale;
+    scale = { metrics: encodedScale.metrics };
+    // #WDD-gpt 2026-09-19 - Scale 原始时序码流封装后不再参与清单生成，立即解除引用以稳定超大序列峰值。
+    (encodedScale as { encoded: Uint8Array }).encoded = new Uint8Array(0);
     stageMs.scale = performance.now() - startedAt;
-    onProgress?.(0.74, '正在编码 DC（兼容单 Worker）', { stage: 'DC', stageRatio: 0, workerCount: 1 });
+    onProgress?.(lowMemoryMode ? 0.76 : 0.74, lowMemoryMode
+      ? '大序列阶段 2/3 · Scale 完成，正在串行编码 DC'
+      : '正在编码 DC（兼容单 Worker）', { stage: 'DC', stageRatio: 0, workerCount: 1 });
     startedAt = performance.now();
     const encodedDc = attributeCodec.encodeTemporalAttribute(segments, layout, {
       prefix: 'f_dc_bank', components: ['0', '1', '2'],
@@ -1733,11 +2305,13 @@ async function encodePreparedRaw4DV26(
     dcStored = await structuredCodec.encodeV22StructuredStream(
       'tattr_dc', encodedDc.encoded, { blockCompression: 'brotli', brotliQuality: 9 },
     );
-    dc = encodedDc;
+    dc = { metrics: encodedDc.metrics };
+    // #WDD-gpt 2026-09-19 - DC 原始时序码流封装后只保留误差指标，避免辅助流阶段继续背负瞬时编码缓冲。
+    (encodedDc as { encoded: Uint8Array }).encoded = new Uint8Array(0);
     stageMs.dc = performance.now() - startedAt;
   }
 
-  const auxiliary = await auxiliaryPromise;
+  const auxiliary = await (auxiliaryPromise ?? encodeAuxiliaryStreams());
   const [activeMaskStream, opacityStream, lifetimeMuStream, lifetimeWStream, sharedShStoredStream] = auxiliary.streams;
   const attributeStreams = await Promise.all([
     storedStream('prs_position', positionStored.encoded),
@@ -1756,6 +2330,8 @@ async function encodePreparedRaw4DV26(
   stageMs.auxiliaryStreams = auxiliary.elapsedMs;
   const originalPointCount = prepared.reduce((sum, source) => sum + source.originalPointCount, 0);
   const deletedPointCount = compacted.reduce((sum, value) => sum + value.deleted, 0);
+  const alphaPrunedPointCount = prepared.reduce((sum, source) => sum + source.alphaPrunedPointCount, 0);
+  const manuallyDeletedPointCount = deletedPointCount - alphaPrunedPointCount;
   const encodedPointCount = originalPointCount - deletedPointCount;
   const sourceBytes = compacted.reduce((sum, value) => sum + value.compactedBytes, 0);
   const firstFrame = descriptors[0].firstFrame;
@@ -1796,18 +2372,48 @@ async function encodePreparedRaw4DV26(
     losslessEntropy: { temporalModes: { lifetime_mu: 'xor', lifetime_w: 'xor' } },
     compressionV26: {
       version: '2.6-browser-export',
-      pruning: false,
+      pruning: options.maximumEffectiveAlpha > 0,
       deletionCompaction: true,
       originalPointCount,
       encodedPointCount,
       deletedPointCount,
+      manuallyDeletedPointCount,
+      alphaPrunedPointCount,
+      maximumEffectiveAlpha: options.maximumEffectiveAlpha,
       generalizationPolicy: 'input-trained adaptive templates; fixed numeric gates; no filename/hash/source-profile dependency',
       positionPolicy: { step: POSITION_STEP, maximumAllowedEuclideanErrorMeters: POSITION_MAXIMUM_ERROR },
       rotationPolicy: { stepDegrees: ROTATION_STEP_DEGREES, maximumAllowedAngleDegrees: ROTATION_MAXIMUM_DEGREES },
       scalePolicy: { step: SCALE_STEP, maximumLogError: SCALE_STEP / 2 },
       dcPolicy: { step: DC_STEP, maximumCoefficientError: DC_STEP / 2 },
       opacityPolicy: 'all declared banks bit-exact FP16; multi-segment inputs require a consistent bank layout',
+      layoutPolicy: {
+        mode: 'sparse-active-slot-local-pairs',
+        activeObservationCount,
+        sparseLayoutBytes,
+        avoidedDenseInverseBytes,
+        releasedMortonRemapBytes,
+        releasedSourceMappingBytes,
+        lowMemoryMode,
+        attributeWorkerLimit: parallelSupported ? attributeWorkerLimit : 1,
+        shWorkerLimit: lowMemoryMode ? 2 : null,
+      },
+      computePolicy: {
+        cropBackend: preferredCrop.backend,
+        cropElapsedMs: stageMs.crop,
+        webgpuFallback: 'automatic-cpu-fallback',
+        alphaScanBackends: prepared.map((source) => source.alphaScanBackend ?? 'not-requested'),
+        alphaGpuElapsedMs: prepared.reduce((sum, source) => sum + (source.alphaGpuElapsedMs ?? 0), 0),
+        alphaGpuVerifiedWitnessCount: prepared.reduce(
+          (sum, source) => sum + (source.alphaGpuVerifiedWitnessCount ?? 0), 0,
+        ),
+        alphaCpuFullScanCount: prepared.reduce((sum, source) => sum + (source.alphaCpuFullScanCount ?? 0), 0),
+        positionSourceEncoding: 'position-raw-pair',
+        positionEnvelopeBackend: position.metrics.envelopeBackend ?? 'parallel-attribute-worker',
+        positionEnvelopeWorkerCount: position.metrics.envelopeWorkerCount ?? parallelPositionEnvelopeWorkerCount,
+      },
       shPolicy: {
+        level: options.shLevel,
+        dimensions: shDimensions,
         template: trainedSh.template.name,
         labelBytesPerInstance: trainedSh.template.levels,
         sampleRmse: trainedSh.metrics.sampleRmse,
@@ -1849,6 +2455,10 @@ async function encodePreparedRaw4DV26(
         originalPointCount,
         encodedPointCount,
         deletedPointCount,
+        manuallyDeletedPointCount,
+        alphaPrunedPointCount,
+        maximumEffectiveAlpha: options.maximumEffectiveAlpha,
+        encodedShLevel: options.shLevel,
       },
     },
   };

@@ -1,0 +1,115 @@
+{
+  "version": 1,
+  "updatedAt": "7e6cb281de963e9057ce4c76fe6266a61f87b2ff2a7a1d82996d624c7a629893",
+  "videos": [
+    {
+      "id": "dance",
+      "name": "琵琶入画",
+      "description": "唐代敦煌壁画留存琵琶乐舞之姿，彩衣舒袖之间流转千年丝路艺术余韵。",
+      "tags": [
+        "琵琶乐舞",
+        "古典舞韵"
+      ],
+      "fps": 30,
+      "snapshot": "dance/thumbnail.webp",
+      "segments": [
+        {
+          "file": "dance/lili_1352xxxx.part-01-of-12.4cgs",
+          "fileBytes": 35278835,
+          "firstFrame": 0,
+          "lastFrame": 90,
+          "codec": "CoRe4D-V2.6-AdaptivePQ-Brotli9-BoundedTemporal-Scale3Way",
+          "contentVersion": "9e7564c0dc949737b0586f73dbb3139e5db48c51648b5a8728fbd6735f78fa34"
+        },
+        {
+          "file": "dance/lili_1352xxxx.part-02-of-12.4cgs",
+          "fileBytes": 56154855,
+          "firstFrame": 90,
+          "lastFrame": 180,
+          "codec": "CoRe4D-V2.6-AdaptivePQ-Brotli9-BoundedTemporal-Scale3Way",
+          "contentVersion": "4374f38274b2319f05f8bab5cac3c77c9a3924c11501a4c00db8e1deb104d93c"
+        },
+        {
+          "file": "dance/lili_1352xxxx.part-03-of-12.4cgs",
+          "fileBytes": 78710170,
+          "firstFrame": 180,
+          "lastFrame": 270,
+          "codec": "CoRe4D-V2.6-AdaptivePQ-Brotli9-BoundedTemporal-Scale3Way",
+          "contentVersion": "42fe9b0e6c01fe19f6ff1b380d8713233151e49fe69dc82eddef6477af8851d1"
+        },
+        {
+          "file": "dance/lili_1352xxxx.part-04-of-12.4cgs",
+          "fileBytes": 76024192,
+          "firstFrame": 270,
+          "lastFrame": 360,
+          "codec": "CoRe4D-V2.6-AdaptivePQ-Brotli9-BoundedTemporal-Scale3Way",
+          "contentVersion": "c1ff74b7ad058ce8e3d67caca37da719893f57fe8b7fa0ff614699b2bcce27b6"
+        },
+        {
+          "file": "dance/lili_1352xxxx.part-05-of-12.4cgs",
+          "fileBytes": 76843199,
+          "firstFrame": 360,
+          "lastFrame": 450,
+          "codec": "CoRe4D-V2.6-AdaptivePQ-Brotli9-BoundedTemporal-Scale3Way",
+          "contentVersion": "630c3fb72a0fc813e0faca6f5bfa17ffef49dac749de6a1e209e6b415d8bb3e9"
+        },
+        {
+          "file": "dance/lili_1352xxxx.part-06-of-12.4cgs",
+          "fileBytes": 70811743,
+          "firstFrame": 450,
+          "lastFrame": 540,
+          "codec": "CoRe4D-V2.6-AdaptivePQ-Brotli9-BoundedTemporal-Scale3Way",
+          "contentVersion": "d8a550c1944d3aa5fd3ee028ccc516fa566b4307b38bd47ceaa95b3853b922de"
+        },
+        {
+          "file": "dance/lili_1352xxxx.part-07-of-12.4cgs",
+          "fileBytes": 69071884,
+          "firstFrame": 540,
+          "lastFrame": 630,
+          "codec": "CoRe4D-V2.6-AdaptivePQ-Brotli9-BoundedTemporal-Scale3Way",
+          "contentVersion": "c14907efa534556a7f8666b40a7ecbd0cda351c5b18ffea5352146bf5a44c6b2"
+        },
+        {
+          "file": "dance/lili_1352xxxx.part-08-of-12.4cgs",
+          "fileBytes": 77640529,
+          "firstFrame": 630,
+          "lastFrame": 720,
+          "codec": "CoRe4D-V2.6-AdaptivePQ-Brotli9-BoundedTemporal-Scale3Way",
+          "contentVersion": "7590e917e75a1368182d1c61e7496a472c3c8835491bc9720c6a983bef1428f3"
+        },
+        {
+          "file": "dance/lili_1352xxxx.part-09-of-12.4cgs",
+          "fileBytes": 75190546,
+          "firstFrame": 720,
+          "lastFrame": 810,
+          "codec": "CoRe4D-V2.6-AdaptivePQ-Brotli9-BoundedTemporal-Scale3Way",
+          "contentVersion": "d33a5afee32db92f55cae651d6f52dee3fe9db8e91ef3ac89d4ef500be68a539"
+        },
+        {
+          "file": "dance/lili_1352xxxx.part-10-of-12.4cgs",
+          "fileBytes": 68105906,
+          "firstFrame": 810,
+          "lastFrame": 900,
+          "codec": "CoRe4D-V2.6-AdaptivePQ-Brotli9-BoundedTemporal-Scale3Way",
+          "contentVersion": "2179feb8aba73a474fe7151691de7f53d49199ee1f0581d5cfad2b02b5587f27"
+        },
+        {
+          "file": "dance/lili_1352xxxx.part-11-of-12.4cgs",
+          "fileBytes": 83706861,
+          "firstFrame": 900,
+          "lastFrame": 990,
+          "codec": "CoRe4D-V2.6-AdaptivePQ-Brotli9-BoundedTemporal-Scale3Way",
+          "contentVersion": "d36855c469510d91b90d71d5c89e100754704ae9f6e238e528b994f616becdf1"
+        },
+        {
+          "file": "dance/lili_1352xxxx.part-12-of-12.4cgs",
+          "fileBytes": 88062703,
+          "firstFrame": 990,
+          "lastFrame": 1079,
+          "codec": "CoRe4D-V2.6-AdaptivePQ-Brotli9-BoundedTemporal-Scale3Way",
+          "contentVersion": "aaafd5cd22db577449646c89c27054c1371cd3a90ea911fef5c8f0b85dcc5430"
+        }
+      ]
+    }
+  ]
+}

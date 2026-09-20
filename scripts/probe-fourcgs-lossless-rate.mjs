@@ -72,7 +72,8 @@ export async function readSegment(path) {
     const propertyDeclarations = [...header.matchAll(/^property (\S+) (\S+)$/gm)];
     const propertyNames = propertyDeclarations.map((match) => match[2]);
     const propertyIndex = new Map(propertyNames.map((name, index) => [name, index]));
-    const comments = new Map([...header.matchAll(/^comment\s+(\S+)\s+(.+)$/gm)].map((match) => [match[1], match[2].trim()]));
+    // #WDD-gpt 2026-09-20 - 注释字段只允许行内空白分隔，避免无空格的 key=value 注释跨行吞掉下一条 fp16_quantized 声明。
+    const comments = new Map([...header.matchAll(/^comment[ \t]+(\S+)[ \t]+(.+)$/gm)].map((match) => [match[1], match[2].trim()]));
     // #WDD-gpt 2026-08-16 - 压缩器操作的是 FP16 位流；明确拒绝 canonical float32，避免按 2 字节记录静默错位读取。
     if (comments.get('fp16_quantized') !== '1'
       || propertyDeclarations.some((match) => !['ushort', 'uint16'].includes(match[1]))) {

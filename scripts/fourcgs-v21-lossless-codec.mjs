@@ -70,8 +70,34 @@ class PackedBitReader {
     this.bitOffset += 1;
     return value;
   }
-  unary() { let zeros = 0; while (this.bit() === 0) zeros += 1; return zeros; }
-  read(bits) { let value = 0; for (let bit = 0; bit < bits; bit += 1) value += this.bit() * (2 ** bit); return value; }
+  // #WDD-gpt 2026-09-20 - Rice 按字节提取低位和跳过零游程，替代逐 bit 调用及指数运算，保持原 LSB 位序与边界检查。
+  unary() {
+    let zeros = 0;
+    while (this.bitOffset < this.totalBits) {
+      const shift = this.bitOffset & 7;
+      const available = Math.min(8 - shift, this.totalBits - this.bitOffset);
+      const value = (this.bytes[this.bitOffset >>> 3] >>> shift) & ((1 << available) - 1);
+      if (value) {
+        const trailing = 31 - Math.clz32(value & -value);
+        this.bitOffset += trailing + 1;
+        return zeros + trailing;
+      }
+      zeros += available; this.bitOffset += available;
+    }
+    throw new Error('Unexpected Rice bitstream end.');
+  }
+  read(bits) {
+    if (this.bitOffset + bits > this.totalBits) throw new Error('Unexpected Rice bitstream end.');
+    let value = 0, written = 0;
+    while (written < bits) {
+      const shift = this.bitOffset & 7;
+      const take = Math.min(8 - shift, bits - written);
+      const part = (this.bytes[this.bitOffset >>> 3] >>> shift) & ((1 << take) - 1);
+      value += part * (2 ** written);
+      written += take; this.bitOffset += take;
+    }
+    return value;
+  }
   done() { if (this.bitOffset !== this.totalBits) throw new Error(`Unused Rice bits: ${this.totalBits - this.bitOffset}`); }
 }
 
@@ -568,7 +594,15 @@ function packEnvelope(magic, metadata, blocks) {
   return Buffer.concat([header, directory, ...blocks.map((block) => block.bytes)]);
 }
 
-function unpackEnvelope(encoded) {
+// #WDD-gpt 2026-09-20 - 内层块保持完整 SHA-256 校验，浏览器优先原生摘要，缺少 WebCrypto 时沿用原实现。
+async function storedDigest(bytes) {
+  if (globalThis.crypto?.subtle && bytes.buffer instanceof ArrayBuffer) {
+    const digest = new Uint8Array(await globalThis.crypto.subtle.digest('SHA-256', bytes));
+    return Array.from(digest, byte => byte.toString(16).padStart(2, '0')).join('');
+  }
+  return sha256(bytes);
+}
+async function unpackEnvelope(encoded) {
   const magic = encoded.subarray(0, 8).toString('ascii');
   if (!ENVELOPE_MAGICS.has(magic)) throw new Error('Unsupported V2.1 structured stream.');
   const directoryBytes = encoded.readUInt32LE(8);
@@ -577,7 +611,7 @@ function unpackEnvelope(encoded) {
   let offset = 12 + directoryBytes;
   for (const block of metadata.blocks) {
     const bytes = encoded.subarray(offset, offset + block.storedBytes);
-    if (bytes.length !== block.storedBytes || sha256(bytes) !== block.storedSha256) throw new Error(`V2.1 block validation failed: ${block.name}.`);
+    if (bytes.length !== block.storedBytes || await storedDigest(bytes) !== block.storedSha256) throw new Error(`V2.1 block validation failed: ${block.name}.`);
     blocks.set(block.name, bytes);
     offset += block.storedBytes;
   }
@@ -802,7 +836,7 @@ export async function encodeV22StructuredStream(name, raw, options = {}) {
 
 // #WDD-gpt 2026-08-16 - V2.4 暴露 V2.2/V2.3 外层逆变换后的原始属性子流，运行时不再重建中间 rANS 文件。
 export async function decodeV22StructuredParts(name, encoded) {
-  const { metadata, blocks } = unpackEnvelope(encoded);
+  const { metadata, blocks } = await unpackEnvelope(encoded);
   if (metadata.streamName !== name || ![2, 3].includes(metadata.version)) {
     throw new Error(`V2.4 direct stream identity mismatch for ${name}.`);
   }
@@ -840,9 +874,82 @@ export async function decodeV22StructuredParts(name, encoded) {
   return { metadata: streamMetadata, streams, envelopeMetadata: metadata };
 }
 
+// #WDD-gpt 2026-09-20 - Rotation 直接消费 Rice 整数读取器，跳过整流写 Varint 后再次解析的往返。
+export async function decodeV22RotationReaders(encoded) {
+  const { metadata, blocks } = await unpackEnvelope(encoded);
+  if (metadata.streamName !== 'so3_rotation' || metadata.transform !== 'so3-predictive-rice64-contexts') {
+    return await decodeV22StructuredParts('so3_rotation', encoded);
+  }
+  const payload = await decodeStructuredBlock(metadata, blocks.get('payload'));
+  const names = compactV22PartNames(metadata);
+  if (names.length !== metadata.partBytes?.length) throw new Error('V2.4 Rotation compact part count mismatch.');
+  const parts = new Map(); let offset = 0;
+  for (let index = 0; index < names.length; index++) {
+    const length = metadata.partBytes[index]; parts.set(names[index], payload.subarray(offset, offset + length)); offset += length;
+  }
+  if (offset !== payload.length) throw new Error('V2.4 Rotation payload length mismatch.');
+  const streamMetadata = JSON.parse(Buffer.from(metadata.directoryBase64, 'base64').toString('utf8'));
+  const streams = new Map(), readers = new Map();
+  for (const entry of streamMetadata.streams) {
+    if (entry.name.startsWith('boundary:') || entry.name.startsWith('endpoint:')) {
+      readers.set(entry.name, metadata.emptyResidualNames?.includes(entry.name) ? new EmptySignedReader() : new PredictiveRiceSignedReader(
+        parts.get(`${entry.name}$header`), parts.get(`${entry.name}$parameters`), parts.get(`${entry.name}$bits`),
+      ));
+    } else streams.set(entry.name, parts.get(entry.name));
+  }
+  return { metadata: streamMetadata, streams, readers, envelopeMetadata: metadata };
+}
+
+// #WDD-gpt 2026-09-20 - DC 的 Rice/YCoCg 直接恢复整数读取器，取消三轮 Varint 重写与大 number[] 中间数组。
+export async function decodeV22DcReaders(encoded) {
+  const { metadata, blocks } = await unpackEnvelope(encoded);
+  if (metadata.streamName !== 'tattr_dc' || metadata.transform !== 'dc-ycocg-r-plus-rice32-contexts') {
+    const decoded = await decodeV22StructuredParts('tattr_dc', encoded);
+    return { ...decoded, readers: new Map([...decoded.streams].map(([name, bytes]) => [name, new ByteReader(bytes)])) };
+  }
+  const payload = await decodeStructuredBlock(metadata, blocks.get('payload'));
+  const names = compactV22PartNames(metadata);
+  if (names.length !== metadata.partBytes?.length) throw new Error('DC compact part count mismatch.');
+  const parts = new Map(); let offset = 0;
+  for (let index = 0; index < names.length; index++) { const length = metadata.partBytes[index]; parts.set(names[index], payload.subarray(offset, offset + length)); offset += length; }
+  if (offset !== payload.length) throw new Error('DC payload length mismatch.');
+  const streamMetadata = JSON.parse(Buffer.from(metadata.directoryBase64, 'base64').toString('utf8'));
+  const readers = new Map();
+  const integerReader = values => { let index = 0; return {
+    sint() { if (index >= values.length) throw new Error('Unexpected DC integer end.'); return values[index++]; },
+    done() { if (index !== values.length) throw new Error('Unused DC integers.'); },
+  }; };
+  const birthBytes = parts.get('birth'); offset = 0;
+  const planes = metadata.birthPlaneBytes.map(length => { const reader = new ByteReader(birthBytes.subarray(offset, offset + length)); offset += length; return reader; });
+  if (offset !== birthBytes.length || planes.length !== 3) throw new Error('DC birth plane mismatch.');
+  const birth = new Int32Array(streamMetadata.slotCount * 3);
+  for (let i = 0; i < streamMetadata.slotCount; i++) {
+    const y = planes[0].sint(), co = planes[1].sint(), cg = planes[2].sint(), t = y - (cg >> 1), b = t - (co >> 1);
+    birth[i * 3] = b + co; birth[i * 3 + 1] = cg + t; birth[i * 3 + 2] = b;
+  }
+  planes.forEach(reader => reader.done()); readers.set('birth', integerReader(birth));
+  const riceValues = name => {
+    if (parts.has(name)) return Int32Array.from(signedValues(parts.get(name)));
+    const header = parts.get(`${name}$header`), parameters = parts.get(`${name}$parameters`), bits = parts.get(`${name}$bits`);
+    if (!header || header.length !== 16) throw new Error('Invalid DC Rice header.');
+    const count = header.readUInt32LE(0), blockSize = header.readUInt32LE(4), blocks = header.readUInt32LE(8), totalBits = header.readUInt32LE(12);
+    if (!blockSize || blocks !== Math.ceil(count / blockSize) || parameters.length !== blocks || bits.length !== Math.ceil(totalBits / 8)) throw new Error('Invalid DC Rice directory.');
+    const reader = new PackedBitReader(bits, totalBits), values = new Int32Array(count);
+    for (let i = 0; i < count; i++) { const k = parameters[Math.floor(i / blockSize)], code = reader.unary() * (2 ** k) + reader.read(k); values[i] = code & 1 ? -(code + 1) / 2 : code / 2; }
+    reader.done(); return values;
+  };
+  for (const context of ['boundary', 'endpoint', 'internal']) {
+    const [y, co, cg] = [0, 1, 2].map(axis => riceValues(`${context}:${axis}`));
+    if (y.length !== co.length || y.length !== cg.length) throw new Error('DC context component mismatch.');
+    for (let i = 0; i < y.length; i++) { const t = y[i] - (cg[i] >> 1), b = t - (co[i] >> 1), r = b + co[i], g = cg[i] + t; y[i] = r; co[i] = g; cg[i] = b; }
+    [y, co, cg].forEach((values, axis) => readers.set(`${context}:${axis}`, integerReader(values)));
+  }
+  return { metadata: streamMetadata, readers, envelopeMetadata: metadata };
+}
+
 // #WDD-gpt 2026-08-16 - V2.4 Scale 从 Rice bitstream 按需取整数，避免先生成 21.1M Varint 再二次解析。
 export async function decodeV22ScaleReaders(encoded, streamName = 'tattr_scale') {
-  const { metadata, blocks } = unpackEnvelope(encoded);
+  const { metadata, blocks } = await unpackEnvelope(encoded);
   if (metadata.streamName !== streamName || metadata.transform !== 'scale-quantized-predictive-rice64-contexts') {
     throw new Error('V2.4 direct Scale reader requires the quantized predictive Rice stream.');
   }
@@ -873,7 +980,7 @@ export async function decodeV22ScaleReaders(encoded, streamName = 'tattr_scale')
 
 // #WDD-gpt 2026-08-16 - V2.4 Position Worker 直接取得六条上下文流，不再合并成 P3D 后执行第二次 rANS 解码。
 export async function decodeV21PositionContexts(encoded) {
-  const { metadata, blocks } = unpackEnvelope(encoded);
+  const { metadata, blocks } = await unpackEnvelope(encoded);
   if (metadata.streamName !== 'prs_position' || metadata.transform !== 'position-context-split') {
     throw new Error('V2.4 direct Position reader requires position-context-split.');
   }
@@ -887,7 +994,7 @@ export async function decodeV21PositionContexts(encoded) {
 }
 
 export async function decodeV21StructuredStream(name, encoded, manifest) {
-  const { metadata, blocks } = unpackEnvelope(encoded);
+  const { metadata, blocks } = await unpackEnvelope(encoded);
   if (metadata.streamName !== name || ![1, 2, 3].includes(metadata.version)) throw new Error(`Structured stream identity mismatch for ${name}.`);
   const parts = new Map();
   if (metadata.transform === 'position-context-split') {

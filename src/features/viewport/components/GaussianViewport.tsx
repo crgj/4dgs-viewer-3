@@ -1,3 +1,4 @@
+import { Raw4DPreparationClient } from '../../gaussian/runtime/Raw4DPreparationClient';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   FOUR_CGS_HEADER_BYTES,
@@ -45,6 +46,13 @@ import {
 interface GaussianViewportProps {
   activeTool: ViewportEditorTool;
   backgroundColor: string;
+  // #WDD-gpt 2026-09-19 - 仅展示页选择透明背景，编辑器维持实色背景。
+  transparentBackground?: boolean;
+  // #WDD-gpt 2026-09-20 - 展示页要求全部片段显存驻留，失败必须报告而非悄悄回退窗口缓存。
+  preloadAllSegments?: boolean;
+  backgroundPreparation?: boolean;
+  // #WDD-gpt 2026-09-20 - 展示页内部切段时保留上一张完整画面直到新段 postrender。
+  retainFrameDuringTransitions?: boolean;
   brushRadius: number;
   currentFrame: number;
   forceSortSync: boolean;
@@ -196,6 +204,10 @@ function fourCgsSequenceStatus(descriptor: FourCgsDescriptor, segmentIndex: numb
 export function GaussianViewport({
   activeTool,
   backgroundColor,
+  transparentBackground = false,
+  preloadAllSegments = false,
+  backgroundPreparation = false,
+  retainFrameDuringTransitions = false,
   brushRadius,
   currentFrame,
   forceSortSync,
@@ -228,6 +240,9 @@ export function GaussianViewport({
   viewportLabel,
 }: GaussianViewportProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const holdCanvasRef = useRef<HTMLCanvasElement>(null);
+  const heldTargetRef = useRef<number | null>(null);
+  const lastDisplayedRef = useRef(-1);
   const runtimeRef = useRef<ViewportRuntime | null>(null);
   const fourCgsSessionRef = useRef<ActiveFourCgsSession | null>(null);
   const raw4DSequenceSessionRef = useRef<ActiveRaw4DSequenceSession | null>(null);
@@ -251,7 +266,31 @@ export function GaussianViewport({
     : detectedRuntimeProfile, [detectedRuntimeProfile, memoryPolicy.mode]);
   backgroundColorRef.current = backgroundColor;
   renderModeRef.current = renderMode;
-  onFrameDisplayedRef.current = onFrameDisplayed;
+  onFrameDisplayedRef.current = (frame) => {
+    lastDisplayedRef.current = frame;
+    if (heldTargetRef.current === frame) {
+      heldTargetRef.current = null;
+      if (canvasRef.current) canvasRef.current.style.visibility = '';
+      if (holdCanvasRef.current) holdCanvasRef.current.style.visibility = 'hidden';
+    }
+    onFrameDisplayed(frame);
+  };
+  // #WDD-gpt 2026-09-20 - 仅在切段边界复制一次，不逐帧回读；前景保留图避免新实体排序期间露底或叠影。
+  const holdPreviousFrame = (target: number) => {
+    if (!retainFrameDuringTransitions || lastDisplayedRef.current < 0) return;
+    const source = canvasRef.current, hold = holdCanvasRef.current;
+    if (!source || !hold) return;
+    if (heldTargetRef.current === null) {
+      hold.width = source.width; hold.height = source.height;
+      const context = hold.getContext('2d');
+      if (!context) throw new Error('无法保留切段过渡画面。');
+      context.globalCompositeOperation = 'copy';
+      context.drawImage(source, 0, 0);
+      hold.style.visibility = 'visible';
+      source.style.visibility = 'hidden';
+    }
+    heldTargetRef.current = target;
+  };
   pendingFrameRef.current = currentFrame;
 
   activateFourCgsFrameRef.current = async (frame: number) => {
@@ -264,6 +303,7 @@ export function GaussianViewport({
       return;
     }
     if (fourCgsLoadingSegmentRef.current === location.segmentIndex) return;
+    holdPreviousFrame(frame);
     const generation = ++fourCgsLoadGenerationRef.current;
     fourCgsLoadingSegmentRef.current = location.segmentIndex;
     const previousSegmentIndex = session.segmentIndex;
@@ -304,6 +344,7 @@ export function GaussianViewport({
       const latestTimelineFrame = pendingFrameRef.current;
       const latest = locateFourCgsFrame(session.descriptor.segments, latestTimelineFrame);
       if (latest.segmentIndex === session.segmentIndex) {
+        if (heldTargetRef.current !== null) heldTargetRef.current = latestTimelineFrame;
         runtime.setFrame(latest.localFrame, () => onFrameDisplayedRef.current(latestTimelineFrame));
         onStatusChange(mappedStatus(status));
       } else {
@@ -327,6 +368,7 @@ export function GaussianViewport({
       return;
     }
     if (raw4DSequenceLoadingSegmentRef.current === location.segmentIndex) return;
+    holdPreviousFrame(frame);
     const generation = ++raw4DSequenceLoadGenerationRef.current;
     raw4DSequenceLoadingSegmentRef.current = location.segmentIndex;
     const segment = session.descriptor.segments[location.segmentIndex];
@@ -392,6 +434,7 @@ export function GaussianViewport({
       const latestTimelineFrame = pendingFrameRef.current;
       const latest = locateRaw4DSequenceFrame(session.descriptor.segments, latestTimelineFrame);
       if (latest.segmentIndex === session.segmentIndex) {
+        if (heldTargetRef.current !== null) heldTargetRef.current = latestTimelineFrame;
         runtime.setFrame(latest.localFrame, () => onFrameDisplayedRef.current(latestTimelineFrame));
         onStatusChange(mappedStatus(status));
       } else {
@@ -404,6 +447,27 @@ export function GaussianViewport({
     }
   };
 
+  // #WDD-gpt 2026-09-20 - 展示页让压缩解码与图形设备初始化重叠；持有同一会话，取消时释放线程。
+  const eagerFourCgs = useRef<{ file: File; decoder: FourCgsDecoderClient; result: Promise<FourCgsDescriptor | null> } | null>(null);
+  useEffect(() => {
+    const file = sourceFiles.length === 1 ? sourceFiles[0] : null;
+    if (!backgroundPreparation || !preloadAllSegments || !file?.name.toLowerCase().endsWith('.4cgs')) return;
+    Raw4DPreparationClient.warm();
+    const decoder = new FourCgsDecoderClient(true);
+    let cancelled = false;
+    const result = readFourCgsManifest(file).then(({ manifest }) => {
+      if (cancelled) throw new DOMException('提前解码已取消', 'AbortError');
+      if (raw4DBundleStorage(manifest)) return null;
+      return decoder.open(file, ({ message, ratio }) => {
+        if (!cancelled) onStatusChange({ phase: 'loading', renderer: '4CGS', splatCount: 0, progress: ratio * .55, message, sourceName: file.name });
+      });
+    });
+    const session = { file, decoder, result };
+    eagerFourCgs.current = session;
+    void result.catch(() => undefined);
+    return () => { cancelled = true; decoder.close(); if (eagerFourCgs.current === session) eagerFourCgs.current = null; };
+  }, [sourceFiles, backgroundPreparation, preloadAllSegments, onStatusChange]);
+
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) {
@@ -414,6 +478,8 @@ export function GaussianViewport({
     setRuntimeReady(false);
     const runtime = new ViewportRuntime(canvas, {
       backgroundColor: backgroundColorRef.current,
+      transparentBackground,
+      backgroundPreparation,
       showGuides,
       preserveDrawingBuffer,
       memoryPolicy,
@@ -461,7 +527,7 @@ export function GaussianViewport({
       runtime.destroy();
       runtimeRef.current = null;
     };
-  }, [onHistoryChange, onRelightingChange, onRuntimeChange, onSelectionChange, onStatusChange, onTransformChange, preserveDrawingBuffer, runtimeProfile, showGuides]);
+  }, [onHistoryChange, onRelightingChange, onRuntimeChange, onSelectionChange, onStatusChange, onTransformChange, preserveDrawingBuffer, runtimeProfile, showGuides, transparentBackground, backgroundPreparation]);
 
   useEffect(() => {
     runtimeRef.current?.setBackgroundColor(backgroundColor);
@@ -703,13 +769,13 @@ export function GaussianViewport({
             return;
           }
           const rawBundleMaxShBands = presentation === 'fourcgs-raw4d-bundle' ? 2 : undefined;
-          const fullGpuPlan = presentation === 'fourcgs-raw4d-bundle'
+          const fullGpuPlan = (presentation === 'fourcgs-raw4d-bundle' || preloadAllSegments)
             ? runtime.getRaw4DSequenceGpuPreloadPlan(residentSegments, rawBundleMaxShBands)
             : null;
           const preloadAllGpuSegments = Boolean(fullGpuPlan?.fits);
           // #WDD-gpt 2026-09-07 - Raw Bundle 先以 SH2 试算 180 段整体显存；足够则首帧前全部建好，不足才回退当前+下一段。
           runtime.configureRaw4DSequenceGpuCache(residentSegments, {
-            ...(presentation === 'fourcgs-raw4d-bundle'
+            ...((presentation === 'fourcgs-raw4d-bundle' || preloadAllSegments)
               ? {
                 maxFutureSegments: preloadAllGpuSegments ? Number.POSITIVE_INFINITY : 1,
                 releaseTextureUploadSources: preloadAllGpuSegments,
@@ -717,7 +783,8 @@ export function GaussianViewport({
               : {}),
             ...(rawBundleMaxShBands === undefined ? {} : { maxShBands: rawBundleMaxShBands }),
           });
-          if (presentation === 'fourcgs-raw4d-bundle' && fullGpuPlan) {
+          if (fullGpuPlan) {
+            if (preloadAllSegments && !fullGpuPlan.fits) throw new Error('当前显存预算不足以让全部片段驻留。');
             const requiredGiB = fullGpuPlan.requiredBytes / 1024 ** 3;
             const budgetGiB = fullGpuPlan.budgetBytes / 1024 ** 3;
             if (preloadAllGpuSegments) {
@@ -740,7 +807,7 @@ export function GaussianViewport({
                   completed: true,
                 })}`);
               } catch (error) {
-                if (error instanceof DOMException && error.name === 'AbortError') throw error;
+                if (preloadAllSegments || (error instanceof DOMException && error.name === 'AbortError')) throw error;
                 console.warn(`${presentationLabel} 全量显存预读失败，回退当前+下一段。`, error);
                 runtime.configureRaw4DSequenceGpuCache(residentSegments, {
                   maxFutureSegments: 1,
@@ -817,8 +884,9 @@ export function GaussianViewport({
           return;
         }
 
-        decoder = new FourCgsDecoderClient();
-        const descriptor = await decoder.open(sourceFile, ({ message, ratio }) => {
+        const eager = eagerFourCgs.current?.file === sourceFile ? eagerFourCgs.current : null;
+        decoder = eager?.decoder ?? new FourCgsDecoderClient();
+        const descriptor = (eager ? await eager.result : null) ?? await decoder.open(sourceFile, ({ message, ratio }) => {
           if (!active) return;
           onStatusChange({
             phase: 'loading', renderer: '4CGS V2.4', splatCount: 0, progress: ratio * 0.55,
@@ -835,41 +903,82 @@ export function GaussianViewport({
         }
         // #WDD-gpt 2026-08-19 - 4CGS 内嵌书签在解码清单后立即恢复；旧文件显式清空三个槽位，禁止沿用上一场景。
         onCameraBookmarksChange(descriptor.cameraBookmarks?.bookmarks ?? [null, null, null]);
-        const extractionStartedAt = performance.now();
-        let extractedCount = 0;
-        // #WDD-gpt 2026-08-16 - 一次提交全部片段请求，减少六次主线程往返并让后续 Loader 池尽早接手。
-        const decodedSegments = await Promise.all(descriptor.segments.map(async (_segment, segmentIndex) => {
-          const decoded = await decoder!.getSegment(segmentIndex);
-          if (!active) throw new DOMException('4CGS 片段提取已取消。', 'AbortError');
-          extractedCount += 1;
-          onStatusChange({
-            phase: 'loading', renderer: '4CGS 系统内存预读', splatCount: 0,
-            progress: 0.55 + 0.1 * extractedCount / descriptor.segments.length,
-            message: `正在并行提取 4CGS 片段 ${extractedCount}/${descriptor.segments.length}`,
-            sourceName: sourceFile.name, objectName: sourceFile.name.replace(/\.4cgs$/i, ''),
-            format: '4CGS', fourCgsContainer: 'binary',
-          });
-          return decoded;
-        }));
-        const extractionMs = performance.now() - extractionStartedAt;
-        const residencyStartedAt = performance.now();
-        residentSegments = await runtime.preloadRaw4DSequence(decodedSegments, ({ message, ratio }) => {
+        const pipelineStartedAt = performance.now();
+        let canonicalGpuSegments = 0;
+        let canonicalCpuSegments = 0;
+        let canonicalRawSegments = 0;
+        let canonicalExpansionWorkerMs = 0;
+        onStatusChange({
+          phase: 'loading', renderer: '4CGS 解码驻留流水线', splatCount: 0, progress: 0.55,
+          message: `正在启动最多 3 条片段提取、GPU/CPU 展开与 Loader 流水线`,
+          sourceName: sourceFile.name, objectName: sourceFile.name.replace(/\.4cgs$/i, ''),
+          format: '4CGS', fourCgsContainer: 'binary',
+        });
+        // #WDD-gpt 2026-09-20 - 每条 Loader lane 只按需提取一个片段；WebGPU 可用时并行展开 FP16 列，失败自动回退 CPU，禁止先堆齐 108 个巨型 File。
+        // #WDD-gpt 2026-09-20 - 继续逐段释放解码行；并行 Loader 失败时重开低并发解码器，避免为重试常驻整文件副本。
+        const prepareResident = (lowConcurrency = false) => runtime.preloadDecodedRaw4DSequence(
+          descriptor.segments.length,
+          async (segmentIndex, cpuBudgetBytes) => {
+            if (backgroundPreparation && !lowConcurrency) {
+              const decoded = await decoder!.getAsset(segmentIndex, cpuBudgetBytes);
+              if (!active) throw new DOMException('4CGS 片段提取已取消。', 'AbortError');
+              canonicalExpansionWorkerMs += decoded.elapsedMs; canonicalCpuSegments++;
+              return decoded;
+            }
+            const decoded = await decoder!.getSegment(segmentIndex, true, !backgroundPreparation);
+            if (!active) throw new DOMException('4CGS 片段提取已取消。', 'AbortError');
+            canonicalExpansionWorkerMs += decoded.elapsedMs;
+            if (decoded.backend === 'webgpu') canonicalGpuSegments += 1;
+            else if (decoded.backend === 'cpu') canonicalCpuSegments += 1;
+            else canonicalRawSegments += 1;
+            return decoded.file;
+          },
+          ({ message, ratio }) => {
           if (!active) return;
           onStatusChange({
-            phase: 'loading', renderer: '4CGS 系统内存驻留', splatCount: 0,
-            progress: 0.65 + ratio * 0.33, message,
+            phase: 'loading', renderer: '4CGS 解码驻留流水线', splatCount: 0,
+            progress: 0.55 + ratio * 0.43,
+            message: `${message} · Canonical ${canonicalGpuSegments} GPU / ${canonicalCpuSegments} CPU`,
             sourceName: sourceFile.name, objectName: sourceFile.name.replace(/\.4cgs$/i, ''),
             format: '4CGS', fourCgsContainer: 'binary',
           });
-        });
-        const residencyMs = performance.now() - residencyStartedAt;
+          },
+          lowConcurrency,
+        );
+        try { residentSegments = await prepareResident(); }
+        catch (error) {
+          if (!active || (error instanceof DOMException && error.name === 'AbortError')) throw error;
+          onStatusChange({ phase: 'loading', renderer: '4CGS', splatCount: 0, progress: 0.55,
+            message: '并行片段准备失败，正在单流水线重试', sourceName: sourceFile.name });
+          decoder!.close();
+          decoder = new FourCgsDecoderClient();
+          await decoder.open(sourceFile, ({ message, ratio }) => {
+            if (active) onStatusChange({ phase: 'loading', renderer: '4CGS', splatCount: 0, progress: ratio * 0.55,
+              message: `低并发重试 · ${message}`, sourceName: sourceFile.name });
+          }, true);
+          if (!active) throw new DOMException('4CGS 片段提取已取消。', 'AbortError');
+          residentSegments = await prepareResident(true);
+        }
+        const streamedResidencyMs = performance.now() - pipelineStartedAt;
         if (!active) {
           runtime.releaseRaw4DSequence(residentSegments);
           residentSegments = [];
           return;
         }
-        // #WDD-gpt 2026-08-16 - 4CGS 六段先驻留系统内存，再建立当前段和未来段的显存预取窗口。
-        runtime.configureRaw4DSequenceGpuCache(residentSegments);
+        // #WDD-gpt 2026-09-20 - show_dance 全量预建文件内所有 GPU 段，上传完整后才允许首帧就绪。
+        runtime.configureRaw4DSequenceGpuCache(residentSegments, preloadAllSegments ? {
+          maxFutureSegments: Number.POSITIVE_INFINITY, releaseTextureUploadSources: true,
+        } : {});
+        const gpuPreloadStartedAt = performance.now();
+        if (preloadAllSegments) {
+          const plan = await runtime.preloadRaw4DSequenceGpu(residentSegments, (progress) => {
+            if (!active) return;
+            onStatusChange({ phase: 'loading', renderer: '4CGS 全显存驻留', splatCount: 0,
+              message: progress.message, progress: 0.98 + progress.ratio * 0.015,
+              sourceName: sourceFile.name, format: '4CGS', fourCgsContainer: 'binary' });
+          }, containerAbortController.signal);
+          if (!plan.fits) throw new Error(`全部显存驻留需要 ${(plan.requiredBytes / 1024 ** 3).toFixed(2)} GiB，超过当前预算 ${(plan.budgetBytes / 1024 ** 3).toFixed(2)} GiB。`);
+        }
         fourCgsSessionRef.current = {
           decoder, descriptor, residentSegments, sourceFile, segmentIndex: -1,
         };
@@ -879,8 +988,12 @@ export function GaussianViewport({
         // #WDD-gpt 2026-08-16 - 单独记录提取、CPU 驻留和首段 GPU 激活，避免只优化 Codec 却遗漏后续等待。
         console.info(`4CGS open timings ${JSON.stringify({
           decodeMs: descriptor.decodeTimings.totalMs,
-          extractionMs,
-          residencyMs,
+          streamedResidencyMs,
+          gpuPreloadMs: activationStartedAt - gpuPreloadStartedAt,
+          canonicalExpansionWorkerMs,
+          canonicalGpuSegments,
+          canonicalCpuSegments,
+          canonicalRawSegments,
           activationMs: performance.now() - activationStartedAt,
           totalMs: performance.now() - openStartedAt,
         })}`);
@@ -930,7 +1043,8 @@ export function GaussianViewport({
       active = false;
       runtime.cancelImport();
     };
-  }, [onCameraBookmarksChange, onStatusChange, runtimeGeneration, runtimeReady, sourceFiles]);
+  }, [onCameraBookmarksChange, onStatusChange, runtimeGeneration, runtimeReady, sourceFiles, preloadAllSegments, backgroundPreparation]);
 
-  return <canvas aria-label={viewportLabel} className="viewport-canvas" ref={canvasRef} tabIndex={0} />;
+  return <><canvas aria-label={viewportLabel} className="viewport-canvas" ref={canvasRef} tabIndex={0} />
+    {retainFrameDuringTransitions && <canvas ref={holdCanvasRef} aria-hidden="true" data-frame-hold="true" style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', visibility: 'hidden', pointerEvents: 'none' }} />}</>;
 }

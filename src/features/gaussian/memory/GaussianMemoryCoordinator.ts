@@ -117,6 +117,9 @@ export class GaussianMemoryCoordinator {
     this.cpuCache.setActive(id);
   }
 
+  // #WDD-gpt 2026-09-20 - 仅全量预读阶段临时调整准备并发，完成或失败后恢复单任务。
+  setGpuTransferConcurrency(count: number): void { this.transferScheduler.setConcurrency(count); }
+
   scheduleGpuTransfer<T>(input: {
     readonly key: string;
     readonly priority?: TransferPriority;

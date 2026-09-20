@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import type { UiLanguage } from '../i18n';
 import { uniqueRaw4DExportFilenames } from '../raw4dFileSave';
+import type { FourCgsExportOptions } from '../../features/gaussian/formats/fourcgs/FourCgsTypes';
 import {
   supportsFourCgsSceneExport,
   supportsFourCgsRaw4DZipExport,
@@ -21,7 +22,7 @@ interface ExportCenterDialogProps {
   readonly inputBytes: number;
   readonly language: UiLanguage;
   readonly onClose: () => void;
-  readonly onExport: (target: ExportTarget) => void;
+  readonly onExport: (target: ExportTarget, options: FourCgsExportOptions & { readonly partCount: number }) => void;
   readonly sceneName: string;
   readonly segmentCount: number;
   readonly segments?: readonly ExportCenterSegment[];
@@ -31,6 +32,9 @@ interface ExportCenterDialogProps {
 export function ExportCenterDialog(props: ExportCenterDialogProps) {
   const zh = props.language === 'zh';
   const [target, setTarget] = useState<ExportTarget>(props.format === 'RAW4D' ? 'raw4d' : 'fourcgs');
+  const [shLevel, setShLevel] = useState<1 | 2 | 3>(3);
+  const [maximumEffectiveAlpha, setMaximumEffectiveAlpha] = useState(0.1);
+  const [partCount, setPartCount] = useState(1);
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') props.onClose();
@@ -94,7 +98,7 @@ export function ExportCenterDialog(props: ExportCenterDialogProps) {
               <div><dt>{zh ? '输出文件' : 'Output files'}</dt><dd>{target === 'raw4d'
                 ? `${props.segmentCount} × .raw4d`
                 : target === 'fourcgs'
-                  ? '1 × .4cgs (V2.6)'
+                  ? `${partCount} × .4cgs (V2.6)`
                   : target === 'fourcgs-raw4d-zip'
                     ? `1 × .4cgs ZIP (${props.segmentCount} RAW4D)`
                     : `${props.frameCount} × .ply`}</dd></div>
@@ -106,6 +110,18 @@ export function ExportCenterDialog(props: ExportCenterDialogProps) {
                   : (zh ? '按导出器坐标' : 'Exporter coordinates')}</dd></div>
               <div><dt>{zh ? '输入大小' : 'Input size'}</dt><dd>{props.inputBytes > 0 ? `${(props.inputBytes / 1_000_000).toFixed(2)} MB` : '—'}</dd></div>
             </dl>
+            {target === 'fourcgs' && (
+              <div className="export-fourcgs-options">
+                <label><span>{zh ? 'SH 阶数' : 'SH level'}</span><select onChange={(event) => setShLevel(Number(event.target.value) as 1 | 2 | 3)} value={shLevel}>
+                  <option value={1}>SH1 · 9D</option><option value={2}>SH2 · 24D</option><option value={3}>SH3 · 45D</option>
+                </select></label>
+                <label><span>{zh ? '最大有效 Alpha' : 'Maximum effective Alpha'}</span><input max="0.999999" min="0" onChange={(event) => setMaximumEffectiveAlpha(Number(event.target.value))} step="0.01" type="number" value={maximumEffectiveAlpha} /></label>
+                <label><span>{zh ? '分段数' : 'Output parts'}</span><input max={Math.max(1, props.segmentCount)} min="1" onChange={(event) => setPartCount(Math.max(1, Math.min(props.segmentCount, Math.round(Number(event.target.value) || 1))))} step="1" type="number" value={partCount} /></label>
+                <small>{zh
+                  ? `Alpha 在每个原片段的所有整数帧均低于阈值时才删除；${partCount > 1 ? '输出按原片段边界连续分组。' : '输出一个完整文件。'}`
+                  : `A point is removed only when Alpha stays below the threshold at every integer frame; ${partCount > 1 ? 'source segments are grouped consecutively.' : 'one complete file is written.'}`}</small>
+              </div>
+            )}
             {target === 'raw4d' && segmentPreview.length > 0 && (
               <ol className="export-segment-preview" aria-label={zh ? 'RAW4D 输出片段预览' : 'RAW4D output segment preview'}>
                 {segmentPreview.map((segment, index) => (
@@ -136,7 +152,7 @@ export function ExportCenterDialog(props: ExportCenterDialogProps) {
                 : (zh ? '浏览器将请求一个专用文件夹，并暂停播放后逐帧写入。' : 'The browser requests a dedicated folder, pauses playback, and writes each frame.')}</p>
           </div>
         </div>
-        <footer><button className="quiet-button" onClick={props.onClose} type="button">{zh ? '取消' : 'Cancel'}</button><button className="primary-button" disabled={selected.disabled} onClick={() => props.onExport(target)} type="button">{zh ? '继续导出' : 'Continue export'}</button></footer>
+        <footer><button className="quiet-button" onClick={props.onClose} type="button">{zh ? '取消' : 'Cancel'}</button><button className="primary-button" disabled={selected.disabled || (target === 'fourcgs' && (!Number.isFinite(maximumEffectiveAlpha) || maximumEffectiveAlpha < 0 || maximumEffectiveAlpha >= 1))} onClick={() => props.onExport(target, { shLevel, maximumEffectiveAlpha, partCount })} type="button">{zh ? '继续导出' : 'Continue export'}</button></footer>
       </section>
     </div>
   );

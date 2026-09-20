@@ -76,11 +76,34 @@ describe('RAW4D dynamic browser encoder real files', () => {
       );
       const { manifest } = await readFourCgsManifest(result.blob);
       const policy = manifest.compressionV26 as Record<string, any>;
+      const shIndex = manifest.streams.findIndex((stream) => stream.name === 'coresh5r_shared');
+      const shOffset = FOUR_CGS_HEADER_BYTES + (await readFourCgsManifest(result.blob)).manifestBytes
+        + manifest.streams.slice(0, shIndex).reduce((sum, stream) => sum + stream.storedBytes, 0);
+      const shBytes = new Uint8Array(await result.blob.slice(
+        shOffset,
+        shOffset + manifest.streams[shIndex].storedBytes,
+      ).arrayBuffer());
+      const baseBytes = new DataView(shBytes.buffer, shBytes.byteOffset).getUint32(20, true);
+      const compressedLengths = [24, 28, 32, 36].map((offset) => (
+        new DataView(shBytes.buffer, shBytes.byteOffset).getUint32(offset, true)
+      ));
+      let compressedOffset = 40 + baseBytes;
+      // #WDD-gpt 2026-09-20 - 真实导出必须逐段解开 C5T3 的更新位图、标签、例外位图和例外值，不能只检查清单与 Magic。
+      const restoredShParts = compressedLengths.map((length) => {
+        const restored = unzlibSync(shBytes.subarray(compressedOffset, compressedOffset + length));
+        compressedOffset += length;
+        return restored;
+      });
       expect(manifest.codecName).toContain('AdaptivePQ');
       expect(policy.sourceProfileSha256).toBeUndefined();
       expect(policy.qualityGate.status).toBe('numeric-passed');
       expect(policy.shPolicy.measuredRmse).toBeLessThanOrEqual(0.0130001);
       expect(policy.shPolicy.maximumCoefficientError).toBeLessThanOrEqual(0.0500001);
+      expect(restoredShParts[0].byteLength).toBe(Math.ceil(manifest.segments[0].gaussianCount / 8));
+      expect(restoredShParts[1].byteLength % policy.shPolicy.labelBytesPerInstance).toBe(0);
+      expect(restoredShParts[2].byteLength).toBe(Math.ceil(manifest.segments[0].gaussianCount / 8));
+      expect(restoredShParts[3].byteLength % (policy.shPolicy.dimensions * 2)).toBe(0);
+      expect(compressedOffset).toBe(shBytes.byteLength);
       if (process.env.RAW4D_ADAPTIVE_OUTPUT) {
         await writeFile(process.env.RAW4D_ADAPTIVE_OUTPUT, Buffer.from(await result.blob.arrayBuffer()));
       }

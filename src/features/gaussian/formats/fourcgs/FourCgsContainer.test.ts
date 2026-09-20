@@ -33,7 +33,7 @@ function fixture(metadata?: unknown, scaleNames: readonly string[] = ['tattr_sca
   return new File([header, manifestBytes, new Uint8Array(names.length)], 'fixture.4cgs');
 }
 
-function raw4DBundleFixture(): File {
+function raw4DBundleFixture(editorVersion?: string): File {
   const bundleSegments = segments.slice(0, 2);
   const manifest: FourCgsManifest = {
     format: '4CGS', version: 2, codecName: RAW4D_BUNDLE_CODEC_NAME, slotCount: 3,
@@ -46,6 +46,9 @@ function raw4DBundleFixture(): File {
     })),
     crop: { center: [0, 0, 0], halfExtent: 1 }, prs: { mode: 'raw4d-lossless-bundle' },
     metadata: {
+      ...(editorVersion ? {
+        editorBuild: { schemaVersion: 1, product: 'Dong Editor 3', version: editorVersion },
+      } : {}),
       raw4dBundle: {
         version: 1,
         chunkBytes: 8,
@@ -107,6 +110,14 @@ describe('4CGS container', () => {
     });
     expect(new Uint8Array(await output.slice(12 + outputDirectory.manifestBytes).arrayBuffer()))
       .toEqual(new Uint8Array(await source.slice(12 + manifestBytes).arrayBuffer()));
+  });
+
+  // #WDD-gpt 2026-09-19 - 回归外部打包器未注入语义版本时的 unknown 来源标记，确保有效 Bundle 不被清单层拒绝。
+  it('accepts an otherwise valid RAW4D bundle whose editor build version is unknown', async () => {
+    const { manifest } = await readFourCgsManifest(raw4DBundleFixture('unknown'));
+    expect(manifest.metadata?.editorBuild).toEqual({
+      schemaVersion: 1, product: 'Dong Editor 3', version: 'unknown',
+    });
   });
 
   it('round-trips the complete scene transform while preserving compressed stream bytes', async () => {

@@ -1,4 +1,4 @@
-import type { FourCgsProgress } from './FourCgsTypes';
+import type { FourCgsExportOptions, FourCgsProgress } from './FourCgsTypes';
 import type { Raw4DMemorySnapshot } from '../raw4d/Raw4DTypes';
 
 export interface FourCgsEncodeResult {
@@ -17,6 +17,14 @@ export interface FourCgsEncodeResult {
     readonly stageMs: Readonly<Record<string, number>>;
   };
 }
+
+export type { FourCgsExportOptions } from './FourCgsTypes';
+
+// #WDD-gpt 2026-09-20 - 新导出默认以 0.1 最大有效 Alpha 压实低贡献点，同时保留 SH3；UI 可显式切换 SH1/SH2。
+export const DEFAULT_FOUR_CGS_EXPORT_OPTIONS: FourCgsExportOptions = {
+  shLevel: 3,
+  maximumEffectiveAlpha: 0.1,
+};
 
 interface WorkerProgressMessage {
   readonly type: 'progress';
@@ -39,10 +47,22 @@ type WorkerEncodeRequest = {
   readonly type: 'files';
   readonly files: readonly File[];
   readonly deletionWords: readonly Uint32Array[];
+  readonly options: FourCgsExportOptions;
 } | {
   readonly type: 'memory';
   readonly sources: readonly Raw4DMemorySnapshot[];
+  readonly options: FourCgsExportOptions;
 };
+
+function normalizeOptions(options: FourCgsExportOptions = DEFAULT_FOUR_CGS_EXPORT_OPTIONS): FourCgsExportOptions {
+  const shLevel = Math.round(options.shLevel);
+  if (shLevel !== 1 && shLevel !== 2 && shLevel !== 3) throw new Error(`4CGS SH 级别无效：${options.shLevel}。`);
+  if (!Number.isFinite(options.maximumEffectiveAlpha)
+    || options.maximumEffectiveAlpha < 0 || options.maximumEffectiveAlpha >= 1) {
+    throw new Error(`4CGS 最大有效 Alpha 阈值必须位于 [0, 1)：${options.maximumEffectiveAlpha}。`);
+  }
+  return { shLevel, maximumEffectiveAlpha: options.maximumEffectiveAlpha };
+}
 
 function runEncoderWorker(
   request: WorkerEncodeRequest,
@@ -53,9 +73,24 @@ function runEncoderWorker(
   const worker = new Worker(new URL('./fourcgs-encoder.worker.ts', import.meta.url), { type: 'module' });
   return new Promise<FourCgsEncodeResult>((resolve, reject) => {
     let settled = false;
+    const startedAt = performance.now();
+    let lastProgress: FourCgsProgress | undefined;
+    let lastProgressAt = startedAt;
+    // #WDD-gpt 2026-09-19 - 同步 WASM/JS 长阶段无法从 Worker 内定时回报；主线程每 15 秒刷新等待时长，明确区分“无新里程碑”和页面失去响应。
+    const heartbeat = globalThis.setInterval(() => {
+      if (settled || !lastProgress || !onProgress) return;
+      const quietMs = performance.now() - lastProgressAt;
+      if (quietMs < 15_000) return;
+      onProgress({
+        ...lastProgress,
+        message: `${lastProgress.message} · 等待新里程碑 ${(quietMs / 1000).toFixed(0)} 秒`,
+        elapsedMs: performance.now() - startedAt,
+      });
+    }, 15_000);
     const finish = () => {
       if (settled) return false;
       settled = true;
+      globalThis.clearInterval(heartbeat);
       signal?.removeEventListener('abort', abort);
       worker.terminate();
       return true;
@@ -67,6 +102,8 @@ function runEncoderWorker(
     worker.addEventListener('message', (event: MessageEvent<WorkerMessage>) => {
       const message = event.data;
       if (message.type === 'progress') {
+        lastProgress = message.progress;
+        lastProgressAt = performance.now();
         onProgress?.(message.progress);
         return;
       }
@@ -92,6 +129,7 @@ export function encodeRaw4DFilesAsFourCgs(
   files: readonly File[],
   deletionWords: readonly Uint32Array[],
   onProgress?: (progress: FourCgsProgress) => void,
+  options: FourCgsExportOptions = DEFAULT_FOUR_CGS_EXPORT_OPTIONS,
 ): Promise<FourCgsEncodeResult> {
   if (files.length === 0) return Promise.reject(new Error('没有可编码的 RAW4D 文件。'));
   if (deletionWords.length !== files.length) {
@@ -100,7 +138,7 @@ export function encodeRaw4DFilesAsFourCgs(
   // #WDD-gpt 2026-08-16 - 只向 Worker 转移删除位集快照，运行时编辑位集继续留在主线程用于撤销和后续编辑。
   const snapshots = deletionWords.map((words) => words.slice());
   return runEncoderWorker(
-    { type: 'files', files: [...files], deletionWords: snapshots },
+    { type: 'files', files: [...files], deletionWords: snapshots, options: normalizeOptions(options) },
     snapshots.map((words) => words.buffer as ArrayBuffer),
     onProgress,
   );
@@ -111,6 +149,7 @@ export function encodeRaw4DMemoryAsFourCgs(
   sources: readonly Raw4DMemorySnapshot[],
   onProgress?: (progress: FourCgsProgress) => void,
   signal?: AbortSignal,
+  options: FourCgsExportOptions = DEFAULT_FOUR_CGS_EXPORT_OPTIONS,
 ): Promise<FourCgsEncodeResult> {
   if (sources.length === 0) return Promise.reject(new Error('没有可编码的 RAW4D 内存快照。'));
   const snapshots = sources.map((source) => ({
@@ -118,7 +157,7 @@ export function encodeRaw4DMemoryAsFourCgs(
     deletionWords: source.deletionWords.slice(),
   }));
   return runEncoderWorker(
-    { type: 'memory', sources: snapshots },
+    { type: 'memory', sources: snapshots, options: normalizeOptions(options) },
     snapshots.map((source) => source.deletionWords.buffer as ArrayBuffer),
     onProgress,
     signal,

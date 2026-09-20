@@ -8,6 +8,17 @@ const MAGIC = '4CGSMG01';
 const SEGMENT_PATTERN = /^segment_(\d+)_(\d+)\.raw4d$/;
 const floatView = new DataView(new ArrayBuffer(4));
 
+// #WDD-gpt 2026-09-20 - C5T3 例外系数使用与浏览器解码器相同的 FP16 字节平面逆重排。
+function unshuffle16(source) {
+  const values = source.length / 2;
+  const output = new Uint8Array(source.length);
+  for (let index = 0; index < values; index += 1) {
+    output[index * 2] = source[index];
+    output[index * 2 + 1] = source[values + index];
+  }
+  return output;
+}
+
 function sha256(bytes) {
   return createHash('sha256').update(bytes).digest('hex');
 }
@@ -141,7 +152,7 @@ function decodeTemporalStream(raw, manifest, activeSlots, namesBySegment, rows, 
 
 function decodeSharedSh(raw, manifest, activeSlots, rows, indices) {
   const magic = raw.subarray(0, 8).toString('ascii');
-  if (magic !== 'C5T1SH01' && magic !== 'C5T2SH01') throw new Error('Unsupported shared SH trajectory stream.');
+  if (magic !== 'C5T1SH01' && magic !== 'C5T2SH01' && magic !== 'C5T3SH01') throw new Error('Unsupported shared SH trajectory stream.');
   const slotCount = raw.readUInt32LE(8);
   const instanceCount = raw.readUInt32LE(12);
   const segmentCount = raw.readUInt16LE(16);
@@ -150,21 +161,22 @@ function decodeSharedSh(raw, manifest, activeSlots, rows, indices) {
   const baseBytes = raw.readUInt32LE(20);
   const maskBytes = raw.readUInt32LE(24);
   const labelBytes = raw.readUInt32LE(28);
-  const headerBytes = magic === 'C5T2SH01' ? 40 : 32;
-  const exceptionMaskBytes = magic === 'C5T2SH01' ? raw.readUInt32LE(32) : 0;
-  const exceptionValueBytes = magic === 'C5T2SH01' ? raw.readUInt32LE(36) : 0;
-  if (slotCount !== manifest.slotCount || segmentCount !== manifest.segments.length || dimensions !== 45
+  const hasExceptions = magic !== 'C5T1SH01';
+  const headerBytes = hasExceptions ? 40 : 32;
+  const exceptionMaskBytes = hasExceptions ? raw.readUInt32LE(32) : 0;
+  const exceptionValueBytes = hasExceptions ? raw.readUInt32LE(36) : 0;
+  if (slotCount !== manifest.slotCount || segmentCount !== manifest.segments.length || ![9, 24, 45].includes(dimensions)
     || levels < 1 || levels > 32 || (magic === 'C5T1SH01' && levels !== 5)
-    || baseBytes !== 45 * 2 + levels * 256 * 45 * 2) {
+    || baseBytes !== dimensions * 2 + levels * 256 * dimensions * 2) {
     throw new Error('Shared CoReSH-5R metadata mismatch.');
   }
   const baseOffset = headerBytes;
-  const mean = new Float32Array(45);
-  for (let dimension = 0; dimension < 45; dimension += 1) {
+  const mean = new Float32Array(dimensions);
+  for (let dimension = 0; dimension < dimensions; dimension += 1) {
     mean[dimension] = halfToFloat(raw.readUInt16LE(baseOffset + dimension * 2));
   }
-  const codebookOffset = baseOffset + 45 * 2;
-  const codebooks = new Float32Array(levels * 256 * 45);
+  const codebookOffset = baseOffset + dimensions * 2;
+  const codebooks = new Float32Array(levels * 256 * dimensions);
   for (let index = 0; index < codebooks.length; index += 1) {
     codebooks[index] = halfToFloat(raw.readUInt16LE(codebookOffset + index * 2));
   }
@@ -174,14 +186,15 @@ function decodeSharedSh(raw, manifest, activeSlots, rows, indices) {
   const exceptionValueOffset = exceptionMaskOffset + exceptionMaskBytes;
   const updateMask = inflateSync(raw.subarray(maskOffset, labelOffset));
   const updates = inflateSync(raw.subarray(labelOffset, exceptionMaskOffset));
-  const exceptionMask = magic === 'C5T2SH01'
+  const exceptionMask = hasExceptions
     ? inflateSync(raw.subarray(exceptionMaskOffset, exceptionValueOffset))
     : new Uint8Array(Math.ceil(instanceCount / 8));
-  const exceptionValues = magic === 'C5T2SH01'
+  const storedExceptionValues = hasExceptions
     ? inflateSync(raw.subarray(exceptionValueOffset, exceptionValueOffset + exceptionValueBytes))
     : new Uint8Array(0);
+  const exceptionValues = magic === 'C5T3SH01' ? unshuffle16(storedExceptionValues) : storedExceptionValues;
   if (updateMask.length !== Math.ceil(instanceCount / 8) || updates.length % levels !== 0
-    || exceptionMask.length !== Math.ceil(instanceCount / 8) || exceptionValues.length % (45 * 2) !== 0
+    || exceptionMask.length !== Math.ceil(instanceCount / 8) || exceptionValues.length % (dimensions * 2) !== 0
     || exceptionValueOffset + exceptionValueBytes !== raw.length) {
     throw new Error('Shared SH compressed payload length mismatch.');
   }
@@ -202,15 +215,15 @@ function decodeSharedSh(raw, manifest, activeSlots, rows, indices) {
         updateOffset += levels;
       }
       if (!initialized[slot]) throw new Error(`Missing SH initialization for slot ${slot}.`);
-      for (let dimension = 0; dimension < 45; dimension += 1) {
+      for (let dimension = 0; dimension < dimensions; dimension += 1) {
         let value = mean[dimension];
         for (let level = 0; level < levels; level += 1) {
-          value += codebooks[(level * 256 + state[stateOffset + level]) * 45 + dimension];
+          value += codebooks[(level * 256 + state[stateOffset + level]) * dimensions + dimension];
         }
         rowValues[row * rowStride + indices[segmentIndex].get(`f_rest_${dimension}`)] = floatToHalf(value);
       }
       if (exceptionMask[instance >>> 3] & (1 << (instance & 7))) {
-        for (let dimension = 0; dimension < 45; dimension += 1) {
+        for (let dimension = 0; dimension < dimensions; dimension += 1) {
           rowValues[row * rowStride + indices[segmentIndex].get(`f_rest_${dimension}`)]
             = exceptionValues[exceptionOffset] | (exceptionValues[exceptionOffset + 1] << 8);
           exceptionOffset += 2;
