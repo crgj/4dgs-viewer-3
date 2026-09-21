@@ -253,6 +253,28 @@ describe('RAW4D 4CGS bundle helpers', () => {
     expect(result.sourceSha256[0]).toMatch(/^[0-9a-f]{64}$/);
   }, 30_000);
 
+  // #WDD-gpt 2026-09-20 - 崩溃恢复的单路编码必须保留多容器合并后的显式连续帧范围。
+  it('keeps four concatenated container ranges in safe single-worker mode', async () => {
+    const source = compressibleFp16Raw4D('memory_take_600_749.raw4d', 16);
+    const parsed = await parseRaw4D(source, { sourceName: source.name });
+    const asset = { ...parsed, totalFrames: 150 };
+    const names = [
+      'music_600_749.raw4d', 'music_750_899.raw4d',
+      'music_900_1049.raw4d', 'music_1050_1199.raw4d',
+    ];
+    const result = await encodeRaw4DV26BrowserMemory(names.map((name) => ({
+      name, asset, deletionWords: new Uint32Array(1),
+    })), undefined, { shLevel: 3, maximumEffectiveAlpha: 0 }, true);
+    const { manifest } = await readFourCgsManifest(result.blob);
+    expect(manifest.segments.map((segment) => [segment.firstFrame, segment.lastFrame])).toEqual([
+      [600, 749], [750, 899], [900, 1049], [1050, 1199],
+    ]);
+    expect(manifest.firstFrame).toBe(600);
+    expect(manifest.lastFrame).toBe(1199);
+    expect(manifest.uniqueFrameCount).toBe(600);
+    expect((manifest.compressionV26 as Record<string, any>).layoutPolicy.lowMemoryMode).toBe(true);
+  }, 30_000);
+
   // #WDD-gpt 2026-09-20 - 同时回归 SH1 真实 9D 载荷与全整数帧最大有效 Alpha 剪除统计。
   it('writes true SH1 dimensions and prunes only points below the effective Alpha gate', async () => {
     const source = compressibleFp16Raw4D('sh1_alpha_take_0_0.raw4d', 16);

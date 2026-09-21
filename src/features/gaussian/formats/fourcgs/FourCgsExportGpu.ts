@@ -2,6 +2,7 @@ import type { Raw4DAsset } from '../raw4d/Raw4DTypes';
 
 const WORKGROUP_SIZE = 256;
 const MINIMUM_ALPHA_GPU_POINTS = 65_536;
+const TARGET_CHUNK_BYTES = 64 * 1024 * 1024;
 
 const CROP_REDUCTION_SHADER = /* wgsl */ `
 struct Params {
@@ -120,10 +121,44 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 `;
 
+const MEMORY_COMPACTION_SHADER = /* wgsl */ `
+struct Params {
+  sourcePointCount: u32,
+  propertyCount: u32,
+  keptPointCount: u32,
+  outputValueCount: u32,
+  outputWordCount: u32,
+  reserved: u32,
+}
+
+@group(0) @binding(0) var<storage, read> sourceWords: array<u32>;
+@group(0) @binding(1) var<storage, read> keptIndices: array<u32>;
+@group(0) @binding(2) var<storage, read_write> outputWords: array<u32>;
+@group(0) @binding(3) var<uniform> params: Params;
+
+fn sourceHalf(outputIndex: u32) -> u32 {
+  if (outputIndex >= params.outputValueCount) { return 0u; }
+  let destination = outputIndex / params.propertyCount;
+  let property = outputIndex - destination * params.propertyCount;
+  let sourcePoint = keptIndices[destination];
+  let sourceIndex = property * params.sourcePointCount + sourcePoint;
+  let packed = sourceWords[sourceIndex >> 1u];
+  return (packed >> ((sourceIndex & 1u) * 16u)) & 0xffffu;
+}
+
+@compute @workgroup_size(${WORKGROUP_SIZE})
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let wordIndex = id.x;
+  if (wordIndex >= params.outputWordCount) { return; }
+  outputWords[wordIndex] = sourceHalf(wordIndex * 2u) | (sourceHalf(wordIndex * 2u + 1u) << 16u);
+}
+`;
+
 interface ExportGpuRuntime {
   readonly device: GPUDevice;
   readonly cropPipeline: GPUComputePipeline;
   readonly alphaPipeline: GPUComputePipeline;
+  readonly compactionPipeline: GPUComputePipeline;
 }
 
 export interface FourCgsExportGpuSegment {
@@ -143,6 +178,58 @@ export interface FourCgsExportGpuAlphaWitnesses {
   readonly elapsedMs: number;
 }
 
+export interface FourCgsExportGpuCompaction {
+  readonly rows: Uint16Array;
+  readonly elapsedMs: number;
+}
+
+export interface FourCgsExportGpuChunk {
+  readonly firstPoint: number;
+  readonly pointCount: number;
+  readonly sourceBytes: number;
+  readonly outputBytes: number;
+}
+
+function alignedGpuBytes(bytes: number): number {
+  return Math.ceil(bytes / 4) * 4;
+}
+
+// #WDD-gpt 2026-09-20 - 裁剪与 Alpha 扫描共用按点分块规划，严格受单 binding、buffer 和 dispatch 三重上限约束。
+export function planFourCgsExportGpuChunks(
+  pointCount: number,
+  sourceBytesPerPoint: number,
+  outputBytesPerPoint: number,
+  maxBufferBytes: number,
+  maxComputeWorkgroups: number,
+): FourCgsExportGpuChunk[] {
+  if (!Number.isSafeInteger(pointCount) || pointCount < 0
+    || !Number.isSafeInteger(sourceBytesPerPoint) || sourceBytesPerPoint <= 0
+    || !Number.isSafeInteger(outputBytesPerPoint) || outputBytesPerPoint < 0
+    || !Number.isFinite(maxBufferBytes) || maxBufferBytes < 4
+    || !Number.isSafeInteger(maxComputeWorkgroups) || maxComputeWorkgroups <= 0) return [];
+  let pointsPerChunk = Math.min(
+    pointCount,
+    Math.floor(maxBufferBytes / sourceBytesPerPoint),
+    outputBytesPerPoint === 0 ? pointCount : Math.floor(maxBufferBytes / outputBytesPerPoint),
+    maxComputeWorkgroups * WORKGROUP_SIZE,
+  );
+  while (pointsPerChunk > 0
+    && (alignedGpuBytes(pointsPerChunk * sourceBytesPerPoint) > maxBufferBytes
+      || alignedGpuBytes(pointsPerChunk * outputBytesPerPoint) > maxBufferBytes)) pointsPerChunk -= 1;
+  if (pointCount > 0 && pointsPerChunk <= 0) return [];
+  const chunks: FourCgsExportGpuChunk[] = [];
+  for (let firstPoint = 0; firstPoint < pointCount; firstPoint += pointsPerChunk) {
+    const chunkPointCount = Math.min(pointsPerChunk, pointCount - firstPoint);
+    chunks.push({
+      firstPoint,
+      pointCount: chunkPointCount,
+      sourceBytes: alignedGpuBytes(chunkPointCount * sourceBytesPerPoint),
+      outputBytes: alignedGpuBytes(chunkPointCount * outputBytesPerPoint),
+    });
+  }
+  return chunks;
+}
+
 let runtimePromise: Promise<ExportGpuRuntime | null> | null = null;
 let gpuDisabled = false;
 let gpuQueue: Promise<void> = Promise.resolve();
@@ -158,7 +245,8 @@ async function createRuntime(): Promise<ExportGpuRuntime | null> {
   }).catch(() => undefined);
   const cropModule = device.createShaderModule({ code: CROP_REDUCTION_SHADER });
   const alphaModule = device.createShaderModule({ code: ALPHA_WITNESS_SHADER });
-  const [cropPipeline, alphaPipeline] = await Promise.all([
+  const compactionModule = device.createShaderModule({ code: MEMORY_COMPACTION_SHADER });
+  const [cropPipeline, alphaPipeline, compactionPipeline] = await Promise.all([
     device.createComputePipelineAsync({
       layout: 'auto',
       compute: { module: cropModule, entryPoint: 'main' },
@@ -167,8 +255,12 @@ async function createRuntime(): Promise<ExportGpuRuntime | null> {
       layout: 'auto',
       compute: { module: alphaModule, entryPoint: 'main' },
     }),
+    device.createComputePipelineAsync({
+      layout: 'auto',
+      compute: { module: compactionModule, entryPoint: 'main' },
+    }),
   ]);
-  return { device, cropPipeline, alphaPipeline };
+  return { device, cropPipeline, alphaPipeline, compactionPipeline };
 }
 
 async function runtime(): Promise<ExportGpuRuntime | null> {
@@ -204,29 +296,152 @@ function positionIndices(segment: FourCgsExportGpuSegment): Uint32Array {
   return Uint32Array.from(indices);
 }
 
+function deletedAt(words: Uint32Array, point: number): boolean {
+  return Boolean(words[point >>> 5] & (1 << (point & 31)));
+}
+
+async function compactMemoryRowsOnGpu(
+  gpu: ExportGpuRuntime,
+  columns: readonly Uint16Array[],
+  deletionWords: Uint32Array,
+  pointCount: number,
+  outputPointCount: number,
+): Promise<FourCgsExportGpuCompaction | null> {
+  if (columns.length === 0 || pointCount <= 0 || outputPointCount <= 0
+    || deletionWords.length !== Math.ceil(pointCount / 32)
+    || columns.some((column) => column.length !== pointCount)) return null;
+  const { device, compactionPipeline } = gpu;
+  const maxBufferBytes = Math.min(TARGET_CHUNK_BYTES, device.limits.maxStorageBufferBindingSize, device.limits.maxBufferSize);
+  const propertyCount = columns.length;
+  const rowsPerDispatch = Math.floor(
+    device.limits.maxComputeWorkgroupsPerDimension * WORKGROUP_SIZE * 2 / propertyCount,
+  );
+  const pointsPerChunk = Math.min(
+    pointCount,
+    Math.floor(maxBufferBytes / (propertyCount * Uint16Array.BYTES_PER_ELEMENT)),
+    Math.floor(maxBufferBytes / Uint32Array.BYTES_PER_ELEMENT),
+    rowsPerDispatch,
+  );
+  if (pointsPerChunk <= 0) return null;
+  const sourceBufferBytes = alignedGpuBytes(pointsPerChunk * propertyCount * Uint16Array.BYTES_PER_ELEMENT);
+  const outputBufferBytes = sourceBufferBytes;
+  const sourceBuffer = device.createBuffer({ label: '4CGS export compact chunk columns', size: sourceBufferBytes,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  const keptBuffer = device.createBuffer({ label: '4CGS export compact kept indices',
+    size: alignedGpuBytes(pointsPerChunk * Uint32Array.BYTES_PER_ELEMENT),
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  const outputBuffer = device.createBuffer({ label: '4CGS export compact chunk rows', size: outputBufferBytes,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+  const readback = device.createBuffer({ label: '4CGS export compact chunk readback', size: outputBufferBytes,
+    usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+  const paramsBuffer = device.createBuffer({ label: '4CGS export compact params', size: 24,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  const rows = new Uint16Array(globalThis.crossOriginIsolated && typeof SharedArrayBuffer !== 'undefined'
+    ? new SharedArrayBuffer(outputPointCount * propertyCount * Uint16Array.BYTES_PER_ELEMENT)
+    : new ArrayBuffer(outputPointCount * propertyCount * Uint16Array.BYTES_PER_ELEMENT));
+  let destinationPoint = 0;
+  const startedAt = performance.now();
+  try {
+    const bindGroup = device.createBindGroup({
+      layout: compactionPipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: sourceBuffer } },
+        { binding: 1, resource: { buffer: keptBuffer } },
+        { binding: 2, resource: { buffer: outputBuffer } },
+        { binding: 3, resource: { buffer: paramsBuffer } },
+      ],
+    });
+    for (let firstPoint = 0; firstPoint < pointCount; firstPoint += pointsPerChunk) {
+      const chunkPointCount = Math.min(pointsPerChunk, pointCount - firstPoint);
+      const kept = new Uint32Array(chunkPointCount);
+      let keptCount = 0;
+      for (let local = 0; local < chunkPointCount; local += 1) {
+        if (!deletedAt(deletionWords, firstPoint + local)) kept[keptCount++] = local;
+      }
+      if (keptCount === 0) continue;
+      const sourceValueCount = chunkPointCount * propertyCount;
+      const sourceValues = new Uint16Array(sourceValueCount + (sourceValueCount & 1));
+      for (let property = 0; property < propertyCount; property += 1) {
+        sourceValues.set(columns[property].subarray(firstPoint, firstPoint + chunkPointCount), property * chunkPointCount);
+      }
+      const outputValueCount = keptCount * propertyCount;
+      const outputWordCount = Math.ceil(outputValueCount / 2);
+      const outputBytes = outputWordCount * Uint32Array.BYTES_PER_ELEMENT;
+      device.queue.writeBuffer(sourceBuffer, 0, new Uint32Array(sourceValues.buffer));
+      device.queue.writeBuffer(keptBuffer, 0, kept.subarray(0, keptCount));
+      device.queue.writeBuffer(paramsBuffer, 0, new Uint32Array([
+        chunkPointCount, propertyCount, keptCount, outputValueCount, outputWordCount, 0,
+      ]));
+      const encoder = device.createCommandEncoder({ label: '4CGS export compact memory chunk' });
+      const pass = encoder.beginComputePass();
+      pass.setPipeline(compactionPipeline);
+      pass.setBindGroup(0, bindGroup);
+      pass.dispatchWorkgroups(Math.ceil(outputWordCount / WORKGROUP_SIZE));
+      pass.end();
+      encoder.copyBufferToBuffer(outputBuffer, 0, readback, 0, outputBytes);
+      device.queue.submit([encoder.finish()]);
+      await readback.mapAsync(GPUMapMode.READ, 0, outputBytes);
+      const chunkRows = new Uint16Array(readback.getMappedRange(0, outputBytes), 0, outputValueCount);
+      const samples = keptCount === 1 ? [0] : [0, Math.floor(keptCount / 2), keptCount - 1];
+      for (const sample of samples) {
+        const sourcePoint = firstPoint + kept[sample];
+        for (let property = 0; property < propertyCount; property += 1) {
+          if (chunkRows[sample * propertyCount + property] !== columns[property][sourcePoint]) {
+            throw new Error(`4CGS WebGPU compaction verification failed at ${sourcePoint}/${property}.`);
+          }
+        }
+      }
+      rows.set(chunkRows, destinationPoint * propertyCount);
+      destinationPoint += keptCount;
+      readback.unmap();
+    }
+    if (destinationPoint !== outputPointCount) throw new Error('4CGS WebGPU compaction point count mismatch.');
+    return { rows, elapsedMs: performance.now() - startedAt };
+  } finally {
+    if (readback.mapState === 'mapped') readback.unmap();
+    sourceBuffer.destroy(); keptBuffer.destroy(); outputBuffer.destroy(); readback.destroy(); paramsBuffer.destroy();
+  }
+}
+
+// #WDD-gpt 2026-09-20 - FP16 Canonical RAM 由 WebGPU 分块完成删除压实与 SoA→row-major 转置；逐块位级抽样失败或设备异常时返回 null 走原 CPU 路径。
+export async function compactFourCgsMemoryRowsGpu(
+  columns: readonly Uint16Array[],
+  deletionWords: Uint32Array,
+  pointCount: number,
+  outputPointCount: number,
+): Promise<FourCgsExportGpuCompaction | null> {
+  const gpu = await runtime();
+  if (!gpu) return null;
+  let resolveTurn!: () => void;
+  const previous = gpuQueue;
+  gpuQueue = new Promise<void>((resolve) => { resolveTurn = resolve; });
+  await previous;
+  try { return await compactMemoryRowsOnGpu(gpu, columns, deletionWords, pointCount, outputPointCount); }
+  catch { gpuDisabled = true; runtimePromise = null; return null; }
+  finally { resolveTurn(); }
+}
+
 async function reduceSegment(
   gpu: ExportGpuRuntime,
   segment: FourCgsExportGpuSegment,
 ): Promise<FourCgsExportGpuCropBits | null> {
   const { device, cropPipeline } = gpu;
-  const source = packedSource(segment.rows);
   const indices = positionIndices(segment);
   const bankCount = indices.length / 3;
-  const workgroups = Math.ceil(segment.count / WORKGROUP_SIZE);
-  if (source.byteLength > device.limits.maxStorageBufferBindingSize
-    || source.byteLength > device.limits.maxBufferSize
-    || workgroups > device.limits.maxComputeWorkgroupsPerDimension
-    || bankCount > device.limits.maxComputeWorkgroupsPerDimension) {
-    return null;
-  }
+  const maxBufferBytes = Math.min(TARGET_CHUNK_BYTES, device.limits.maxStorageBufferBindingSize, device.limits.maxBufferSize);
+  const chunks = planFourCgsExportGpuChunks(
+    segment.count, segment.propertyNames.length * Uint16Array.BYTES_PER_ELEMENT, 0,
+    maxBufferBytes, device.limits.maxComputeWorkgroupsPerDimension,
+  );
+  if (chunks.length === 0 || bankCount > device.limits.maxComputeWorkgroupsPerDimension) return null;
   const initialBounds = new Uint32Array([
     0xffff_ffff, 0xffff_ffff, 0xffff_ffff,
     0, 0, 0,
     0,
   ]);
   const sourceBuffer = device.createBuffer({
-    label: '4CGS export crop source',
-    size: source.byteLength,
+    label: '4CGS export crop chunk source',
+    size: Math.max(...chunks.map((chunk) => chunk.sourceBytes)),
     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
   });
   const indexBuffer = device.createBuffer({
@@ -244,17 +459,14 @@ async function reduceSegment(
     size: initialBounds.byteLength,
     usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
   });
-  const params = new Uint32Array([segment.count, segment.propertyNames.length, bankCount, 0]);
   const paramsBuffer = device.createBuffer({
     label: '4CGS export crop params',
-    size: params.byteLength,
+    size: 16,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
   try {
-    device.queue.writeBuffer(sourceBuffer, 0, source);
     device.queue.writeBuffer(indexBuffer, 0, indices);
     device.queue.writeBuffer(boundsBuffer, 0, initialBounds);
-    device.queue.writeBuffer(paramsBuffer, 0, params);
     const bindGroup = device.createBindGroup({
       layout: cropPipeline.getBindGroupLayout(0),
       entries: [
@@ -264,14 +476,24 @@ async function reduceSegment(
         { binding: 3, resource: { buffer: paramsBuffer } },
       ],
     });
-    const encoder = device.createCommandEncoder({ label: '4CGS export crop reduction' });
-    const pass = encoder.beginComputePass();
-    pass.setPipeline(cropPipeline);
-    pass.setBindGroup(0, bindGroup);
-    pass.dispatchWorkgroups(workgroups, bankCount);
-    pass.end();
-    encoder.copyBufferToBuffer(boundsBuffer, 0, readback, 0, initialBounds.byteLength);
-    device.queue.submit([encoder.finish()]);
+    for (const chunk of chunks) {
+      const first = chunk.firstPoint * segment.propertyNames.length;
+      const source = packedSource(segment.rows.subarray(first, first + chunk.pointCount * segment.propertyNames.length));
+      device.queue.writeBuffer(sourceBuffer, 0, source);
+      device.queue.writeBuffer(paramsBuffer, 0, new Uint32Array([
+        chunk.pointCount, segment.propertyNames.length, bankCount, 0,
+      ]));
+      const encoder = device.createCommandEncoder({ label: '4CGS export crop chunk reduction' });
+      const pass = encoder.beginComputePass();
+      pass.setPipeline(cropPipeline);
+      pass.setBindGroup(0, bindGroup);
+      pass.dispatchWorkgroups(Math.ceil(chunk.pointCount / WORKGROUP_SIZE), bankCount);
+      pass.end();
+      device.queue.submit([encoder.finish()]);
+    }
+    const readbackEncoder = device.createCommandEncoder({ label: '4CGS export crop bounds readback' });
+    readbackEncoder.copyBufferToBuffer(boundsBuffer, 0, readback, 0, initialBounds.byteLength);
+    device.queue.submit([readbackEncoder.finish()]);
     await readback.mapAsync(GPUMapMode.READ);
     const result = new Uint32Array(readback.getMappedRange()).slice();
     readback.unmap();
@@ -290,7 +512,7 @@ async function reduceSegment(
   }
 }
 
-// #WDD-gpt 2026-09-20 - 导出包围盒只归约 FP16 Position 位模式；分段顺序提交并仅回读 24 字节，设备缺失或限额不足时让调用方安全回退 CPU。
+// #WDD-gpt 2026-09-20 - 导出包围盒按 64MiB 上限分块归约 FP16 Position 位模式；任意大段均只回读 28 字节，异常时安全回退 CPU。
 export async function computeFourCgsExportCropGpu(
   segments: readonly FourCgsExportGpuSegment[],
 ): Promise<FourCgsExportGpuCropBits | null> {
@@ -359,18 +581,23 @@ function alphaFrameSpans(asset: Raw4DAsset): ArrayBuffer {
   return buffer;
 }
 
-function packedAlphaColumns(asset: Raw4DAsset): Uint32Array | null {
+function packedAlphaColumns(asset: Raw4DAsset, firstPoint: number, pointCount: number): Uint32Array | null {
   if (asset.opacity.encoding !== asset.sourceEncoding) return null;
   const columns = [...asset.opacity.values, asset.lifetimeMu, asset.lifetimeW];
   if (asset.sourceEncoding === 'float16') {
     if (columns.some((column) => !(column instanceof Uint16Array))) return null;
-    const values = new Uint16Array(columns.length * asset.splatCount + ((columns.length * asset.splatCount) & 1));
-    columns.forEach((column, index) => values.set(column as Uint16Array, index * asset.splatCount));
+    const valueCount = columns.length * pointCount;
+    const values = new Uint16Array(valueCount + (valueCount & 1));
+    columns.forEach((column, index) => values.set(
+      (column as Uint16Array).subarray(firstPoint, firstPoint + pointCount), index * pointCount,
+    ));
     return new Uint32Array(values.buffer);
   }
   if (columns.some((column) => !(column instanceof Float32Array))) return null;
-  const values = new Float32Array(columns.length * asset.splatCount);
-  columns.forEach((column, index) => values.set(column as Float32Array, index * asset.splatCount));
+  const values = new Float32Array(columns.length * pointCount);
+  columns.forEach((column, index) => values.set(
+    (column as Float32Array).subarray(firstPoint, firstPoint + pointCount), index * pointCount,
+  ));
   return new Uint32Array(values.buffer);
 }
 
@@ -381,21 +608,18 @@ async function alphaWitnessesOnGpu(
 ): Promise<FourCgsExportGpuAlphaWitnesses | null> {
   const { device, alphaPipeline } = gpu;
   if (asset.splatCount < MINIMUM_ALPHA_GPU_POINTS || asset.totalFrames < 2) return null;
-  const source = packedAlphaColumns(asset);
-  if (!source) return null;
   const spans = alphaFrameSpans(asset);
-  const outputBytes = asset.splatCount * Uint32Array.BYTES_PER_ELEMENT;
-  const workgroups = Math.ceil(asset.splatCount / WORKGROUP_SIZE);
-  if (source.byteLength > device.limits.maxStorageBufferBindingSize
-    || source.byteLength > device.limits.maxBufferSize
-    || spans.byteLength > device.limits.maxStorageBufferBindingSize
-    || outputBytes > device.limits.maxStorageBufferBindingSize
-    || outputBytes > device.limits.maxBufferSize
-    || workgroups > device.limits.maxComputeWorkgroupsPerDimension) {
-    return null;
-  }
+  const columnCount = asset.opacity.values.length + 2;
+  const valueBytes = asset.sourceEncoding === 'float32' ? Float32Array.BYTES_PER_ELEMENT : Uint16Array.BYTES_PER_ELEMENT;
+  const maxBufferBytes = Math.min(TARGET_CHUNK_BYTES, device.limits.maxStorageBufferBindingSize, device.limits.maxBufferSize);
+  if (spans.byteLength > maxBufferBytes) return null;
+  const chunks = planFourCgsExportGpuChunks(
+    asset.splatCount, columnCount * valueBytes, Uint32Array.BYTES_PER_ELEMENT,
+    maxBufferBytes, device.limits.maxComputeWorkgroupsPerDimension,
+  );
+  if (chunks.length === 0) return null;
   const sourceBuffer = device.createBuffer({
-    label: '4CGS export alpha source', size: source.byteLength,
+    label: '4CGS export alpha chunk source', size: Math.max(...chunks.map((chunk) => chunk.sourceBytes)),
     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
   });
   const spanBuffer = device.createBuffer({
@@ -403,34 +627,21 @@ async function alphaWitnessesOnGpu(
     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
   });
   const outputBuffer = device.createBuffer({
-    label: '4CGS export alpha witnesses', size: outputBytes,
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+    label: '4CGS export alpha chunk witnesses', size: Math.max(...chunks.map((chunk) => chunk.outputBytes)),
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
   });
   const readback = device.createBuffer({
-    label: '4CGS export alpha readback', size: outputBytes,
+    label: '4CGS export alpha chunk readback', size: Math.max(...chunks.map((chunk) => chunk.outputBytes)),
     usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
   });
   const paramsBuffer = device.createBuffer({
     label: '4CGS export alpha params', size: 32,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
-  const params = new ArrayBuffer(32);
-  const paramsView = new DataView(params);
-  paramsView.setUint32(0, asset.splatCount, true);
-  paramsView.setUint32(4, asset.opacity.values.length, true);
-  paramsView.setUint32(8, asset.totalFrames, true);
-  paramsView.setUint32(12, asset.sourceEncoding === 'float32' ? 1 : 0, true);
-  paramsView.setFloat32(16, threshold, true);
-  paramsView.setUint32(20, asset.opacityTiming === 'baked' ? 1 : 0, true);
   try {
     const startedAt = performance.now();
-    device.queue.writeBuffer(sourceBuffer, 0, source);
     device.queue.writeBuffer(spanBuffer, 0, spans);
-    device.queue.writeBuffer(paramsBuffer, 0, params);
-    const encoder = device.createCommandEncoder({ label: '4CGS export alpha witness scan' });
-    const pass = encoder.beginComputePass();
-    pass.setPipeline(alphaPipeline);
-    pass.setBindGroup(0, device.createBindGroup({
+    const bindGroup = device.createBindGroup({
       layout: alphaPipeline.getBindGroupLayout(0),
       entries: [
         { binding: 0, resource: { buffer: sourceBuffer } },
@@ -438,14 +649,34 @@ async function alphaWitnessesOnGpu(
         { binding: 2, resource: { buffer: outputBuffer } },
         { binding: 3, resource: { buffer: paramsBuffer } },
       ],
-    }));
-    pass.dispatchWorkgroups(workgroups);
-    pass.end();
-    encoder.copyBufferToBuffer(outputBuffer, 0, readback, 0, outputBytes);
-    device.queue.submit([encoder.finish()]);
-    await readback.mapAsync(GPUMapMode.READ);
-    const frames = new Uint32Array(readback.getMappedRange()).slice();
-    readback.unmap();
+    });
+    const frames = new Uint32Array(asset.splatCount);
+    for (const chunk of chunks) {
+      const source = packedAlphaColumns(asset, chunk.firstPoint, chunk.pointCount);
+      if (!source) return null;
+      const params = new ArrayBuffer(32);
+      const paramsView = new DataView(params);
+      paramsView.setUint32(0, chunk.pointCount, true);
+      paramsView.setUint32(4, asset.opacity.values.length, true);
+      paramsView.setUint32(8, asset.totalFrames, true);
+      paramsView.setUint32(12, asset.sourceEncoding === 'float32' ? 1 : 0, true);
+      paramsView.setFloat32(16, threshold, true);
+      paramsView.setUint32(20, asset.opacityTiming === 'baked' ? 1 : 0, true);
+      device.queue.writeBuffer(sourceBuffer, 0, source);
+      device.queue.writeBuffer(paramsBuffer, 0, params);
+      const encoder = device.createCommandEncoder({ label: '4CGS export alpha witness chunk scan' });
+      encoder.clearBuffer(outputBuffer, 0, chunk.outputBytes);
+      const pass = encoder.beginComputePass();
+      pass.setPipeline(alphaPipeline);
+      pass.setBindGroup(0, bindGroup);
+      pass.dispatchWorkgroups(Math.ceil(chunk.pointCount / WORKGROUP_SIZE));
+      pass.end();
+      encoder.copyBufferToBuffer(outputBuffer, 0, readback, 0, chunk.outputBytes);
+      device.queue.submit([encoder.finish()]);
+      await readback.mapAsync(GPUMapMode.READ, 0, chunk.outputBytes);
+      frames.set(new Uint32Array(readback.getMappedRange(0, chunk.outputBytes), 0, chunk.pointCount), chunk.firstPoint);
+      readback.unmap();
+    }
     return { frames, elapsedMs: performance.now() - startedAt };
   } finally {
     if (readback.mapState === 'mapped') readback.unmap();
@@ -457,7 +688,7 @@ async function alphaWitnessesOnGpu(
   }
 }
 
-// #WDD-gpt 2026-09-20 - GPU 只给出“可能可见”的具体整数帧，CPU 必须复算该帧后才能跳过全帧扫描，确保 GPU 数学近似不会改变 Alpha 剪除结果。
+// #WDD-gpt 2026-09-20 - GPU 分块给出“可能可见”的整数帧，CPU 仍复算 witness；大资产不再因单 buffer 超限回退全量 CPU 扫描。
 export async function computeFourCgsEffectiveAlphaWitnessesGpu(
   asset: Raw4DAsset,
   threshold: number,

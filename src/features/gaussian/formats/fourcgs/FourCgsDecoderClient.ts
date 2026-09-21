@@ -107,10 +107,17 @@ export class FourCgsDecoderClient {
   }
 
   // #WDD-gpt 2026-09-20 - 不经临时 File 的内部导入通道；内存租约仍由 ViewportRuntime 注册与回收。
-  async getAsset(segmentIndex: number, cpuBudgetBytes: number): Promise<{ file: File; loaded: ImportedGaussianAsset; elapsedMs: number }> {
-    const result = await this.request<{ asset: Raw4DAsset; elapsedMs: number; shared: boolean }>({ type: 'asset', segmentIndex, consume: true, cpuBudgetBytes });
+  async getAsset(segmentIndex: number, cpuBudgetBytes: number, preferGpu = true): Promise<{
+    file: File;
+    loaded: ImportedGaussianAsset;
+    elapsedMs: number;
+    backend: 'webgpu' | 'cpu';
+  }> {
+    const result = await this.request<{ asset: Raw4DAsset; elapsedMs: number; shared: boolean; backend: 'webgpu' | 'cpu' }>({
+      type: 'asset', segmentIndex, consume: true, cpuBudgetBytes, preferGpu,
+    });
     const cpuResidentBytes = measureRaw4DAssetBytes(result.asset);
-    return { file: new File([], result.asset.sourceName), elapsedMs: result.elapsedMs,
+    return { file: new File([], result.asset.sourceName), elapsedMs: result.elapsedMs, backend: result.backend,
       loaded: { asset: result.asset, bufferId: `fourcgs-direct-${crypto.randomUUID()}`, cpuResidentBytes,
         sourceToResidentRatio: 1, transport: result.shared ? 'shared-array-buffer' : 'transferable', decodeBackend: 'fp16-bits', format: 'RAW4D',
         releaseBacking() { /* Worker 不保留已返回的列，最后一个 RAM/GPU 租约释放后由 GC 回收。 */ },

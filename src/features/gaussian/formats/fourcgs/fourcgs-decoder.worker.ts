@@ -8,7 +8,7 @@ import { bytesToHex } from '@noble/hashes/utils.js';
 import { FOUR_CGS_HEADER_BYTES, readFourCgsManifest } from './FourCgsContainer';
 import type { FourCgsDescriptor, FourCgsManifest, FourCgsSegment } from './FourCgsTypes';
 import { createFourCgsCanonicalRaw4D, fourCgsDecodedPropertyNames } from './FourCgsRaw4D';
-import { createFourCgsCanonicalRaw4DGpu } from './FourCgsCanonicalGpu';
+import { createFourCgsCanonicalAssetGpu, createFourCgsCanonicalRaw4DGpu } from './FourCgsCanonicalGpu';
 import { raw4DBundleMetadata, raw4DBundleStreamName, unshuffle16 } from './FourCgsRaw4DBundle';
 
 interface OpenRequest {
@@ -667,14 +667,20 @@ async function segmentBytes(segmentIndex: number, consume = false, preferGpu = t
 }
 
 // #WDD-gpt 2026-09-20 - 直达共享 Canonical RAM，只保留已交给主线程的列视图，旧行按段释放。
-function segmentAsset(index: number, consume: boolean, cpuBudgetBytes?: number) {
+async function segmentAsset(index: number, consume: boolean, cpuBudgetBytes?: number, preferGpu = true) {
   const started = performance.now();
   const segment = activeManifest?.segments[index];
   if (!segment || !decodedRows[index]?.length) throw new Error('4CGS decoded segment unavailable.');
   const shared = globalThis.crossOriginIsolated && typeof SharedArrayBuffer !== 'undefined';
-  const asset = createFourCgsCanonicalAsset(segment, decodedNames[index], decodedRows[index], shared, cpuBudgetBytes);
+  // #WDD-gpt 2026-09-20 - 前景导入直接由 WebGPU 生成最终列式 RAM；后台或失败路径继续使用经验证的 CPU 转置。
+  const gpuAsset = preferGpu ? await createFourCgsCanonicalAssetGpu(
+    segment, decodedNames[index], decodedRows[index], shared, cpuBudgetBytes,
+  ) : null;
+  const asset = gpuAsset ?? createFourCgsCanonicalAsset(
+    segment, decodedNames[index], decodedRows[index], shared, cpuBudgetBytes,
+  );
   if (consume) decodedRows[index] = new Uint16Array(0);
-  return { asset, elapsedMs: performance.now() - started, shared };
+  return { asset, elapsedMs: performance.now() - started, shared, backend: gpuAsset ? 'webgpu' : 'cpu' };
 }
 
 self.addEventListener('message', (event: MessageEvent<WorkerRequest>) => {
@@ -682,8 +688,9 @@ self.addEventListener('message', (event: MessageEvent<WorkerRequest>) => {
   if (request.type === 'reset') { activeManifest = null; activeSourceName = ''; decodedRows = []; decodedNames = []; decodedRaw4DBundle = []; return; }
   const operation: Promise<void> = request.type === 'open'
     ? open(request.file, request.background).then((value) => self.postMessage({ type: 'result', requestId: request.requestId, value }))
-    : request.type === 'asset' ? Promise.resolve().then(() => {
-      const value = segmentAsset(request.segmentIndex, Boolean(request.consume), request.cpuBudgetBytes);
+    : request.type === 'asset' ? segmentAsset(
+      request.segmentIndex, Boolean(request.consume), request.cpuBudgetBytes, request.preferGpu,
+    ).then((value) => {
       const buffer = value.asset.position.values[0].buffer;
       self.postMessage({ type: 'result', requestId: request.requestId, value }, buffer instanceof ArrayBuffer ? [buffer] : []);
     })

@@ -48,11 +48,15 @@ type WorkerEncodeRequest = {
   readonly files: readonly File[];
   readonly deletionWords: readonly Uint32Array[];
   readonly options: FourCgsExportOptions;
+  readonly safeMode?: boolean;
 } | {
   readonly type: 'memory';
   readonly sources: readonly Raw4DMemorySnapshot[];
   readonly options: FourCgsExportOptions;
+  readonly safeMode?: boolean;
 };
+
+class FourCgsEncoderWorkerCrashedError extends Error {}
 
 function normalizeOptions(options: FourCgsExportOptions = DEFAULT_FOUR_CGS_EXPORT_OPTIONS): FourCgsExportOptions {
   const shLevel = Math.round(options.shLevel);
@@ -113,14 +117,25 @@ function runEncoderWorker(
     });
     worker.addEventListener('error', (event) => {
       if (!finish()) return;
-      reject(new Error(event.message || '4CGS 编码 Worker 崩溃。'));
+      reject(new FourCgsEncoderWorkerCrashedError(event.message || '4CGS 编码 Worker 崩溃。'));
+    }, { once: true });
+    worker.addEventListener('messageerror', () => {
+      if (!finish()) return;
+      reject(new FourCgsEncoderWorkerCrashedError('4CGS 编码 Worker 结果传输失败。'));
     }, { once: true });
     signal?.addEventListener('abort', abort, { once: true });
     if (signal?.aborted) {
       abort();
       return;
     }
-    worker.postMessage(request, [...transfer]);
+    try {
+      worker.postMessage(request, [...transfer]);
+    } catch (error) {
+      if (!finish()) return;
+      reject(new FourCgsEncoderWorkerCrashedError(
+        `4CGS 编码 Worker 启动失败：${error instanceof Error ? error.message : String(error)}`,
+      ));
+    }
   });
 }
 
@@ -136,12 +151,20 @@ export function encodeRaw4DFilesAsFourCgs(
     return Promise.reject(new Error(`RAW4D 删除位集数量不一致：${deletionWords.length}/${files.length}。`));
   }
   // #WDD-gpt 2026-08-16 - 只向 Worker 转移删除位集快照，运行时编辑位集继续留在主线程用于撤销和后续编辑。
-  const snapshots = deletionWords.map((words) => words.slice());
-  return runEncoderWorker(
-    { type: 'files', files: [...files], deletionWords: snapshots, options: normalizeOptions(options) },
-    snapshots.map((words) => words.buffer as ArrayBuffer),
-    onProgress,
-  );
+  const normalized = normalizeOptions(options);
+  const attempt = (safeMode: boolean) => {
+    const snapshots = deletionWords.map((words) => words.slice());
+    return runEncoderWorker(
+      { type: 'files', files: [...files], deletionWords: snapshots, options: normalized, safeMode },
+      snapshots.map((words) => words.buffer as ArrayBuffer), onProgress,
+    );
+  };
+  // #WDD-gpt 2026-09-20 - 总控 Worker 被浏览器回收时仅重试一次严格单路模式；业务校验错误不重试。
+  return attempt(false).catch((error: unknown) => {
+    if (!(error instanceof FourCgsEncoderWorkerCrashedError)) throw error;
+    onProgress?.({ ratio: 0, message: `${error.message}正在以低内存单路模式重试。`, stage: '安全重试', stageRatio: 0, workerCount: 1 });
+    return attempt(true);
+  });
 }
 
 // #WDD-gpt 2026-08-16 - 正式保存直接把 Canonical RAM 交给 Worker；共享内存零拷贝，兼容模式只克隆而不回读源文件。
@@ -152,14 +175,18 @@ export function encodeRaw4DMemoryAsFourCgs(
   options: FourCgsExportOptions = DEFAULT_FOUR_CGS_EXPORT_OPTIONS,
 ): Promise<FourCgsEncodeResult> {
   if (sources.length === 0) return Promise.reject(new Error('没有可编码的 RAW4D 内存快照。'));
-  const snapshots = sources.map((source) => ({
-    ...source,
-    deletionWords: source.deletionWords.slice(),
-  }));
-  return runEncoderWorker(
-    { type: 'memory', sources: snapshots, options: normalizeOptions(options) },
-    snapshots.map((source) => source.deletionWords.buffer as ArrayBuffer),
-    onProgress,
-    signal,
-  );
+  const normalized = normalizeOptions(options);
+  const attempt = (safeMode: boolean) => {
+    const snapshots = sources.map((source) => ({ ...source, deletionWords: source.deletionWords.slice() }));
+    return runEncoderWorker(
+      { type: 'memory', sources: snapshots, options: normalized, safeMode },
+      snapshots.map((source) => source.deletionWords.buffer as ArrayBuffer), onProgress, signal,
+    );
+  };
+  // #WDD-gpt 2026-09-20 - 保留主线程 Canonical 与删除位集，崩溃后新 Worker 可以重建快照并关闭 GPU/嵌套并行。
+  return attempt(false).catch((error: unknown) => {
+    if (!(error instanceof FourCgsEncoderWorkerCrashedError) || signal?.aborted) throw error;
+    onProgress?.({ ratio: 0, message: `${error.message}正在以低内存单路模式重试。`, stage: '安全重试', stageRatio: 0, workerCount: 1 });
+    return attempt(true);
+  });
 }

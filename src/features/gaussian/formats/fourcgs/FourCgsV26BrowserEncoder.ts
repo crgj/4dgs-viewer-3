@@ -23,6 +23,7 @@ import {
 import type { Raw4DAsset, Raw4DHeader, Raw4DMemorySnapshot, Raw4DTemporalLayout, Raw4DTrack } from '../raw4d/Raw4DTypes';
 import { readRaw4DScalar } from '../raw4d/Raw4DValues';
 import {
+  compactFourCgsMemoryRowsGpu,
   computeFourCgsEffectiveAlphaWitnessesGpu,
   computeFourCgsExportCropGpu,
   fourCgsUnorderedHalf,
@@ -134,6 +135,8 @@ interface PreparedV26Source {
   readonly alphaGpuElapsedMs?: number;
   readonly alphaGpuVerifiedWitnessCount?: number;
   readonly alphaCpuFullScanCount?: number;
+  readonly compactionBackend?: 'webgpu-bitwise-verified' | 'cpu';
+  readonly compactionGpuElapsedMs?: number;
   readonly temporalLayout?: Raw4DTemporalLayout;
   readonly compacted: {
     readonly segment: BrowserSegment;
@@ -227,6 +230,7 @@ async function effectiveDeletionWords(
   asset: Raw4DAsset,
   sourceWords: Uint32Array,
   threshold: number,
+  preferGpu = true,
 ): Promise<{
   readonly words: Uint32Array;
   readonly alphaPruned: number;
@@ -242,7 +246,7 @@ async function effectiveDeletionWords(
       gpuVerifiedWitnessCount: 0, cpuFullScanCount: 0,
     };
   }
-  const gpuWitnesses = await computeFourCgsEffectiveAlphaWitnessesGpu(asset, threshold);
+  const gpuWitnesses = preferGpu ? await computeFourCgsEffectiveAlphaWitnessesGpu(asset, threshold) : null;
   let alphaPruned = 0;
   let gpuVerifiedWitnessCount = 0;
   let cpuFullScanCount = 0;
@@ -649,12 +653,13 @@ function orderedMemorySources(sources: readonly Raw4DMemorySnapshot[]): readonly
 async function compactMemorySegment(
   source: IndexedMemorySource,
   options: FourCgsExportOptions,
+  safeMode = false,
 ): Promise<PreparedV26Source> {
   const { asset } = source;
   if (![0, 9, 24, MAX_SH_DIMENSIONS].includes(asset.shRest.length)) {
     throw new FourCgsHighCompressionUnsupportedError(`${source.name} 的非 DC SH 系数数量 ${asset.shRest.length} 不对应 SH0/SH1/SH2/SH3。`);
   }
-  const effective = await effectiveDeletionWords(asset, source.deletionWords, options.maximumEffectiveAlpha);
+  const effective = await effectiveDeletionWords(asset, source.deletionWords, options.maximumEffectiveAlpha, !safeMode);
   const deletionWords = effective.words;
   const deleted = countDeleted(deletionWords, asset.splatCount);
   if (deleted === asset.splatCount) throw new Error(`${source.name} 的高斯点已全部删除，无法导出空片段。`);
@@ -684,30 +689,37 @@ async function compactMemorySegment(
   if (columns.length !== propertyNames.length || columns.some((column) => !(column instanceof sourceArrayType))) {
     throw new FourCgsHighCompressionUnsupportedError(`${source.name} 的 Canonical RAM 属性布局与 V2.6 不一致。`);
   }
-  const floatToHalf = asset.sourceEncoding === 'float32'
-    ? (await import('../../../../../scripts/fourcgs-prs-codec.mjs')).floatToHalf
+  const gpuCompaction = asset.sourceEncoding === 'float16' && !safeMode
+    ? await compactFourCgsMemoryRowsGpu(
+      columns as readonly Uint16Array[], deletionWords, asset.splatCount, descriptor.gaussianCount,
+    )
     : null;
-  const rows = allocateEncodingRows(descriptor.gaussianCount * propertyNames.length);
-  let destination = 0;
-  for (let stableId = 0; stableId < asset.splatCount; stableId += 1) {
-    if (isDeleted(deletionWords, stableId)) continue;
-    const destinationOffset = destination * propertyNames.length;
-    for (let property = 0; property < columns.length; property += 1) {
-      if (asset.sourceEncoding === 'float16') {
-        rows[destinationOffset + property] = (columns[property] as Uint16Array)[stableId];
-      } else {
-        const value = (columns[property] as Float32Array)[stableId];
-        if (!Number.isFinite(value) || Math.abs(value) > 65_504) {
-          throw new FourCgsHighCompressionUnsupportedError(
-            `${source.name} 的 ${propertyNames[property]}[${stableId}] 无法安全量化为 FP16：${value}。`,
-          );
+  const rows = gpuCompaction?.rows ?? allocateEncodingRows(descriptor.gaussianCount * propertyNames.length);
+  if (!gpuCompaction) {
+    const floatToHalf = asset.sourceEncoding === 'float32'
+      ? (await import('../../../../../scripts/fourcgs-prs-codec.mjs')).floatToHalf
+      : null;
+    let destination = 0;
+    for (let stableId = 0; stableId < asset.splatCount; stableId += 1) {
+      if (isDeleted(deletionWords, stableId)) continue;
+      const destinationOffset = destination * propertyNames.length;
+      for (let property = 0; property < columns.length; property += 1) {
+        if (asset.sourceEncoding === 'float16') {
+          rows[destinationOffset + property] = (columns[property] as Uint16Array)[stableId];
+        } else {
+          const value = (columns[property] as Float32Array)[stableId];
+          if (!Number.isFinite(value) || Math.abs(value) > 65_504) {
+            throw new FourCgsHighCompressionUnsupportedError(
+              `${source.name} 的 ${propertyNames[property]}[${stableId}] 无法安全量化为 FP16：${value}。`,
+            );
+          }
+          rows[destinationOffset + property] = floatToHalf!(value);
         }
-        rows[destinationOffset + property] = floatToHalf!(value);
       }
+      destination += 1;
     }
-    destination += 1;
+    if (destination !== descriptor.gaussianCount) throw new Error(`${source.name} 的内存删除压实计数不一致。`);
   }
-  if (destination !== descriptor.gaussianCount) throw new Error(`${source.name} 的内存删除压实计数不一致。`);
   const sourceHasher = nobleSha256.create();
   sourceHasher.update(new TextEncoder().encode(JSON.stringify({
     name: source.name,
@@ -733,6 +745,8 @@ async function compactMemorySegment(
     alphaGpuElapsedMs: effective.gpuElapsedMs,
     alphaGpuVerifiedWitnessCount: effective.gpuVerifiedWitnessCount,
     alphaCpuFullScanCount: effective.cpuFullScanCount,
+    compactionBackend: gpuCompaction ? 'webgpu-bitwise-verified' : 'cpu',
+    compactionGpuElapsedMs: gpuCompaction?.elapsedMs,
     temporalLayout: compactTemporalLayout(asset.temporalLayout, deletionWords),
     compacted: {
       segment: {
@@ -1259,7 +1273,8 @@ async function assignSh(
   onProgress?: (ratio: number, message: string, detail?: Partial<FourCgsProgress>) => void,
   workerLimit = Number.POSITIVE_INFINITY,
 ): Promise<ShAssignmentResult> {
-  const wasmSupported = globalThis.crossOriginIsolated
+  const wasmSupported = workerLimit > 0
+    && globalThis.crossOriginIsolated
     && typeof SharedArrayBuffer !== 'undefined'
     && typeof WebAssembly !== 'undefined'
     && typeof Worker !== 'undefined'
@@ -1875,6 +1890,7 @@ export async function encodeRaw4DV26Browser(
   deletionWords: readonly Uint32Array[],
   onProgress?: (ratio: number, message: string, detail?: Partial<FourCgsProgress>) => void,
   exportOptions: FourCgsExportOptions = LEGACY_V26_OPTIONS,
+  safeMode = false,
 ): Promise<FourCgsEncodeResult> {
   const options = normalizeV26Options(exportOptions);
   if (files.length === 0) throw new Error('没有可编码的 RAW4D 文件。');
@@ -1909,7 +1925,7 @@ export async function encodeRaw4DV26Browser(
       compacted,
     });
   }
-  return encodePreparedRaw4DV26(prepared, options, onProgress);
+  return encodePreparedRaw4DV26(prepared, options, onProgress, safeMode);
 }
 
 // #WDD-gpt 2026-08-16 - 内存保存绕过 File 解析，直接从当前 SoA 位模式建立压缩工作集。
@@ -1917,6 +1933,7 @@ export async function encodeRaw4DV26BrowserMemory(
   sources: readonly Raw4DMemorySnapshot[],
   onProgress?: (ratio: number, message: string, detail?: Partial<FourCgsProgress>) => void,
   exportOptions: FourCgsExportOptions = LEGACY_V26_OPTIONS,
+  safeMode = false,
 ): Promise<FourCgsEncodeResult> {
   const options = normalizeV26Options(exportOptions);
   if (sources.length === 0) throw new Error('没有可编码的 RAW4D 内存快照。');
@@ -1925,14 +1942,17 @@ export async function encodeRaw4DV26BrowserMemory(
   for (let index = 0; index < ordered.length; index += 1) {
     const precision = ordered[index].asset.sourceEncoding === 'float32' ? '（Float32 → FP16 编码工作副本）' : '';
     onProgress?.(0.03 + index * 0.18 / ordered.length, `正在从 Canonical RAM 压实 ${index + 1}/${ordered.length}：${ordered[index].name}${precision}`);
-    const compacted = await compactMemorySegment(ordered[index], options);
+    const compacted = await compactMemorySegment(ordered[index], options, safeMode);
     prepared.push(compacted);
+    const compactionStatus = compacted.compactionBackend === 'webgpu-bitwise-verified'
+      ? `WebGPU 压实 ${(compacted.compactionGpuElapsedMs! / 1000).toFixed(2)} 秒`
+      : 'CPU 压实';
     if (options.maximumEffectiveAlpha > 0) {
       const alphaBackend = compacted.alphaScanBackend === 'webgpu-witness-cpu-verified'
         ? `WebGPU 扫描 ${(compacted.alphaGpuElapsedMs! / 1000).toFixed(2)} 秒 · CPU 验证 ${compacted.alphaGpuVerifiedWitnessCount!.toLocaleString()} 点`
         : 'CPU 完整扫描';
       onProgress?.(0.03 + (index + 1) * 0.18 / ordered.length,
-        `Alpha ${index + 1}/${ordered.length} 完成 · ${alphaBackend} · 剪除 ${compacted.alphaPrunedPointCount.toLocaleString()} 点`, {
+        `Alpha ${index + 1}/${ordered.length} 完成 · ${alphaBackend} · ${compactionStatus} · 剪除 ${compacted.alphaPrunedPointCount.toLocaleString()} 点`, {
           stage: compacted.alphaScanBackend === 'webgpu-witness-cpu-verified' ? 'WebGPU Alpha 扫描' : 'CPU Alpha 扫描',
           stageRatio: (index + 1) / ordered.length,
           workerCount: 1,
@@ -1940,15 +1960,26 @@ export async function encodeRaw4DV26BrowserMemory(
           totalTasks: ordered.length,
           elapsedMs: compacted.alphaGpuElapsedMs,
         });
+    } else {
+      onProgress?.(0.03 + (index + 1) * 0.18 / ordered.length,
+        `内存压实 ${index + 1}/${ordered.length} 完成 · ${compactionStatus}`, {
+          stage: compacted.compactionBackend === 'webgpu-bitwise-verified' ? 'WebGPU 内存压实' : 'CPU 内存压实',
+          stageRatio: (index + 1) / ordered.length,
+          workerCount: 1,
+          completedTasks: index + 1,
+          totalTasks: ordered.length,
+          elapsedMs: compacted.compactionGpuElapsedMs,
+        });
     }
   }
-  return encodePreparedRaw4DV26(prepared, options, onProgress);
+  return encodePreparedRaw4DV26(prepared, options, onProgress, safeMode);
 }
 
 async function encodePreparedRaw4DV26(
   prepared: readonly PreparedV26Source[],
   options: FourCgsExportOptions,
   onProgress?: (ratio: number, message: string, detail?: Partial<FourCgsProgress>) => void,
+  safeMode = false,
 ): Promise<FourCgsEncodeResult> {
   const totalStartedAt = performance.now();
   const stageMs: Record<string, number> = {};
@@ -1966,7 +1997,9 @@ async function encodePreparedRaw4DV26(
   const permanent = buildExactBoundaryPermanentTrackMaps(segments);
   const prsCodec = await import('../../../../../scripts/fourcgs-prs-codec.mjs');
   const cropStartedAt = performance.now();
-  const preferredCrop = await computeInputCropPreferred(segments, prsCodec.halfToFloat);
+  const preferredCrop = safeMode
+    ? { crop: computeInputCrop(segments, prsCodec.halfToFloat), backend: 'cpu' as const }
+    : await computeInputCropPreferred(segments, prsCodec.halfToFloat);
   const crop = preferredCrop.crop;
   stageMs.crop = performance.now() - cropStartedAt;
   onProgress?.(0.225, preferredCrop.backend === 'webgpu'
@@ -2011,7 +2044,7 @@ async function encodePreparedRaw4DV26(
     stage: '稀疏 Morton 布局', stageRatio: 1, workerCount: 1,
   });
   // #WDD-gpt 2026-09-19 - 超大序列优先稳定性，避免 6 路属性状态、SH 与辅助流同时推高浏览器 Worker 峰值。
-  const lowMemoryMode = layout.slotCount >= 8_000_000 || activeObservationCount >= 12_000_000;
+  const lowMemoryMode = safeMode || layout.slotCount >= 8_000_000 || activeObservationCount >= 12_000_000;
   // #WDD-gpt 2026-09-19 - 千万 Track 级属性结果可能超过 Chromium 跨 Worker 消息的可靠交付范围；大序列全部留在总控 Worker 串行编码。
   const parallelSupported = !lowMemoryMode
     && globalThis.crossOriginIsolated
@@ -2026,8 +2059,8 @@ async function encodePreparedRaw4DV26(
     ? lowMemoryMode ? 1 : (navigator.hardwareConcurrency || 4) >= 12 ? 4 : (navigator.hardwareConcurrency || 4) >= 8 ? 3 : 2
     : 0;
   if (lowMemoryMode) {
-    onProgress?.(0.265, `大序列可靠传输模式：${layout.slotCount.toLocaleString()} 条 Track，SH、属性、辅助流在总控 Worker 分阶段串行`, {
-      stage: '大序列可靠调度', stageRatio: 1, workerCount: 1,
+    onProgress?.(0.265, `${safeMode ? '崩溃恢复单路模式' : '大序列可靠传输模式'}：${layout.slotCount.toLocaleString()} 条 Track，SH、属性、辅助流在总控 Worker 分阶段串行`, {
+      stage: safeMode ? '安全单路调度' : '大序列可靠调度', stageRatio: 1, workerCount: 1,
     });
   }
   const attributePool = parallelSupported
@@ -2074,7 +2107,7 @@ async function encodePreparedRaw4DV26(
   });
   const trainedSh = await trainAdaptiveSh(
     segments, layout, shDimensions, prsCodec.floatToHalf, prsCodec.halfToFloat, shProgress,
-    lowMemoryMode ? 2 : Number.POSITIVE_INFINITY,
+    safeMode ? 0 : lowMemoryMode ? 2 : Number.POSITIVE_INFINITY,
   );
   stageMs.shTraining = performance.now() - shStartedAt;
 
@@ -2090,16 +2123,23 @@ async function encodePreparedRaw4DV26(
     });
     if (lowMemoryMode) {
       const streams: StoredStream[] = [];
+      // #WDD-gpt 2026-09-20 - 崩溃恢复禁止再启嵌套 Brotli Worker；超大正常编码仍保留单条压缩 Worker 的心跳和隔离。
+      const storeBrotli = (
+        name: string,
+        raw: Uint8Array,
+        compression: 'brotli' | 'brotli-shuffle16',
+        heartbeat?: (elapsedMs: number) => void,
+      ) => safeMode ? storedStream(name, raw, compression) : storedBrotliStreamInWorker(name, raw, compression, heartbeat);
       const report = (completed: number, message: string) => onProgress?.(
         0.84 + 0.10 * completed / 5,
         `大序列阶段 3/3 · ${message}`,
         {
-          stage: '辅助流逐项封装', stageRatio: completed / 5, workerCount: 2,
+          stage: '辅助流逐项封装', stageRatio: completed / 5, workerCount: safeMode ? 1 : 2,
           completedTasks: completed, totalTasks: 5,
         },
       );
       report(0, '正在生成并压缩 Active Mask');
-      streams.push(await storedBrotliStreamInWorker(
+      streams.push(await storeBrotli(
         'active_masks', activeMask(layout, segments.length), 'brotli',
         (elapsedMs) => report(0, `Active Mask Brotli 正在运行 ${(elapsedMs / 1000).toFixed(0)} 秒`),
       ));
@@ -2115,12 +2155,12 @@ async function encodePreparedRaw4DV26(
         streams.push(await storedStream('mixsc_opacity', opacity.encoded));
       }
       report(2, 'Opacity 完成，正在压缩生命周期中心');
-      streams.push(await storedBrotliStreamInWorker(
+      streams.push(await storeBrotli(
         'lifetime_mu', temporalComponent(segments, layout, segments.map(() => ['lifetime_mu'])), 'brotli-shuffle16',
         (elapsedMs) => report(2, `生命周期中心 Brotli 正在运行 ${(elapsedMs / 1000).toFixed(0)} 秒`),
       ));
       report(3, '生命周期中心完成，正在压缩生命周期宽度');
-      streams.push(await storedBrotliStreamInWorker(
+      streams.push(await storeBrotli(
         'lifetime_w', temporalComponent(segments, layout, segments.map(() => ['lifetime_w'])), 'brotli-shuffle16',
         (elapsedMs) => report(3, `生命周期宽度 Brotli 正在运行 ${(elapsedMs / 1000).toFixed(0)} 秒`),
       ));
@@ -2216,7 +2256,13 @@ async function encodePreparedRaw4DV26(
     const positionEnvelopeWorkerLimit = lowMemoryMode ? 2 : 4;
     let positionEnvelopeWorkers = 1;
     let positionEnvelopeBackend = 'sequential-brotli';
-    try {
+    if (safeMode) {
+      // #WDD-gpt 2026-09-20 - 安全重试不再创建 Position 子 Worker，避免在浏览器已回收总控线程后再次命中同一资源边界。
+      positionStored = await structuredCodec.encodeV21StructuredStream(
+        'prs_position', { mainRaw: encodedPosition.mainRaw, exceptionRaw: encodedPosition.exceptionRaw },
+        { segments: descriptors }, { blockCompression: 'brotli', brotliQuality: 9 },
+      );
+    } else try {
       positionEnvelopeWorkers = fourCgsPositionEnvelopeWorkerCount(positionEnvelopeWorkerLimit);
       positionStored = await structuredCodec.encodeV21StructuredStream(
         'prs_position', { mainRaw: encodedPosition.mainRaw, exceptionRaw: encodedPosition.exceptionRaw },

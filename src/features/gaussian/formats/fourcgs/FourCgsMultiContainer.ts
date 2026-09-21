@@ -5,29 +5,64 @@ export interface FourCgsMultiSegmentSource {
   readonly segmentIndex: number;
 }
 
+// #WDD-gpt 2026-09-20 - 合并时间轴的真实范围写入内部 Canonical 段名，导出 Worker 不再从重复原名还原成四个同区间。
+export function fourCgsTimelineSourceName(sourceName: string, segment: FourCgsSegment): string {
+  const stem = sourceName.replace(/\.4cgs$/i, '').replace(/[<>:"/\\|?*\u0000-\u001f]/g, '_');
+  return `${stem}_${segment.firstFrame}_${segment.lastFrame}.raw4d`;
+}
+
+function formsContinuousSourceTimeline(
+  ordered: readonly { readonly descriptor: FourCgsDescriptor; readonly sourceIndex: number }[],
+): boolean {
+  let previous: FourCgsSegment | undefined;
+  for (const { descriptor } of ordered) {
+    if (descriptor.segments.length === 0) return false;
+    for (const segment of descriptor.segments) {
+      if (previous && (segment.firstFrame < previous.lastFrame || segment.firstFrame > previous.lastFrame + 1)) {
+        return false;
+      }
+      previous = segment;
+    }
+  }
+  return true;
+}
+
 export function mergeFourCgsDescriptors(input: readonly FourCgsDescriptor[]): {
   readonly descriptor: FourCgsDescriptor;
   readonly segmentSources: readonly FourCgsMultiSegmentSource[];
 } {
   if (input.length < 2) throw new Error('多 4CGS 序列至少需要两个容器。');
-  const ordered = input.map((descriptor, sourceIndex) => ({ descriptor, sourceIndex }))
-    .sort((a, b) => a.descriptor.firstFrame - b.descriptor.firstFrame
-      || a.descriptor.sourceName.localeCompare(b.descriptor.sourceName));
+  const selected = input.map((descriptor, sourceIndex) => ({ descriptor, sourceIndex }));
+  const sourceOrdered = [...selected].sort((a, b) => a.descriptor.firstFrame - b.descriptor.firstFrame
+    || a.descriptor.sourceName.localeCompare(b.descriptor.sourceName));
+  // #WDD-gpt 2026-09-20 - 同起始帧表示多个独立 4CGS 片段而非错误重叠；按用户选择顺序串接。
+  // #WDD-gpt 2026-09-20 - 不连续或互相重叠的不同容器同样视为独立段落；连续分卷仍按源帧排序，兼容逆序选择。
+  const concatenateStandalone = input.every((descriptor) => descriptor.firstFrame === input[0].firstFrame)
+    || !formsContinuousSourceTimeline(sourceOrdered);
+  const ordered = concatenateStandalone ? selected : sourceOrdered;
   const segments: FourCgsSegment[] = [];
   const segmentSources: FourCgsMultiSegmentSource[] = [];
+  let nextStandaloneFrame = input[0].firstFrame;
   for (const { descriptor, sourceIndex } of ordered) {
     if (descriptor.segments.length === 0) throw new Error(`${descriptor.sourceName} 不包含 4CGS 片段。`);
+    const frameOffset = concatenateStandalone ? nextStandaloneFrame - descriptor.firstFrame : 0;
     descriptor.segments.forEach((segment, segmentIndex) => {
+      const timelineSegment = frameOffset === 0 ? segment : {
+        ...segment,
+        firstFrame: segment.firstFrame + frameOffset,
+        lastFrame: segment.lastFrame + frameOffset,
+      };
       const previous = segments.at(-1);
-      if (previous && segment.firstFrame < previous.lastFrame) {
+      if (previous && timelineSegment.firstFrame < previous.lastFrame) {
         throw new Error(`${descriptor.sourceName} 与前一 4CGS 的帧范围重叠超过共享边界。`);
       }
-      if (previous && segment.firstFrame > previous.lastFrame + 1) {
-        throw new Error(`${descriptor.sourceName} 与前一 4CGS 之间缺少帧 ${previous.lastFrame + 1}-${segment.firstFrame - 1}。`);
+      if (previous && timelineSegment.firstFrame > previous.lastFrame + 1) {
+        throw new Error(`${descriptor.sourceName} 与前一 4CGS 之间缺少帧 ${previous.lastFrame + 1}-${timelineSegment.firstFrame - 1}。`);
       }
-      segments.push(segment);
+      segments.push(timelineSegment);
       segmentSources.push({ sourceIndex, segmentIndex });
     });
+    if (concatenateStandalone) nextStandaloneFrame = segments.at(-1)!.lastFrame + 1;
   }
   const firstFrame = segments[0].firstFrame;
   const lastFrame = segments.at(-1)!.lastFrame;

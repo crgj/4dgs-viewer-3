@@ -17,7 +17,7 @@ import {
   isFourCgsRaw4DZip,
 } from '../../gaussian/formats/fourcgs/FourCgsRaw4DZip';
 import type { FourCgsDescriptor } from '../../gaussian/formats/fourcgs/FourCgsTypes';
-import { mergeFourCgsDescriptors } from '../../gaussian/formats/fourcgs/FourCgsMultiContainer';
+import { fourCgsTimelineSourceName, mergeFourCgsDescriptors } from '../../gaussian/formats/fourcgs/FourCgsMultiContainer';
 import { locateRaw4DSequenceFrame } from '../../gaussian/formats/raw4d/Raw4DSequence';
 import { raw4DCanonicalKeyframes } from '../../gaussian/formats/raw4d/Raw4DSchema';
 import { Raw4DSequenceClient } from '../../gaussian/formats/raw4d/Raw4DSequenceClient';
@@ -698,7 +698,7 @@ export function GaussianViewport({
           file: manifestSources[segmentSource.sourceIndex].file,
         }));
         let openedSourceIndex = -1;
-        residentSegments = await runtime.preloadDecodedRaw4DSequence(tasks.length, async (globalSegmentIndex) => {
+        residentSegments = await runtime.preloadDecodedRaw4DSequence(tasks.length, async (globalSegmentIndex, cpuBudgetBytes) => {
           const task = tasks[globalSegmentIndex];
           if (openedSourceIndex !== task.sourceIndex) {
             closeActiveDecoder();
@@ -713,7 +713,11 @@ export function GaussianViewport({
           }
           const decoder = activeDecoder;
           if (!decoder) throw new Error('多 4CGS 解码器未初始化。');
-          return (await decoder.getSegment(task.segmentIndex, true, true)).file;
+          // #WDD-gpt 2026-09-20 - 多容器同样直达 Canonical RAM，取消逐文件临时 RAW4D 与 Loader 二次解析；GPU 不可用时由解码器内部回退 CPU。
+          const decoded = await decoder.getAsset(task.segmentIndex, cpuBudgetBytes, true);
+          const timelineSegment = merged.descriptor.segments[globalSegmentIndex];
+          // #WDD-gpt 2026-09-20 - 驻留文件身份使用合并后范围，保证再编码的清单仍是 600–749 / 750–899 等真实时间轴。
+          return { ...decoded, file: new File([], fourCgsTimelineSourceName(task.file.name, timelineSegment)) };
         }, ({ message, ratio }) => {
           if (active) onStatusChange({ phase: 'loading', renderer: '多 4CGS 系统内存驻留', splatCount: 0,
             progress: 0.55 + ratio * 0.43, message, sourceName, objectName: sourceName, format: '4CGS' });
@@ -991,19 +995,15 @@ export function GaussianViewport({
         const prepareResident = (lowConcurrency = false) => runtime.preloadDecodedRaw4DSequence(
           descriptor.segments.length,
           async (segmentIndex, cpuBudgetBytes) => {
-            if (backgroundPreparation && !lowConcurrency) {
-              const decoded = await decoder!.getAsset(segmentIndex, cpuBudgetBytes);
-              if (!active) throw new DOMException('4CGS 片段提取已取消。', 'AbortError');
-              canonicalExpansionWorkerMs += decoded.elapsedMs; canonicalCpuSegments++;
-              return decoded;
-            }
-            const decoded = await decoder!.getSegment(segmentIndex, true, !backgroundPreparation);
+            // #WDD-gpt 2026-09-20 - 所有 Binary 4CGS 均走直达 Canonical RAM；前景启用 GPU，后台和低并发重试保留 CPU，取消临时 File 与 Loader 二次解析。
+            const decoded = await decoder!.getAsset(
+              segmentIndex, cpuBudgetBytes, !backgroundPreparation && !lowConcurrency,
+            );
             if (!active) throw new DOMException('4CGS 片段提取已取消。', 'AbortError');
             canonicalExpansionWorkerMs += decoded.elapsedMs;
             if (decoded.backend === 'webgpu') canonicalGpuSegments += 1;
-            else if (decoded.backend === 'cpu') canonicalCpuSegments += 1;
-            else canonicalRawSegments += 1;
-            return decoded.file;
+            else canonicalCpuSegments += 1;
+            return decoded;
           },
           ({ message, ratio }) => {
           if (!active) return;

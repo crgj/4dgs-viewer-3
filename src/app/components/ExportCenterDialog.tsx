@@ -1,7 +1,12 @@
 import { useEffect, useState } from 'react';
 import type { UiLanguage } from '../i18n';
 import { uniqueRaw4DExportFilenames } from '../raw4dFileSave';
-import type { FourCgsExportOptions } from '../../features/gaussian/formats/fourcgs/FourCgsTypes';
+import {
+  defaultFourCgsFilenamePrefix,
+  fourCgsPartFilename,
+  isValidFourCgsFilenamePrefix,
+  type FourCgsPartitionExportOptions,
+} from '../fourCgsExportPartitions';
 import {
   supportsFourCgsSceneExport,
   supportsFourCgsRaw4DZipExport,
@@ -22,7 +27,7 @@ interface ExportCenterDialogProps {
   readonly inputBytes: number;
   readonly language: UiLanguage;
   readonly onClose: () => void;
-  readonly onExport: (target: ExportTarget, options: FourCgsExportOptions & { readonly partCount: number }) => void;
+  readonly onExport: (target: ExportTarget, options: FourCgsPartitionExportOptions) => void;
   readonly sceneName: string;
   readonly segmentCount: number;
   readonly segments?: readonly ExportCenterSegment[];
@@ -35,6 +40,7 @@ export function ExportCenterDialog(props: ExportCenterDialogProps) {
   const [shLevel, setShLevel] = useState<1 | 2 | 3>(3);
   const [maximumEffectiveAlpha, setMaximumEffectiveAlpha] = useState(0.1);
   const [partCount, setPartCount] = useState(1);
+  const [filenamePrefix, setFilenamePrefix] = useState(() => defaultFourCgsFilenamePrefix(props.sceneName));
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') props.onClose();
@@ -78,6 +84,8 @@ export function ExportCenterDialog(props: ExportCenterDialogProps) {
     { id: 'ply-sequence', title: zh ? 'PLY 序列' : 'PLY sequence', detail: zh ? `逐帧写入 ${props.frameCount} 个文件` : `Write ${props.frameCount} frame files` },
   ];
   const selected = options.find((option) => option.id === target)!;
+  const maxPartCount = Math.min(9_999, Math.max(1, props.segmentCount));
+  const filenamePrefixValid = isValidFourCgsFilenamePrefix(filenamePrefix);
   const segmentPreview = props.segments?.slice(0, 4) ?? [];
   const segmentOutputNames = uniqueRaw4DExportFilenames(props.segments?.map((segment) => segment.name) ?? []);
   return (
@@ -116,7 +124,13 @@ export function ExportCenterDialog(props: ExportCenterDialogProps) {
                   <option value={1}>SH1 · 9D</option><option value={2}>SH2 · 24D</option><option value={3}>SH3 · 45D</option>
                 </select></label>
                 <label><span>{zh ? '最大有效 Alpha' : 'Maximum effective Alpha'}</span><input max="0.999999" min="0" onChange={(event) => setMaximumEffectiveAlpha(Number(event.target.value))} step="0.01" type="number" value={maximumEffectiveAlpha} /></label>
-                <label><span>{zh ? '分段数' : 'Output parts'}</span><input max={Math.max(1, props.segmentCount)} min="1" onChange={(event) => setPartCount(Math.max(1, Math.min(props.segmentCount, Math.round(Number(event.target.value) || 1))))} step="1" type="number" value={partCount} /></label>
+                <label><span>{zh ? '分段数' : 'Output parts'}</span><input max={maxPartCount} min="1" onChange={(event) => setPartCount(Math.max(1, Math.min(maxPartCount, Math.round(Number(event.target.value) || 1))))} step="1" type="number" value={partCount} /></label>
+                <label><span>{zh ? '文件名前缀' : 'Filename prefix'}</span><input aria-label={zh ? '4CGS 文件名前缀' : '4CGS filename prefix'} className="export-fourcgs-prefix-input" maxLength={120} onChange={(event) => setFilenamePrefix(event.target.value)} placeholder={zh ? '例如 dance' : 'For example: dance'} type="text" value={filenamePrefix} /></label>
+                {partCount > 1 && <small className={filenamePrefixValid ? '' : 'option-error'}>{filenamePrefixValid
+                  ? (zh
+                      ? `文件名：${fourCgsPartFilename(filenamePrefix, 0, partCount)} … ${fourCgsPartFilename(filenamePrefix, partCount - 1, partCount)}`
+                      : `Filenames: ${fourCgsPartFilename(filenamePrefix, 0, partCount)} … ${fourCgsPartFilename(filenamePrefix, partCount - 1, partCount)}`)
+                  : (zh ? '请输入非空前缀，且不要包含 / \\ : * ? " < > |。' : 'Enter a non-empty prefix without / \\ : * ? " < > |.') }</small>}
                 <small>{zh
                   ? `Alpha 在每个原片段的所有整数帧均低于阈值时才删除；${partCount > 1 ? '输出按原片段边界连续分组。' : '输出一个完整文件。'}`
                   : `A point is removed only when Alpha stays below the threshold at every integer frame; ${partCount > 1 ? 'source segments are grouped consecutively.' : 'one complete file is written.'}`}</small>
@@ -152,7 +166,7 @@ export function ExportCenterDialog(props: ExportCenterDialogProps) {
                 : (zh ? '浏览器将请求一个专用文件夹，并暂停播放后逐帧写入。' : 'The browser requests a dedicated folder, pauses playback, and writes each frame.')}</p>
           </div>
         </div>
-        <footer><button className="quiet-button" onClick={props.onClose} type="button">{zh ? '取消' : 'Cancel'}</button><button className="primary-button" disabled={selected.disabled || (target === 'fourcgs' && (!Number.isFinite(maximumEffectiveAlpha) || maximumEffectiveAlpha < 0 || maximumEffectiveAlpha >= 1))} onClick={() => props.onExport(target, { shLevel, maximumEffectiveAlpha, partCount })} type="button">{zh ? '继续导出' : 'Continue export'}</button></footer>
+        <footer><button className="quiet-button" onClick={props.onClose} type="button">{zh ? '取消' : 'Cancel'}</button><button className="primary-button" disabled={selected.disabled || (target === 'fourcgs' && (!Number.isFinite(maximumEffectiveAlpha) || maximumEffectiveAlpha < 0 || maximumEffectiveAlpha >= 1 || (partCount > 1 && !filenamePrefixValid)))} onClick={() => props.onExport(target, { shLevel, maximumEffectiveAlpha, partCount, filenamePrefix: filenamePrefix.trim() })} type="button">{zh ? '继续导出' : 'Continue export'}</button></footer>
       </section>
     </div>
   );

@@ -12,7 +12,6 @@ export function createFourCgsCanonicalAsset(segment: FourCgsSegment, names: read
   if (rows.byteLength > cpuBudgetBytes) throw new Error('RAW4D CPU memory budget exceeded.');
   validateDecodedRaw4DRows(rows, names);
   const backing = new Uint16Array(shared ? new SharedArrayBuffer(rows.byteLength) : new ArrayBuffer(rows.byteLength));
-  const columns = new Map(names.map((name, index) => [name, backing.subarray(index * count, (index + 1) * count)]));
   // 小块转置使输入与输出访问局限在缓存内；所有列原样保留 FP16 位模式。
   for (let first = 0; first < count; first += 256) {
     const end = Math.min(first + 256, count);
@@ -21,6 +20,18 @@ export function createFourCgsCanonicalAsset(segment: FourCgsSegment, names: read
       for (let row = first, input = first * names.length + column; row < end; row++, input += names.length) backing[output + row] = rows[input];
     }
   }
+  return createFourCgsCanonicalAssetFromColumnMajor(segment, names, backing);
+}
+
+// #WDD-gpt 2026-09-20 - WebGPU 可直接写出最终列式 FP16 backing；此入口只组装 Track 视图，避免再生成临时 RAW4D 文件及二次转置。
+export function createFourCgsCanonicalAssetFromColumnMajor(
+  segment: FourCgsSegment,
+  names: readonly string[],
+  backing: Uint16Array,
+): Raw4DAsset {
+  const count = segment.gaussianCount;
+  if (backing.length !== count * names.length) throw new Error('4CGS canonical column count mismatch.');
+  const columns = new Map(names.map((name, index) => [name, backing.subarray(index * count, (index + 1) * count)]));
   const get = (name: string) => { const values = columns.get(name); if (!values) throw new Error(`4CGS missing ${name}`); return values; };
   const strides = fourCgsRaw4DKeyframeStrides(segment);
   const tracks = Object.fromEntries(Object.entries(RAW4D_TRACK_DEFINITIONS).map(([name, definition]) => {

@@ -22,7 +22,6 @@ import { writeFourCgsFile } from '../features/gaussian/formats/fourcgs/FourCgsCo
 import {
   encodeRaw4DMemoryAsFourCgs,
   type FourCgsEncodeResult,
-  type FourCgsExportOptions,
 } from '../features/gaussian/formats/fourcgs/FourCgsEncoderClient';
 import type { FourCgsProgress } from '../features/gaussian/formats/fourcgs/FourCgsTypes';
 import { FourCgsRaw4DZipWriter } from '../features/gaussian/formats/fourcgs/FourCgsRaw4DZip';
@@ -146,7 +145,12 @@ import {
   isFilePickerAbort,
   writeBlobToFileHandle,
 } from './fourCgsFileSave';
-import { fourCgsPartFilename, partitionConsecutiveSegments } from './fourCgsExportPartitions';
+import {
+  fourCgsPartFilename,
+  isValidFourCgsFilenamePrefix,
+  partitionConsecutiveSegments,
+  type FourCgsPartitionExportOptions,
+} from './fourCgsExportPartitions';
 import { gaussianSourceSelectionKind } from './GaussianSourceSelection';
 import {
   createRaw4DSavePickerOptions,
@@ -1454,8 +1458,8 @@ export function App() {
   // #WDD-gpt  2026-08-16 - RAW4D 保存时根据软删除位集输出压实文件；编辑中的源数据保持稳定 ID。
   const exportWorkspace = async (
     forceFourCgsReencode = false,
-    fourCgsOptions: FourCgsExportOptions & { readonly partCount: number } = {
-      shLevel: 3, maximumEffectiveAlpha: 0.1, partCount: 1,
+    fourCgsOptions: FourCgsPartitionExportOptions = {
+      shLevel: 3, maximumEffectiveAlpha: 0.1, partCount: 1, filenamePrefix: '',
     },
   ) => {
     setOpenMenu(null);
@@ -1474,6 +1478,8 @@ export function App() {
     }
     const canonicalDataDirty = viewportRuntime?.hasCanonicalGaussianDataChanges() ?? false;
     const exportsFourCgs = supportsFourCgsSceneExport(status.format ?? '');
+    const fourCgsStem = (sceneName ?? status.objectName ?? 'dong-editor-3').replace(/\.(?:4cgs|4gs|raw4d|ply4)$/i, '');
+    const multipartFilenamePrefix = fourCgsOptions.filenamePrefix.trim() || fourCgsStem;
     let fourCgsFileHandle: FileSystemFileHandle | null = null;
     let fourCgsDirectoryHandle: FileSystemDirectoryHandle | null = null;
     if (exportsFourCgs) {
@@ -1518,13 +1524,19 @@ export function App() {
         );
         return;
       }
-      const stem = (sceneName ?? status.objectName ?? 'dong-editor-3').replace(/\.(?:4cgs|4gs|raw4d|ply4)$/i, '');
+      if (fourCgsOptions.partCount > 1 && !isValidFourCgsFilenamePrefix(multipartFilenamePrefix)) {
+        showAppNotice(
+          language === 'zh' ? '4CGS 文件名前缀不能为空，也不能包含 / \\ : * ? " < > |。' : 'The 4CGS filename prefix cannot be empty or contain / \\ : * ? " < > |.',
+          language === 'zh' ? '文件名前缀无效' : 'Invalid filename prefix', 'warning',
+        );
+        return;
+      }
       try {
         // #WDD-gpt 2026-09-20 - 单部分保持精确文件授权；多部分只申请一个目录并顺序写入。
         if (fourCgsOptions.partCount > 1) {
           fourCgsDirectoryHandle = await window.showDirectoryPicker!({ id: 'dong-editor-3-fourcgs-parts-v1', mode: 'readwrite', startIn: 'downloads' });
         } else {
-          fourCgsFileHandle = await window.showSaveFilePicker!(createFourCgsSavePickerOptions(`${stem}.4cgs`));
+          fourCgsFileHandle = await window.showSaveFilePicker!(createFourCgsSavePickerOptions(`${fourCgsStem}.4cgs`));
         }
       } catch (error) {
         if (isFilePickerAbort(error) || isDirectoryPickerAbort(error)) return;
@@ -1558,7 +1570,7 @@ export function App() {
           ? viewportRuntime.snapshotResidentSequenceExportMemory()
           : viewportRuntime.snapshotRaw4DExportMemory(sourceFiles);
         const parts = partitionConsecutiveSegments(memorySnapshots, fourCgsOptions.partCount);
-        const stem = (sceneName ?? status.objectName ?? 'dong-editor-3').replace(/\.(?:4cgs|4gs|raw4d|ply4)$/i, '');
+        const stem = fourCgsStem;
         const results: FourCgsEncodeResult[] = [];
         let totalOutputBytes = 0;
         // #WDD-gpt 2026-09-20 - 多部分按原片段连续分组后串行编码/写入，避免同时驻留多份大 Blob。
@@ -1579,7 +1591,7 @@ export function App() {
           }, controller.signal, fourCgsOptions);
           const blob = await writeFourCgsFile(result.blob, sceneTransform, cameraBookmarks);
           if (controller.signal.aborted) throw new DOMException('4CGS 保存已取消。', 'AbortError');
-          const filename = fourCgsPartFilename(stem, partIndex, parts.length);
+          const filename = fourCgsPartFilename(parts.length > 1 ? multipartFilenamePrefix : stem, partIndex, parts.length);
           if (fourCgsDirectoryHandle) await writeRaw4DBlobToDirectory(fourCgsDirectoryHandle, filename, blob);
           else await commitExportBlob(blob, filename, fourCgsFileHandle);
           results.push(result);
@@ -1611,7 +1623,7 @@ export function App() {
           }].slice(-12),
         } : current);
         setExportProgress(1);
-        const outputFilename = parts.length > 1 ? `${parts.length} 个连续 4CGS 部分` : (fourCgsFileHandle?.name ?? fourCgsPartFilename(stem, 0, 1));
+        const outputFilename = parts.length > 1 ? `${fourCgsPartFilename(multipartFilenamePrefix, 0, parts.length)} … ${fourCgsPartFilename(multipartFilenamePrefix, parts.length - 1, parts.length)}` : (fourCgsFileHandle?.name ?? fourCgsPartFilename(stem, 0, 1));
         setExportElapsedMs(performance.now() - exportStartedAtRef.current);
         setExportMonitor((current) => current ? {
           ...current,
@@ -1658,7 +1670,7 @@ export function App() {
         const stem = (sceneName ?? status.objectName ?? 'dong-editor-3').replace(/\.4cgs$/i, '');
         await commitExportBlob(blob, `${stem}.4cgs`, fourCgsFileHandle);
       } catch (error) {
-        showAppError(error, '4cgs-export', () => { void exportWorkspace(); });
+        showAppError(error, '4cgs-export', () => { void exportWorkspace(forceFourCgsReencode, fourCgsOptions); });
       } finally {
         setExportProgress(null);
       }
@@ -2219,7 +2231,7 @@ export function App() {
     gs2MeshPluginRef.current?.exportLastResult();
   };
 
-  const runExportTarget = (target: ExportTarget, options: FourCgsExportOptions & { readonly partCount: number }) => {
+  const runExportTarget = (target: ExportTarget, options: FourCgsPartitionExportOptions) => {
     setExportCenterVisible(false);
     if (target === 'ply-sequence') exportPlySequence();
     else if (target === 'raw4d') void exportRaw4DSegments();

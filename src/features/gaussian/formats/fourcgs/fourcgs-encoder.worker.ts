@@ -35,12 +35,14 @@ interface FileEncodeRequest {
   readonly files: readonly File[];
   readonly deletionWords: readonly Uint32Array[];
   readonly options: FourCgsExportOptions;
+  readonly safeMode?: boolean;
 }
 
 interface MemoryEncodeRequest {
   readonly type: 'memory';
   readonly sources: readonly Raw4DMemorySnapshot[];
   readonly options: FourCgsExportOptions;
+  readonly safeMode?: boolean;
 }
 
 type EncodeRequest = FileEncodeRequest | MemoryEncodeRequest;
@@ -295,9 +297,10 @@ async function encodeRaw4DExport(
   files: readonly File[],
   deletionWords: readonly Uint32Array[],
   options: FourCgsExportOptions,
+  safeMode = false,
 ) {
   // #WDD-gpt 2026-08-16 - 正式导出只走通用自适应压缩；质量不够自动升档，禁止静默退回 233MB 级无损 Bundle。
-  return encodeRaw4DV26Browser(files, deletionWords, workerProgress, options);
+  return encodeRaw4DV26Browser(files, deletionWords, workerProgress, options, safeMode);
 }
 
 if (typeof self !== 'undefined' && typeof self.postMessage === 'function') {
@@ -305,8 +308,8 @@ if (typeof self !== 'undefined' && typeof self.postMessage === 'function') {
     encoderStartedAt = performance.now();
     encoderPeakWorkerCount = 1;
     const encoding = event.data.type === 'memory'
-      ? encodeRaw4DV26BrowserMemory(event.data.sources, workerProgress, event.data.options)
-      : encodeRaw4DExport(event.data.files, event.data.deletionWords, event.data.options);
+      ? encodeRaw4DV26BrowserMemory(event.data.sources, workerProgress, event.data.options, Boolean(event.data.safeMode))
+      : encodeRaw4DExport(event.data.files, event.data.deletionWords, event.data.options, Boolean(event.data.safeMode));
     void encoding.then(
       (result) => self.postMessage({ type: 'result', result }),
       (error: unknown) => self.postMessage({ type: 'error', message: error instanceof Error ? error.message : String(error) }),

@@ -40,6 +40,9 @@ describe('ExportCenterDialog', () => {
     expect(markup).toContain('从 PLY4 编码完整场景与全部片段');
     expect(markup).toContain('Float32 输入会在 Worker 编码副本中量化为 FP16');
     expect(markup).toContain('场景内存保持 Float32，不会被原地改写');
+    expect(markup).toContain('文件名前缀');
+    expect(markup).toContain('aria-label="4CGS 文件名前缀"');
+    expect(markup).toContain('value="sample"');
     expect(markup).toContain('保持原始分段，写入 2 个独立 .raw4d 文件');
     expect(markup).not.toContain('当前 Mesh');
   });
