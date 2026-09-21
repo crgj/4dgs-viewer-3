@@ -7,6 +7,12 @@ function blocksCameraInput(target: EventTarget | null): boolean {
   return target.closest('input, textarea, select, [contenteditable]:not([contenteditable="false"]), [data-camera-input-block]') !== null;
 }
 
+// #WDD-gpt 2026-09-20 - 时间轴 range 即使仍持有焦点也允许 WASD/QE；其指针操作仍沿用完整 UI 隔离规则。
+function blocksCameraKeyboardInput(target: EventTarget | null): boolean {
+  if (target instanceof Element && target.closest('[data-global-shortcuts]')) return false;
+  return blocksCameraInput(target);
+}
+
 interface OrbitCameraOptions {
   distance: number;
   pitch: number;
@@ -30,6 +36,12 @@ interface OrbitCameraTransition {
 }
 
 export type OrbitCameraPreset = 'back' | 'bottom' | 'front' | 'left' | 'right' | 'top';
+export type OrbitPointerDragMode = 'orbit' | 'pan';
+
+// #WDD-gpt 2026-09-20 - 中键与左键统一为环绕旋转，选择工具占用左键时仍可用中键调整视点；右键保留平移。
+export function orbitPointerDragMode(button: number): OrbitPointerDragMode {
+  return button === 2 ? 'pan' : 'orbit';
+}
 
 export function orbitCameraPresetAngles(preset: OrbitCameraPreset): { pitch: number; yaw: number } {
   switch (preset) {
@@ -230,7 +242,7 @@ export class OrbitCameraController {
         this.distance = this.clampDistance(this.distance * (this.lastPinchDistance / Math.max(nextDistance, 1)));
       }
       this.lastPinchDistance = nextDistance;
-    } else if (this.activeButton === 2 || this.activeButton === 1) {
+    } else if (orbitPointerDragMode(this.activeButton) === 'pan') {
       this.pan(dx, dy);
     } else {
       this.yaw -= dx * 0.22;
@@ -257,7 +269,7 @@ export class OrbitCameraController {
   private readonly preventContextMenu = (event: MouseEvent) => event.preventDefault();
 
   private readonly onKeyDown = (event: KeyboardEvent) => {
-    if (!this.inputEnabled || blocksCameraInput(event.target)) {
+    if (!this.inputEnabled || blocksCameraKeyboardInput(event.target)) {
       this.clearInput();
       return;
     }

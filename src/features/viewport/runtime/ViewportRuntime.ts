@@ -146,12 +146,18 @@ import {
   gaussianBrushScreenMetrics,
   gaussianSelectionIdsFromMask,
   gaussianSelectionModeFromModifiers,
+  isGaussianSelectionAddFeedbackKey,
+  isGaussianSelectionPointerButton,
   normalizeGaussianSelectionRect,
   type GaussianScreenPoint,
   type GaussianScreenSelectionRegion,
   type GaussianScreenSelectionScope,
   type GaussianSelectionModifiers,
 } from './selection/GaussianScreenSelection';
+import {
+  gaussianProjectedEllipse,
+  projectGaussianAxisToScreen,
+} from './selection/GaussianProjectedEllipse';
 import { Raw4DSelectionFrameSampler } from './selection/Raw4DSelectionFrameSampler';
 import { GaussianSequenceEditStore } from './selection/GaussianSequenceEditStore';
 import { viewportBackgroundColorRgb } from './ViewportBackgroundColor';
@@ -587,6 +593,8 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost, Semanti
   private selectionPolygonPoints: GaussianScreenPoint[] = [];
   private selectionPolygonCursor: GaussianScreenPoint | null = null;
   private selectionPointer: GaussianScreenPoint | null = null;
+  private selectionAddFeedbackActive = false;
+  private selectionAddIndicator: HTMLDivElement | null = null;
   private selectionPolygonModifiers: GaussianSelectionModifiers | null = null;
   private selectionRunId = 0;
   private gaussianHistogramAnalysisId = 0;
@@ -1515,6 +1523,7 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost, Semanti
     this.canvas.classList.toggle('gaussian-selection-active', selectionTool !== null && selectionTool !== 'select-cylinder');
     this.canvas.classList.toggle('gaussian-selection-brush', selectionTool === 'select-brush');
     this.canvas.classList.toggle('gaussian-selection-poly', selectionTool === 'select-poly');
+    this.updateGaussianSelectionAddFeedback();
     this.guides?.setSelectionCylinder(this.selectionCylinder, selectionTool === 'select-cylinder');
     this.updateGaussianSelectionOverlayVisibility();
     if (selectionTool) {
@@ -3991,16 +4000,17 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost, Semanti
     return this.emptyStatus();
   }
 
-  // #WDD-gpt  2026-08-16 - 按 viewer-2 语义统一接管 Brush/Rect/Polygon 左键输入，右键和非选择工具仍留给摄像机。
+  // #WDD-gpt 2026-09-20 - Brush/Rect/Polygon 只接管左键，中键旋转与右键平移始终留给摄像机。
   private readonly onGaussianSelectionPointerDown = (event: PointerEvent): void => {
     const tool = this.selectionToolForEditor();
-    if (!tool || event.button !== 0) return;
+    if (!tool || !isGaussianSelectionPointerButton(event.button)) return;
     // #WDD-gpt 2026-08-16 - 圆柱由参数面板驱动，视口鼠标仍完整留给摄像机漫游。
     if (tool === 'select-cylinder') return;
     event.preventDefault();
     event.stopImmediatePropagation();
     const point = this.gaussianSelectionCanvasPoint(event);
     this.selectionPointer = point;
+    this.updateGaussianSelectionAddFeedback();
     const modifiers = this.gaussianSelectionModifiers(event);
 
     if (tool === 'select-poly') {
@@ -4039,6 +4049,7 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost, Semanti
     if (!tool) return;
     const point = this.gaussianSelectionCanvasPoint(event);
     this.selectionPointer = point;
+    this.updateGaussianSelectionAddFeedback();
     if (tool === 'select-brush') this.updateGaussianBrushOverlay();
     if (tool === 'select-poly') {
       this.selectionPolygonCursor = point;
@@ -4061,7 +4072,8 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost, Semanti
 
   private readonly onGaussianSelectionPointerUp = (event: PointerEvent): void => {
     const tool = this.selectionToolForEditor();
-    if (tool === 'select-poly') {
+    // #WDD-gpt 2026-09-20 - 折线选择只吞掉左键释放，中键必须完整交还轨道相机完成视点旋转。
+    if (tool === 'select-poly' && isGaussianSelectionPointerButton(event.button)) {
       event.preventDefault();
       event.stopImmediatePropagation();
       return;
@@ -4104,6 +4116,10 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost, Semanti
   };
 
   private readonly onGaussianSelectionKeyDown = (event: KeyboardEvent): void => {
+    if (isGaussianSelectionAddFeedbackKey(event.code)) {
+      this.selectionAddFeedbackActive = true;
+      this.updateGaussianSelectionAddFeedback();
+    }
     if (this.selectionToolForEditor() !== 'select-poly' || this.selectionPolygonPoints.length === 0) return;
     if (event.key === 'Escape') {
       this.cancelGaussianSelectionRun();
@@ -4113,8 +4129,21 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost, Semanti
     }
   };
 
+  private readonly onGaussianSelectionKeyUp = (event: KeyboardEvent): void => {
+    if (!isGaussianSelectionAddFeedbackKey(event.code)) return;
+    this.selectionAddFeedbackActive = false;
+    this.updateGaussianSelectionAddFeedback();
+  };
+
+  private readonly onGaussianSelectionWindowBlur = (): void => {
+    this.selectionAddFeedbackActive = false;
+    this.updateGaussianSelectionAddFeedback();
+  };
+
   private readonly onGaussianSelectionPointerLeave = (): void => {
+    this.selectionPointer = null;
     if (!this.selectionDrag && this.selectionBrushOverlay) this.selectionBrushOverlay.hidden = true;
+    this.updateGaussianSelectionAddFeedback();
   };
 
   private initializeGaussianSelectionInput(): void {
@@ -4128,6 +4157,11 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost, Semanti
     brush.className = 'gaussian-selection-brush-cursor';
     brush.setAttribute('aria-hidden', 'true');
     brush.hidden = true;
+    const addIndicator = document.createElement('div');
+    addIndicator.className = 'gaussian-selection-add-indicator';
+    addIndicator.setAttribute('aria-hidden', 'true');
+    addIndicator.textContent = '+';
+    addIndicator.hidden = true;
     const brushTrailOverlay = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
     brushTrailOverlay.classList.add('gaussian-selection-brush-trail-overlay');
     brushTrailOverlay.setAttribute('aria-hidden', 'true');
@@ -4145,7 +4179,7 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost, Semanti
     const cursorLine = document.createElementNS('http://www.w3.org/2000/svg', 'line');
     cursorLine.classList.add('gaussian-selection-polygon-cursor-line');
     polygonOverlay.append(polygon, cursorLine);
-    parent.append(rectangle, brushTrailOverlay, brush, polygonOverlay);
+    parent.append(rectangle, brushTrailOverlay, brush, polygonOverlay, addIndicator);
     this.selectionOverlay = rectangle;
     this.selectionBrushOverlay = brush;
     this.selectionBrushTrailOverlay = brushTrailOverlay;
@@ -4153,6 +4187,7 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost, Semanti
     this.selectionPolygonOverlay = polygonOverlay;
     this.selectionPolygonShape = polygon;
     this.selectionPolygonCursorLine = cursorLine;
+    this.selectionAddIndicator = addIndicator;
     this.canvas.addEventListener('pointerdown', this.onGaussianSelectionPointerDown, { capture: true });
     this.canvas.addEventListener('pointermove', this.onGaussianSelectionPointerMove, { capture: true });
     this.canvas.addEventListener('pointerup', this.onGaussianSelectionPointerUp, { capture: true });
@@ -4160,6 +4195,8 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost, Semanti
     this.canvas.addEventListener('pointerleave', this.onGaussianSelectionPointerLeave, { capture: true });
     this.canvas.addEventListener('dblclick', this.onGaussianSelectionDoubleClick, { capture: true });
     window.addEventListener('keydown', this.onGaussianSelectionKeyDown);
+    window.addEventListener('keyup', this.onGaussianSelectionKeyUp);
+    window.addEventListener('blur', this.onGaussianSelectionWindowBlur);
   }
 
   private destroyGaussianSelectionInput(): void {
@@ -4171,10 +4208,13 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost, Semanti
     this.canvas.removeEventListener('pointerleave', this.onGaussianSelectionPointerLeave, { capture: true });
     this.canvas.removeEventListener('dblclick', this.onGaussianSelectionDoubleClick, { capture: true });
     window.removeEventListener('keydown', this.onGaussianSelectionKeyDown);
+    window.removeEventListener('keyup', this.onGaussianSelectionKeyUp);
+    window.removeEventListener('blur', this.onGaussianSelectionWindowBlur);
     this.selectionOverlay?.remove();
     this.selectionBrushOverlay?.remove();
     this.selectionBrushTrailOverlay?.remove();
     this.selectionPolygonOverlay?.remove();
+    this.selectionAddIndicator?.remove();
     this.selectionOverlay = null;
     this.selectionBrushOverlay = null;
     this.selectionBrushTrailOverlay = null;
@@ -4183,7 +4223,11 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost, Semanti
     this.selectionPolygonOverlay = null;
     this.selectionPolygonShape = null;
     this.selectionPolygonCursorLine = null;
-    this.canvas.classList.remove('gaussian-selection-active', 'gaussian-selection-brush', 'gaussian-selection-poly');
+    this.selectionAddIndicator = null;
+    this.selectionAddFeedbackActive = false;
+    this.canvas.classList.remove(
+      'gaussian-selection-active', 'gaussian-selection-brush', 'gaussian-selection-poly', 'gaussian-selection-add',
+    );
   }
 
   private finishGaussianSelectionDrag(pointerId: number): void {
@@ -4355,6 +4399,23 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost, Semanti
     this.updateGaussianBrushOverlay();
     this.updateGaussianBrushTrailOverlay();
     this.updateGaussianPolygonOverlay();
+    this.updateGaussianSelectionAddFeedback();
+  }
+
+  private updateGaussianSelectionAddFeedback(): void {
+    const tool = this.selectionToolForEditor();
+    const active = this.selectionAddFeedbackActive && tool !== null && tool !== 'select-cylinder';
+    this.canvas.classList.toggle('gaussian-selection-add', active);
+    const indicator = this.selectionAddIndicator;
+    const point = this.selectionPointer;
+    if (!indicator || !active || !point) {
+      if (indicator) indicator.hidden = true;
+      return;
+    }
+    const offset = this.gaussianSelectionParentOffset();
+    indicator.hidden = false;
+    indicator.style.left = `${offset.x + point.x}px`;
+    indicator.style.top = `${offset.y + point.y}px`;
   }
 
   private selectionToolForEditor(tool = this.editorTool): ViewportSelectionTool | null {
@@ -4462,10 +4523,42 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost, Semanti
       const entityTransform = raw4D.entity.getWorldTransform().clone();
       const cameraPosition = camera.getPosition().clone();
       const cameraForward = camera.forward.clone();
+      const useProjectedEllipse = this.renderMode === 'ellipse';
+      const graphicsRect = this.app!.graphicsDevice.clientRect;
+      const cameraRect = camera.camera.rect;
+      const pixelRatio = graphicsRect.width > 0
+        ? Math.max(1, this.app!.graphicsDevice.width / graphicsRect.width)
+        : 1;
+      const projectionViewport = {
+        width: graphicsRect.width,
+        height: graphicsRect.height,
+        rectWidth: cameraRect.z,
+        rectHeight: cameraRect.w,
+      };
+      const maximumEllipseAxis = Math.max(1, Math.min(
+        1024 / pixelRatio,
+        graphicsRect.width * cameraRect.z,
+        graphicsRect.height * cameraRect.w,
+      ));
+      const antialiasVariance = 0.3 / (pixelRatio * pixelRatio);
+      const cameraViewMatrix = camera.camera.viewMatrix;
+      const cameraProjection = camera.camera.projectionMatrix.data;
       const localPoint = new Vec3();
       const worldPoint = new Vec3();
       const cameraOffset = new Vec3();
       const screenPoint = new Vec3();
+      const viewPoint = new Vec3();
+      const localEllipseAxis = new Vec3();
+      const rotatedEllipseAxis = new Vec3();
+      const worldEllipseAxis = new Vec3();
+      const viewEllipseAxis = new Vec3();
+      const ellipseRotation = new Quat();
+      const projectedEllipseAxes = [{ x: 0, y: 0 }, { x: 0, y: 0 }, { x: 0, y: 0 }];
+      const projectedScreenEllipse = {
+        centerX: 0, centerY: 0,
+        axis1X: 0, axis1Y: 0,
+        axis2X: 0, axis2Y: 0,
+      };
       const nearClip = camera.camera.nearClip;
       const farClip = camera.camera.farClip;
       const batchSize = 32_768;
@@ -4494,7 +4587,7 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost, Semanti
           if (selectionAsset.splatCount !== edits.pointCount) {
             throw new Error(`片段 ${segmentIndex + 1} 点数与编辑位集不一致。`);
           }
-          const sampler = new Raw4DSelectionFrameSampler(selectionAsset);
+          const sampler = new Raw4DSelectionFrameSampler(selectionAsset, useProjectedEllipse);
           const frameCount = scope === 'visible' ? 1 : selectionAsset.totalFrames;
           const firstFrame = scope === 'visible' ? this.pendingFrame : 0;
           const hits = new Uint8Array(selectionAsset.splatCount);
@@ -4505,7 +4598,7 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost, Semanti
               || sequence !== this.gaussianSelectionSequence) return;
             const frame = scope === 'visible' ? firstFrame : frameOffset;
             sampler.sample(frame);
-            const { x, y, z, opacity } = sampler.properties;
+            const { x, y, z, opacity, ellipse } = sampler.properties;
             for (let start = 0; start < selectionAsset.splatCount; start += batchSize) {
               const end = Math.min(selectionAsset.splatCount, start + batchSize);
               for (let stableId = start; stableId < end; stableId += 1) {
@@ -4517,11 +4610,56 @@ export class ViewportRuntime implements SmartAlignmentHost, GS2MeshHost, Semanti
                 const depth = cameraOffset.dot(cameraForward);
                 if (depth < nearClip || depth > farClip) continue;
                 camera.camera.worldToScreen(worldPoint, screenPoint);
-                if (Number.isFinite(screenPoint.x)
-                  && Number.isFinite(screenPoint.y)
-                  && region.contains(screenPoint.x, screenPoint.y)) {
-                  hits[stableId] = 1;
+                if (!Number.isFinite(screenPoint.x) || !Number.isFinite(screenPoint.y)) continue;
+                if (!useProjectedEllipse || !ellipse) {
+                  if (region.contains(screenPoint.x, screenPoint.y)) hits[stableId] = 1;
+                  continue;
                 }
+                if (region.contains(screenPoint.x, screenPoint.y)) {
+                  hits[stableId] = 1;
+                  continue;
+                }
+
+                // #WDD-gpt 2026-09-20 - 椭圆模式按当前帧旋转/尺度构造二维协方差足迹，中心在选区外但椭圆相交时同样命中。
+                ellipseRotation.set(
+                  ellipse.rotationX[stableId], ellipse.rotationY[stableId],
+                  ellipse.rotationZ[stableId], ellipse.rotationW[stableId],
+                ).normalize();
+                cameraViewMatrix.transformPoint(worldPoint, viewPoint);
+                let validEllipse = true;
+                for (let axisIndex = 0; axisIndex < 3; axisIndex += 1) {
+                  const ellipseScale = axisIndex === 0
+                    ? ellipse.scaleX[stableId]
+                    : axisIndex === 1 ? ellipse.scaleY[stableId] : ellipse.scaleZ[stableId];
+                  localEllipseAxis.set(0, 0, 0);
+                  if (axisIndex === 0) localEllipseAxis.x = ellipseScale;
+                  else if (axisIndex === 1) localEllipseAxis.y = ellipseScale;
+                  else localEllipseAxis.z = ellipseScale;
+                  ellipseRotation.transformVector(localEllipseAxis, rotatedEllipseAxis);
+                  entityTransform.transformVector(rotatedEllipseAxis, worldEllipseAxis);
+                  cameraViewMatrix.transformVector(worldEllipseAxis, viewEllipseAxis);
+                  const projectedAxis = projectGaussianAxisToScreen(
+                    cameraProjection,
+                    viewPoint,
+                    viewEllipseAxis,
+                    projectionViewport,
+                    projectedEllipseAxes[axisIndex],
+                  );
+                  if (!projectedAxis) {
+                    validEllipse = false;
+                    break;
+                  }
+                }
+                if (!validEllipse) continue;
+                const screenEllipse = gaussianProjectedEllipse(
+                  screenPoint.x,
+                  screenPoint.y,
+                  projectedEllipseAxes,
+                  maximumEllipseAxis,
+                  antialiasVariance,
+                  projectedScreenEllipse,
+                );
+                if (screenEllipse && region.intersectsEllipse(screenEllipse)) hits[stableId] = 1;
               }
               if (end < selectionAsset.splatCount || frameOffset + 1 < frameCount) {
                 await new Promise<void>((resolve) => window.setTimeout(resolve, 0));

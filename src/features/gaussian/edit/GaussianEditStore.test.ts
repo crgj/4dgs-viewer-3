@@ -18,6 +18,15 @@ describe('GaussianEditStore', () => {
     expect(edits.selectionCount).toBe(0);
   });
 
+  it('merges a new hit set into the existing selection in add mode', () => {
+    const edits = new GaussianEditStore(12);
+    edits.select([1, 4, 7], 'replace');
+    // #WDD-gpt 2026-09-20 - 左 Ctrl 增选必须保留旧位集，并对重复命中去重而不是切换或替换。
+    edits.select([4, 6, 9], 'add');
+    expect(edits.selectedStableIds()).toEqual([1, 4, 6, 7, 9]);
+    expect(edits.selectionCount).toBe(5);
+  });
+
   it('stores CPU-only sparse attributes without allocating a value for every point', () => {
     const edits = new GaussianEditStore(1_000_000, 65_536);
     edits.defineAttribute({ name: 'semantic', type: 'u16', sparse: true, residency: 'cpu-only' });

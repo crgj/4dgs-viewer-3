@@ -6,6 +6,7 @@ import {
   isEditorUndoShortcut,
   isGaussianDeleteShortcut,
   isViewportBrowseShortcut,
+  toggleShortcutTool,
 } from '../features/editor/tools/EditorKeyboardShortcuts';
 import {
   createGaussian4DMemoryPolicy,
@@ -145,6 +146,7 @@ import {
   writeBlobToFileHandle,
 } from './fourCgsFileSave';
 import { fourCgsPartFilename, partitionConsecutiveSegments } from './fourCgsExportPartitions';
+import { gaussianSourceSelectionKind } from './GaussianSourceSelection';
 import {
   createRaw4DSavePickerOptions,
   RAW4D_SEGMENTS_DIRECTORY_PICKER_OPTIONS,
@@ -302,7 +304,7 @@ const cameraViews: ReadonlyArray<{
 
 function isTextEntryTarget(target: EventTarget | null): boolean {
   return target instanceof Element
-    && target.closest('input, textarea, select, [contenteditable]:not([contenteditable="false"])') !== null;
+    && target.closest('input:not([type="range"][data-global-shortcuts]), textarea, select, [contenteditable]:not([contenteditable="false"])') !== null;
 }
 
 function TransformNumberField({
@@ -1048,9 +1050,13 @@ export function App() {
       }
       const shortcut = allEditorTools.find((tool) => tool.shortcut.toLowerCase() === event.key.toLowerCase());
       if (shortcut) {
-        setActiveTool(shortcut.id);
-        if (isGaussianSelectionTool(shortcut.id)) setIsPlaying(false);
-        if (isViewportTransformTool(shortcut.id)) {
+        event.preventDefault();
+        if (event.repeat) return;
+        const nextTool = toggleShortcutTool(activeTool, shortcut.id, 'select');
+        setActiveTool(nextTool);
+        // #WDD-gpt 2026-09-20 - 首次快捷键启用工具，再按同键关闭并返回浏览；按键长按不反复切换。
+        if (isGaussianSelectionTool(nextTool)) setIsPlaying(false);
+        if (isViewportTransformTool(nextTool)) {
           setInspectorPanelVisible(true);
           setInspectorTab('transform');
         }
@@ -1058,7 +1064,7 @@ export function App() {
     };
     window.addEventListener('keydown', onKeyDown, { capture: true });
     return () => window.removeEventListener('keydown', onKeyDown, { capture: true });
-  }, [language, selectionScope, viewportRuntime]);
+  }, [activeTool, language, selectionScope, viewportRuntime]);
 
   useEffect(() => {
     if (!isPlaying) return;
@@ -2222,9 +2228,8 @@ export function App() {
   const openSourceFiles = (incoming: readonly File[]) => {
     const files = [...incoming];
     if (files.length === 0) return;
-    const supported = files.every((file) => /\.(4cgs|4gs|raw4d|ply4|sog|ply)$/i.test(file.name));
-    const validMultiRaw4D = files.length === 1 || files.every((file) => /\.(?:raw4d|ply4)$/i.test(file.name));
-    if (!supported || !validMultiRaw4D) {
+    const selectionKind = gaussianSourceSelectionKind(files);
+    if (selectionKind === 'invalid') {
       setStatus({
         phase: 'error', renderer: copy.unsupportedFile, splatCount: 0,
         message: files.length > 1 ? copy.multiRaw4DOnlyMessage : copy.unsupportedFileMessage,
@@ -2232,7 +2237,9 @@ export function App() {
       return;
     }
     if (viewportRuntime) gs2MeshPluginRef.current?.clear(viewportRuntime, setGS2MeshState);
-    setSceneName(files.length === 1 ? files[0].name.replace(/\.[^.]+$/, '') : `RAW4D × ${files.length}`);
+    setSceneName(files.length === 1
+      ? files[0].name.replace(/\.[^.]+$/, '')
+      : `${selectionKind === 'fourcgs-sequence' ? '4CGS' : 'RAW4D'} × ${files.length}`);
     setSceneTransform(createInitialTransform());
     setSmartAlignmentState(INITIAL_SMART_ALIGNMENT_STATE);
     setGS2MeshState(INITIAL_GS2MESH_STATE);
@@ -3671,6 +3678,7 @@ export function App() {
             )}
             <input
               aria-label={copy.currentFrame}
+              data-global-shortcuts
               max={timelineEndFrame}
               min="0"
               onChange={(event) => {
@@ -3682,6 +3690,16 @@ export function App() {
               onPointerDown={() => {
                 // #WDD-gpt 2026-09-08 - 拖动开始只停止自动播放；随后每个滑块值立即驱动实际渲染。
                 stopPlayback();
+              }}
+              onPointerUp={(event) => {
+                // #WDD-gpt 2026-09-20 - 等浏览器完成 range 默认聚焦后再释放焦点，兼容真实拖动与不同浏览器事件顺序。
+                const slider = event.currentTarget;
+                window.requestAnimationFrame(() => slider.blur());
+              }}
+              onPointerCancel={(event) => {
+                // #WDD-gpt 2026-09-20 - 指针取消也在默认事件结束后归还键盘焦点，避免时间轴永久吞掉全局快捷键。
+                const slider = event.currentTarget;
+                window.requestAnimationFrame(() => slider.blur());
               }}
               style={{ '--timeline-progress': `${(currentFrame / Math.max(1, timelineEndFrame)) * 100}%` } as React.CSSProperties}
               type="range"

@@ -2,10 +2,17 @@ import { describe, expect, it } from 'vitest';
 import {
   easeOrbitCameraTransition,
   orbitCameraPresetAngles,
+  orbitPointerDragMode,
   shortestOrbitYawDelta,
 } from './OrbitCameraController';
 
 describe('OrbitCameraController presets', () => {
+  it('uses left and middle drag for orbit while keeping right drag for pan', () => {
+    expect(orbitPointerDragMode(0)).toBe('orbit');
+    expect(orbitPointerDragMode(1)).toBe('orbit');
+    expect(orbitPointerDragMode(2)).toBe('pan');
+  });
+
   it('maps the four ViewCube faces to exact Y-up orbit angles', () => {
     expect(orbitCameraPresetAngles('front')).toEqual({ pitch: 0, yaw: 0 });
     expect(orbitCameraPresetAngles('left')).toEqual({ pitch: 0, yaw: -90 });

@@ -85,4 +85,32 @@ describe('Raw4DSelectionFrameSampler', () => {
     expect([...selection.properties.opacity]).toEqual([0.5, 0.5]);
     expect([...sortCenters.centers]).toEqual([2, 0, 0, 12, 0, 0]);
   });
+
+  it('optionally matches renderer rotation and linear scale for ellipse projection', () => {
+    const asset: Raw4DAsset = {
+      ...testAsset(),
+      rotation: track(4, [
+        [1, 1], [0, 0], [0, 0], [0, 0],
+        [0, 0], [0, 0], [0, 0], [1, -1],
+      ], [0, 2]),
+      scale: track(3, [
+        [0, Math.log(2)], [Math.log(2), 0], [0, 0],
+        [Math.log(4), Math.log(8)], [Math.log(8), Math.log(4)], [Math.log(2), Math.log(2)],
+      ], [0, 2]),
+    };
+    const selection = new Raw4DSelectionFrameSampler(asset, true);
+    const renderer = new Raw4DFrameSampler(asset);
+    selection.sample(1);
+    renderer.sample(1);
+    expect(selection.properties.ellipse).not.toBeNull();
+    for (const property of [
+      'rotationW', 'rotationX', 'rotationY', 'rotationZ', 'scaleX', 'scaleY', 'scaleZ',
+    ] as const) {
+      const expected = renderer.properties[property];
+      const actual = selection.properties.ellipse![property];
+      for (let index = 0; index < actual.length; index += 1) {
+        expect(actual[index]).toBeCloseTo(expected[index], 5);
+      }
+    }
+  });
 });

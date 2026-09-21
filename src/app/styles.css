@@ -2005,6 +2005,27 @@ input:focus-visible {
   cursor: crosshair;
 }
 
+/* #WDD-gpt 2026-09-20 - 左 Ctrl/Cmd 增选时使用系统带加号光标，并在精确指针位置叠加高对比度 + 提示。 */
+.viewport-canvas.gaussian-selection-active.gaussian-selection-add {
+  cursor: copy;
+}
+
+.gaussian-selection-add-indicator {
+  position: absolute;
+  z-index: 8;
+  width: 16px;
+  height: 16px;
+  margin: -15px 0 0 8px;
+  border: 1px solid rgba(130, 255, 213, 0.75);
+  border-radius: 50%;
+  color: #d7fff2;
+  background: rgba(10, 35, 29, 0.9);
+  box-shadow: 0 1px 5px rgba(0, 0, 0, 0.72), 0 0 8px rgba(65, 235, 181, 0.25);
+  font: 700 14px/14px "SFMono-Regular", Consolas, monospace;
+  text-align: center;
+  pointer-events: none;
+}
+
 .gaussian-selection-box {
   position: absolute;
   z-index: 6;

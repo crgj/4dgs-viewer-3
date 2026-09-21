@@ -12,6 +12,17 @@ export interface Raw4DSelectionFrameProperties {
   readonly y: Float32Array;
   readonly z: Float32Array;
   readonly opacity: Float32Array;
+  readonly ellipse: Raw4DSelectionEllipseProperties | null;
+}
+
+export interface Raw4DSelectionEllipseProperties {
+  readonly rotationW: Float32Array;
+  readonly rotationX: Float32Array;
+  readonly rotationY: Float32Array;
+  readonly rotationZ: Float32Array;
+  readonly scaleX: Float32Array;
+  readonly scaleY: Float32Array;
+  readonly scaleZ: Float32Array;
 }
 
 function trackSpan(track: Raw4DTrack, frame: number): TrackSpan {
@@ -52,13 +63,26 @@ function interpolateExtended(left: number, right: number, alpha: number): number
 export class Raw4DSelectionFrameSampler {
   readonly properties: Raw4DSelectionFrameProperties;
   private sampledFrame = Number.NaN;
+  private rotationPairIndex = -1;
+  private rotationTheta: Float32Array | null = null;
+  private rotationInverseSine: Float32Array | null = null;
+  private rotationRightSign: Int8Array | null = null;
 
-  constructor(private readonly asset: Raw4DAsset) {
+  constructor(private readonly asset: Raw4DAsset, includeEllipse = false) {
     this.properties = {
       x: new Float32Array(asset.splatCount),
       y: new Float32Array(asset.splatCount),
       z: new Float32Array(asset.splatCount),
       opacity: new Float32Array(asset.splatCount),
+      ellipse: includeEllipse ? {
+        rotationW: new Float32Array(asset.splatCount),
+        rotationX: new Float32Array(asset.splatCount),
+        rotationY: new Float32Array(asset.splatCount),
+        rotationZ: new Float32Array(asset.splatCount),
+        scaleX: new Float32Array(asset.splatCount),
+        scaleY: new Float32Array(asset.splatCount),
+        scaleZ: new Float32Array(asset.splatCount),
+      } : null,
     };
   }
 
@@ -67,6 +91,10 @@ export class Raw4DSelectionFrameSampler {
     if (frame === this.sampledFrame) return false;
     this.samplePosition(frame);
     this.sampleOpacity(frame);
+    if (this.properties.ellipse) {
+      this.sampleScale(frame, this.properties.ellipse);
+      this.sampleRotation(frame, this.properties.ellipse);
+    }
     this.sampledFrame = frame;
     return true;
   }
@@ -123,6 +151,118 @@ export class Raw4DSelectionFrameSampler {
           * stableSigmoid(10 * ((lifetimeMu + lifetimeW) - frame));
       }
       this.properties.opacity[index] = stableSigmoid(logit) * gate;
+    }
+  }
+
+  private sampleScale(frame: number, ellipse: Raw4DSelectionEllipseProperties): void {
+    const track = this.asset.scale;
+    const span = trackSpan(track, frame);
+    const destinations = [ellipse.scaleX, ellipse.scaleY, ellipse.scaleZ];
+    for (let component = 0; component < 3; component += 1) {
+      const left = track.values[span.left * 3 + component];
+      const right = track.values[span.right * 3 + component];
+      const destination = destinations[component];
+      for (let index = 0; index < destination.length; index += 1) {
+        destination[index] = Math.exp(interpolateExtended(
+          readRaw4DScalar(left, index, track.encoding),
+          readRaw4DScalar(right, index, track.encoding),
+          span.alpha,
+        ));
+      }
+    }
+  }
+
+  // #WDD-gpt 2026-09-20 - 椭圆选择按渲染器同样的最短弧 slerp 采样旋转，并只缓存当前关键帧对的系数。
+  private prepareRotationPair(leftKey: number): void {
+    if (this.rotationPairIndex === leftKey) return;
+    const track = this.asset.rotation;
+    const leftOffset = leftKey * 4;
+    const rightOffset = leftOffset + 4;
+    const theta = new Float32Array(this.asset.splatCount);
+    const inverseSine = new Float32Array(this.asset.splatCount);
+    const rightSign = new Int8Array(this.asset.splatCount);
+    for (let index = 0; index < this.asset.splatCount; index += 1) {
+      const lw = readRaw4DScalar(track.values[leftOffset], index, track.encoding);
+      const lx = readRaw4DScalar(track.values[leftOffset + 1], index, track.encoding);
+      const ly = readRaw4DScalar(track.values[leftOffset + 2], index, track.encoding);
+      const lz = readRaw4DScalar(track.values[leftOffset + 3], index, track.encoding);
+      const rw = readRaw4DScalar(track.values[rightOffset], index, track.encoding);
+      const rx = readRaw4DScalar(track.values[rightOffset + 1], index, track.encoding);
+      const ry = readRaw4DScalar(track.values[rightOffset + 2], index, track.encoding);
+      const rz = readRaw4DScalar(track.values[rightOffset + 3], index, track.encoding);
+      const leftLength = Math.hypot(lw, lx, ly, lz);
+      const rightLength = Math.hypot(rw, rx, ry, rz);
+      let cosine = leftLength > 1e-12 && rightLength > 1e-12
+        ? (lw * rw + lx * rx + ly * ry + lz * rz) / (leftLength * rightLength)
+        : 1;
+      const sign = cosine < 0 ? -1 : 1;
+      cosine = Math.min(1, Math.max(-1, cosine * sign));
+      const angle = Math.acos(cosine);
+      const sine = Math.sin(angle);
+      theta[index] = angle;
+      inverseSine[index] = sine > 1e-5 ? 1 / sine : 0;
+      rightSign[index] = sign;
+    }
+    this.rotationPairIndex = leftKey;
+    this.rotationTheta = theta;
+    this.rotationInverseSine = inverseSine;
+    this.rotationRightSign = rightSign;
+  }
+
+  private sampleRotation(frame: number, ellipse: Raw4DSelectionEllipseProperties): void {
+    const track = this.asset.rotation;
+    const span = trackSpan(track, frame);
+    const destinations = [ellipse.rotationW, ellipse.rotationX, ellipse.rotationY, ellipse.rotationZ];
+    if (span.left === span.right) {
+      const offset = span.left * 4;
+      for (let index = 0; index < this.asset.splatCount; index += 1) {
+        const w = readRaw4DScalar(track.values[offset], index, track.encoding);
+        const x = readRaw4DScalar(track.values[offset + 1], index, track.encoding);
+        const y = readRaw4DScalar(track.values[offset + 2], index, track.encoding);
+        const z = readRaw4DScalar(track.values[offset + 3], index, track.encoding);
+        const inverseLength = 1 / Math.max(1e-12, Math.hypot(w, x, y, z));
+        destinations[0][index] = w * inverseLength;
+        destinations[1][index] = x * inverseLength;
+        destinations[2][index] = y * inverseLength;
+        destinations[3][index] = z * inverseLength;
+      }
+      return;
+    }
+
+    this.prepareRotationPair(span.left);
+    const theta = this.rotationTheta!;
+    const inverseSine = this.rotationInverseSine!;
+    const rightSign = this.rotationRightSign!;
+    const leftOffset = span.left * 4;
+    const rightOffset = span.right * 4;
+    for (let index = 0; index < this.asset.splatCount; index += 1) {
+      let lw = readRaw4DScalar(track.values[leftOffset], index, track.encoding);
+      let lx = readRaw4DScalar(track.values[leftOffset + 1], index, track.encoding);
+      let ly = readRaw4DScalar(track.values[leftOffset + 2], index, track.encoding);
+      let lz = readRaw4DScalar(track.values[leftOffset + 3], index, track.encoding);
+      let rw = readRaw4DScalar(track.values[rightOffset], index, track.encoding);
+      let rx = readRaw4DScalar(track.values[rightOffset + 1], index, track.encoding);
+      let ry = readRaw4DScalar(track.values[rightOffset + 2], index, track.encoding);
+      let rz = readRaw4DScalar(track.values[rightOffset + 3], index, track.encoding);
+      const leftInverseLength = 1 / Math.max(1e-12, Math.hypot(lw, lx, ly, lz));
+      const rightInverseLength = rightSign[index] / Math.max(1e-12, Math.hypot(rw, rx, ry, rz));
+      lw *= leftInverseLength; lx *= leftInverseLength; ly *= leftInverseLength; lz *= leftInverseLength;
+      rw *= rightInverseLength; rx *= rightInverseLength; ry *= rightInverseLength; rz *= rightInverseLength;
+      const leftWeight = inverseSine[index]
+        ? Math.sin((1 - span.alpha) * theta[index]) * inverseSine[index]
+        : 1 - span.alpha;
+      const rightWeight = inverseSine[index]
+        ? Math.sin(span.alpha * theta[index]) * inverseSine[index]
+        : span.alpha;
+      const w = lw * leftWeight + rw * rightWeight;
+      const x = lx * leftWeight + rx * rightWeight;
+      const y = ly * leftWeight + ry * rightWeight;
+      const z = lz * leftWeight + rz * rightWeight;
+      const inverseLength = 1 / Math.max(1e-12, Math.hypot(w, x, y, z));
+      destinations[0][index] = w * inverseLength;
+      destinations[1][index] = x * inverseLength;
+      destinations[2][index] = y * inverseLength;
+      destinations[3][index] = z * inverseLength;
     }
   }
 }

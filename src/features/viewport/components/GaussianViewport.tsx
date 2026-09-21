@@ -17,6 +17,7 @@ import {
   isFourCgsRaw4DZip,
 } from '../../gaussian/formats/fourcgs/FourCgsRaw4DZip';
 import type { FourCgsDescriptor } from '../../gaussian/formats/fourcgs/FourCgsTypes';
+import { mergeFourCgsDescriptors } from '../../gaussian/formats/fourcgs/FourCgsMultiContainer';
 import { locateRaw4DSequenceFrame } from '../../gaussian/formats/raw4d/Raw4DSequence';
 import { raw4DCanonicalKeyframes } from '../../gaussian/formats/raw4d/Raw4DSchema';
 import { Raw4DSequenceClient } from '../../gaussian/formats/raw4d/Raw4DSequenceClient';
@@ -86,10 +87,10 @@ interface GaussianViewportProps {
 }
 
 interface ActiveFourCgsSession {
-  readonly decoder: FourCgsDecoderClient;
   readonly descriptor: FourCgsDescriptor;
   readonly residentSegments: readonly ViewportResidentRaw4DSegment[];
-  readonly sourceFile: File;
+  readonly sourceName: string;
+  readonly objectName: string;
   segmentIndex: number;
 }
 
@@ -315,8 +316,8 @@ export function GaussianViewport({
       ...status,
       format: '4CGS',
       fourCgsContainer: 'binary',
-      sourceName: session.sourceFile.name,
-      objectName: session.sourceFile.name.replace(/\.4cgs$/i, ''),
+      sourceName: session.sourceName,
+      objectName: session.objectName,
       totalFrames: session.descriptor.totalFrames,
       keyframeCount: sequenceStatus.keyframes.length,
       raw4dSequence: sequenceStatus,
@@ -329,7 +330,7 @@ export function GaussianViewport({
       onStatusChange({
         phase: 'loading', renderer: '4CGS V2.4', splatCount: segment.gaussianCount,
         progress: 0.98, totalFrames: session.descriptor.totalFrames, keyframeCount: sequenceStatus.keyframes.length, fps: 30, shBands: 3,
-        sourceName: session.sourceFile.name, objectName: session.sourceFile.name.replace(/\.4cgs$/i, ''),
+        sourceName: session.sourceName, objectName: session.objectName,
         format: '4CGS', fourCgsContainer: 'binary', raw4dSequence: sequenceStatus, message: `正在从系统内存准备 4CGS ${segment.name}`,
       });
     }
@@ -517,7 +518,6 @@ export function GaussianViewport({
 
     return () => {
       active = false;
-      fourCgsSessionRef.current?.decoder.close();
       fourCgsSessionRef.current = null;
       raw4DSequenceSessionRef.current?.client.close();
       raw4DSequenceSessionRef.current = null;
@@ -597,7 +597,7 @@ export function GaussianViewport({
         onStatusChange({
           phase: 'error', renderer: '4CGS 段切换失败', splatCount: 0,
           message: error instanceof Error ? error.message : String(error),
-          sourceName: fourCgsSessionRef.current?.sourceFile.name,
+          sourceName: fourCgsSessionRef.current?.sourceName,
           format: '4CGS',
         });
       });
@@ -654,7 +654,6 @@ export function GaussianViewport({
     if (!runtime || !runtimeReady) return;
     fourCgsLoadGenerationRef.current += 1;
     fourCgsLoadingSegmentRef.current = null;
-    fourCgsSessionRef.current?.decoder.close();
     fourCgsSessionRef.current = null;
     raw4DSequenceLoadGenerationRef.current += 1;
     raw4DSequenceLoadingSegmentRef.current = null;
@@ -667,6 +666,79 @@ export function GaussianViewport({
       return;
     }
     let active = true;
+    const multiFourCgs = sourceFiles.length > 1 && sourceFiles.every((file) => /\.4cgs$/i.test(file.name));
+    if (multiFourCgs) {
+      const containerAbortController = new AbortController();
+      let activeDecoder: FourCgsDecoderClient | null = null;
+      const closeActiveDecoder = () => { activeDecoder?.close(); activeDecoder = null; };
+      let residentSegments: readonly ViewportResidentRaw4DSegment[] = [];
+      const sourceName = `4CGS × ${sourceFiles.length}`;
+      onStatusChange({ phase: 'loading', renderer: '多 4CGS 清单', splatCount: 0, progress: 0,
+        message: `正在检查 ${sourceFiles.length} 个 4CGS 容器`, sourceName, objectName: sourceName, format: '4CGS' });
+      void (async () => {
+        const manifestSources = await Promise.all(sourceFiles.map(async (file) => {
+          if (await isFourCgsRaw4DZip(file)) throw new Error(`多文件序列暂不接受 ZIP 容器：${file.name}`);
+          const { manifest } = await readFourCgsManifest(file);
+          if (raw4DBundleStorage(manifest)) throw new Error(`多文件序列暂不接受 RAW4D Bundle：${file.name}`);
+          const descriptor: FourCgsDescriptor = {
+            sourceName: file.name, sourceBytes: file.size, codecName: manifest.codecName,
+            firstFrame: manifest.firstFrame, lastFrame: manifest.lastFrame, totalFrames: manifest.uniqueFrameCount,
+            slotCount: manifest.slotCount, segments: manifest.segments,
+            sceneTransform: manifest.metadata?.sceneTransform, cameraBookmarks: manifest.metadata?.cameraBookmarks,
+            crossOriginIsolated: globalThis.crossOriginIsolated,
+            decodeTimings: { streamReadMs: 0, attributeDecodeMs: 0, totalMs: 0, workerCount: 1,
+              hardwareConcurrency: navigator.hardwareConcurrency || 4, attributeTasksMs: {} },
+          };
+          return { file, descriptor };
+        }));
+        if (!active) return;
+        const merged = mergeFourCgsDescriptors(manifestSources.map((source) => source.descriptor));
+        const tasks = merged.segmentSources.map((segmentSource) => ({
+          ...segmentSource,
+          file: manifestSources[segmentSource.sourceIndex].file,
+        }));
+        let openedSourceIndex = -1;
+        residentSegments = await runtime.preloadDecodedRaw4DSequence(tasks.length, async (globalSegmentIndex) => {
+          const task = tasks[globalSegmentIndex];
+          if (openedSourceIndex !== task.sourceIndex) {
+            closeActiveDecoder();
+            const decoder = new FourCgsDecoderClient();
+            activeDecoder = decoder;
+            openedSourceIndex = task.sourceIndex;
+            await decoder.open(task.file, ({ message, ratio }) => {
+              if (active) onStatusChange({ phase: 'loading', renderer: '多 4CGS 顺序解码', splatCount: 0,
+                progress: (globalSegmentIndex + ratio) / tasks.length * 0.55,
+                message: `${task.file.name} · ${message}`, sourceName, objectName: sourceName, format: '4CGS' });
+            }, true);
+          }
+          const decoder = activeDecoder;
+          if (!decoder) throw new Error('多 4CGS 解码器未初始化。');
+          return (await decoder.getSegment(task.segmentIndex, true, true)).file;
+        }, ({ message, ratio }) => {
+          if (active) onStatusChange({ phase: 'loading', renderer: '多 4CGS 系统内存驻留', splatCount: 0,
+            progress: 0.55 + ratio * 0.43, message, sourceName, objectName: sourceName, format: '4CGS' });
+        }, true);
+        closeActiveDecoder();
+        if (!active) { runtime.releaseRaw4DSequence(residentSegments); residentSegments = []; return; }
+        if (merged.descriptor.sceneTransform) runtime.restoreSceneTransform(fourCgsSceneTransformToInput(merged.descriptor.sceneTransform));
+        onCameraBookmarksChange(merged.descriptor.cameraBookmarks?.bookmarks ?? [null, null, null]);
+        runtime.configureRaw4DSequenceGpuCache(residentSegments);
+        // #WDD-gpt 2026-09-20 - 多容器仅在清单层合并时间轴；各文件严格顺序解码并在下一文件前关闭 Worker，限制峰值内存。
+        fourCgsSessionRef.current = {
+          descriptor: merged.descriptor, residentSegments,
+          sourceName, objectName: sourceName, segmentIndex: -1,
+        };
+        await activateFourCgsFrameRef.current(pendingFrameRef.current);
+      })().catch((error: unknown) => {
+        if (!active || (error instanceof DOMException && error.name === 'AbortError')) return;
+        onStatusChange({ phase: 'error', renderer: '多 4CGS 导入失败', splatCount: 0,
+          message: error instanceof Error ? error.message : String(error), sourceName, objectName: sourceName, format: '4CGS' });
+      });
+      return () => {
+        active = false; containerAbortController.abort(); closeActiveDecoder(); runtime.cancelImport();
+        runtime.releaseRaw4DSequence(residentSegments); residentSegments = [];
+      };
+    }
     if (sourceFiles.length > 1) {
       const client = new Raw4DSequenceClient();
       let residentSegments: readonly ViewportResidentRaw4DSegment[] = [];
@@ -980,7 +1052,8 @@ export function GaussianViewport({
           if (!plan.fits) throw new Error(`全部显存驻留需要 ${(plan.requiredBytes / 1024 ** 3).toFixed(2)} GiB，超过当前预算 ${(plan.budgetBytes / 1024 ** 3).toFixed(2)} GiB。`);
         }
         fourCgsSessionRef.current = {
-          decoder, descriptor, residentSegments, sourceFile, segmentIndex: -1,
+          descriptor, residentSegments,
+          sourceName: sourceFile.name, objectName: sourceFile.name.replace(/\.4cgs$/i, ''), segmentIndex: -1,
         };
         decoder.close();
         const activationStartedAt = performance.now();
@@ -1016,7 +1089,7 @@ export function GaussianViewport({
         residentSegments = [];
         decoder?.close();
         sequenceClient?.close();
-        if (decoder && fourCgsSessionRef.current?.decoder === decoder) fourCgsSessionRef.current = null;
+        fourCgsSessionRef.current = null;
         if (sequenceClient && raw4DSequenceSessionRef.current?.client === sequenceClient) raw4DSequenceSessionRef.current = null;
       };
     }

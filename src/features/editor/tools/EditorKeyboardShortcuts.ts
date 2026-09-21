@@ -6,6 +6,11 @@ export interface EditorKeyboardShortcutEvent {
   readonly shiftKey?: boolean;
 }
 
+// #WDD-gpt 2026-09-20 - 同一工具快捷键第二次按下返回浏览工具，统一选择与变换工具的开关语义。
+export function toggleShortcutTool<T extends string>(activeTool: T, shortcutTool: T, browseTool: T): T {
+  return activeTool === shortcutTool ? browseTool : shortcutTool;
+}
+
 // #WDD-gpt  2026-08-16 - 兼容标准 Delete 以及部分键盘上报的 Del 键名，物理 Delete 键始终可用。
 export function isGaussianDeleteShortcut(event: EditorKeyboardShortcutEvent): boolean {
   const key = event.key.toLowerCase();

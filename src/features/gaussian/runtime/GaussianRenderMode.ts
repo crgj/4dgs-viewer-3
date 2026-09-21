@@ -22,7 +22,8 @@ interface GaussianRenderThresholds {
 
 const renderThresholds = new WeakMap<Application, GaussianRenderThresholds>();
 const relightingEnabled = new WeakMap<Application, boolean>();
-const GSPLAT_KERNEL_EXTENT = 3.33;
+// #WDD-gpt 2026-09-20 - 导出实际渲染核范围，椭圆选择必须复用同一数值才能与屏幕外缘严格一致。
+export const GSPLAT_KERNEL_EXTENT = 3.33;
 const GSPLAT_KERNEL_EXPONENT = 0.5 * GSPLAT_KERNEL_EXTENT * GSPLAT_KERNEL_EXTENT;
 
 function replaceRequired(source: string, search: string, replacement: string, chunk: string): string {

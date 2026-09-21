@@ -4,9 +4,17 @@ import {
   isEditorUndoShortcut,
   isGaussianDeleteShortcut,
   isViewportBrowseShortcut,
+  toggleShortcutTool,
 } from './EditorKeyboardShortcuts';
 
 describe('EditorKeyboardShortcuts', () => {
+  it('toggles the same shortcut tool back to browse without closing a different tool', () => {
+    expect(toggleShortcutTool('select', 'select-brush', 'select')).toBe('select-brush');
+    expect(toggleShortcutTool('select-brush', 'select-brush', 'select')).toBe('select');
+    expect(toggleShortcutTool('select-rect', 'select-brush', 'select')).toBe('select-brush');
+    expect(toggleShortcutTool('move', 'move', 'select')).toBe('select');
+  });
+
   it('recognizes Delete and Del keyboard reports', () => {
     expect(isGaussianDeleteShortcut({ key: 'Delete', code: 'Delete' })).toBe(true);
     expect(isGaussianDeleteShortcut({ key: 'Del', code: '' })).toBe(true);
