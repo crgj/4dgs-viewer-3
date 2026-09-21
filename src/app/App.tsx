@@ -6,6 +6,7 @@ import {
   isEditorUndoShortcut,
   isGaussianDeleteShortcut,
   isViewportBrowseShortcut,
+  timelineFrameStepFromShortcut,
   toggleShortcutTool,
 } from '../features/editor/tools/EditorKeyboardShortcuts';
 import {
@@ -1019,6 +1020,14 @@ export function App() {
         return;
       }
       if (isTextEntryTarget(event.target)) return;
+      const timelineStep = timelineFrameStepFromShortcut(event);
+      if (timelineStep !== 0 && sourceFiles.length > 0) {
+        event.preventDefault();
+        // #WDD-gpt 2026-09-20 - 方向键与时间轴 ±1 按钮共享逐帧、暂停和边界钳制语义，长按可连续检查相邻帧。
+        stopPlayback();
+        setCurrentFrame((frame) => Math.max(0, Math.min(timelineEndFrame, frame + timelineStep)));
+        return;
+      }
       if (event.key === 'Home') {
         event.preventDefault();
         viewportRuntime?.frameScene();
@@ -1064,7 +1073,7 @@ export function App() {
     };
     window.addEventListener('keydown', onKeyDown, { capture: true });
     return () => window.removeEventListener('keydown', onKeyDown, { capture: true });
-  }, [activeTool, language, selectionScope, viewportRuntime]);
+  }, [activeTool, language, selectionScope, sourceFiles.length, stopPlayback, timelineEndFrame, viewportRuntime]);
 
   useEffect(() => {
     if (!isPlaying) return;

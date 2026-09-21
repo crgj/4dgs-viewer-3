@@ -4,6 +4,7 @@ import {
   isEditorUndoShortcut,
   isGaussianDeleteShortcut,
   isViewportBrowseShortcut,
+  timelineFrameStepFromShortcut,
   toggleShortcutTool,
 } from './EditorKeyboardShortcuts';
 
@@ -36,5 +37,13 @@ describe('EditorKeyboardShortcuts', () => {
     expect(isEditorRedoShortcut({ key: 'z', code: 'KeyZ', metaKey: true, shiftKey: true })).toBe(true);
     expect(isEditorRedoShortcut({ key: 'y', code: 'KeyY', ctrlKey: true })).toBe(true);
     expect(isEditorRedoShortcut({ key: 'y', code: 'KeyY' })).toBe(false);
+  });
+
+  it('maps plain left and right arrows to one-frame timeline steps', () => {
+    expect(timelineFrameStepFromShortcut({ key: 'ArrowLeft', code: 'ArrowLeft' })).toBe(-1);
+    expect(timelineFrameStepFromShortcut({ key: 'ArrowRight', code: 'ArrowRight' })).toBe(1);
+    expect(timelineFrameStepFromShortcut({ key: 'Unidentified', code: 'ArrowLeft' })).toBe(-1);
+    expect(timelineFrameStepFromShortcut({ key: 'ArrowRight', code: 'ArrowRight', ctrlKey: true })).toBe(0);
+    expect(timelineFrameStepFromShortcut({ key: 'ArrowLeft', code: 'ArrowLeft', altKey: true })).toBe(0);
   });
 });

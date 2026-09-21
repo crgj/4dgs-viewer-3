@@ -2,6 +2,7 @@ export interface EditorKeyboardShortcutEvent {
   readonly code: string;
   readonly key: string;
   readonly ctrlKey?: boolean;
+  readonly altKey?: boolean;
   readonly metaKey?: boolean;
   readonly shiftKey?: boolean;
 }
@@ -21,6 +22,14 @@ export function isGaussianDeleteShortcut(event: EditorKeyboardShortcutEvent): bo
 export function isViewportBrowseShortcut(event: EditorKeyboardShortcutEvent): boolean {
   const key = event.key.toLowerCase();
   return key === 'escape' || key === 'esc' || event.code === 'Escape';
+}
+
+// #WDD-gpt 2026-09-20 - 左右方向键逐帧移动主时间轴；系统/浏览器修饰组合保留给原生快捷操作。
+export function timelineFrameStepFromShortcut(event: EditorKeyboardShortcutEvent): -1 | 0 | 1 {
+  if (event.ctrlKey || event.metaKey || event.altKey) return 0;
+  if (event.key === 'ArrowLeft' || event.code === 'ArrowLeft') return -1;
+  if (event.key === 'ArrowRight' || event.code === 'ArrowRight') return 1;
+  return 0;
 }
 
 // #WDD-gpt  2026-08-16 - 同时支持 Windows/Linux Ctrl 与 macOS Command，并把 Shift+Z 留给重做。
